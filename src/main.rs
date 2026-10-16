@@ -100,6 +100,7 @@ fn run_bundle(
     let bundler = bundle::Bundler {
         root: &config.dir.join(bundle::BUNDLE_ROOT),
         build: &bundle::run_node_build,
+        passes: &config.passes,
     };
     let (outcome, report) = bundler.run(&plan, &mut |step| eprintln!("bundle: {step}"))?;
     write!(out, "{}", report.summary())?;

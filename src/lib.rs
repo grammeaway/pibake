@@ -7,6 +7,7 @@ pub mod harness;
 pub mod inventory;
 pub mod lock;
 pub mod package;
+pub mod passes;
 pub mod paths;
 pub mod process;
 pub mod sea;

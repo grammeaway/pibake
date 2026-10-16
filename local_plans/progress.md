@@ -13,7 +13,7 @@ Live log for `README.md`'s plans. One row per plan; details under Deviations and
 | l5 bundle | done | 2ce36da | jiti stand-in instead of `extensionFactories`; 16/16 live extensions bundled; `verify` same; startup 508 ms vs 2648 ms (indicative) |
 | l6 SEA backend | done | bb0fdc7 | `node --build-sea`, ESM main + code cache; 14 MiB of stage files as assets, extracted once to `~/.cache/pibake/<hash>/`; `verify` same with no `node` on `PATH`; recorded: startup 484 ms vs 2597 ms, big write 46.1 s vs 48.1 s (`bench_results/2026-10-16_l6_sea.json`) |
 | l7 staleness | done | df0685a | setup fingerprint in the executable, checked in the entry; check 1.9 ms in-process (median, live setup); recorded: `bench_results/2026-10-16_l7_staleness.json` (+4.1 ms startup median, inside noise); `verify` same |
-| l8 passes, trim highlight | planned | | |
+| l8 passes, trim highlight | done | b0f6bcc | passes run before esbuild (owner); `trim_highlight` keeps 39 of 191 languages; `main.mjs` −1.19 MB, executable −1.23 MB; startup RSS −4 MiB, startup time within noise (indicative; Pi 1.3.0 already loads 170 languages only after the first interactive render); `verify` same |
 | l9 fold providers | planned | | |
 | l10 snapshot backend | planned | | O2 after step 1 |
 | l11 streaming JSON | planned | | O1 |
@@ -74,6 +74,10 @@ Decisions taken during passes, with who took them (owner or agent) and when.
 | l7 | `build` reads the fingerprint before the lock check and the stage: a change made during the build then shows as stale at runtime instead of being recorded as baked. `packages` and the npm versions come from the same settings.json and manifest reads as the inventory (`Inventory.settings_packages`, `#[serde(skip)]`, so `inspect` output is unchanged). Git commits at build time are `git rev-parse HEAD` (lock's `git_head`, now `pub(crate)`); the runtime reads `.git/HEAD`, loose refs and `packed-refs` itself; the E2E tests hold the two equal. The extension walk is the stage's own (`stage::walk_tree`, generalised from `read_tree`), which stats each file before reading it | 2026-10-16, agent |
 | l7 | Message: `<executable name>: built from an older setup (<at most 3 changes>, <N> more); run pibake install`. The plan said `pi-baked:` (the name is `[build] name`, so it now follows the config) and `run pibake build` (`install` is `build` plus the copy, and the binary used daily is the installed one). A check that throws prints `<name>: checking the setup failed: <message>` instead; Pi starts either way. `PIBAKE_NO_STALENESS_CHECK=1` (exactly `1`) skips it | 2026-10-16, agent |
 | l7 | The host `node` binary is not part of the fingerprint (l6's Found note): the executable embeds its own copy, and a broken dynamic link fails before any JS runs, so a JS check could not report it | 2026-10-16, agent |
+| l8 | Passes run before esbuild, on the module sources they target, not on esbuild's output (owner, on the plan check's evidence; revises D5's "passes run on its output"). A second esbuild run over a bundle with the 152 registrations removed kept all 191 `var require_x = __commonJS({…})` grammar wrappers: nothing marks that call pure, so neither esbuild nor oxc's minifier can drop them. Rewriting `highlight.js/lib/index.js` before bundling lets esbuild's tree shaking leave them out, and l9's SDK removal needs the same | 2026-10-16, owner |
+| l8 | Pipeline (`src/passes.rs`): passes run in `[build] passes` order over `Sources` (the stage's files plus earlier passes' rewrites). Each finds its spans with oxc (`oxc` 0.154, `semantic` feature only) and splices text there (`splice`); nothing is reprinted, so a rewritten file is unchanged outside its edits and an unchanged file is not overridden. `build.mjs` reads the rewrite in its existing `onLoad` (so the `import.meta` rewrite still applies), and a rewrite esbuild never loads fails the bundle (`a pass rewrote <file>, but the bundle never loads it`). The pass options and the rewritten texts are part of the bundle hash, which is the plan's "bundle hash + pass list + pass options" cache. The pass report (file, what, bytes removed) goes into `report.json` and the bundle summary. No sourcemap chaining is needed: esbuild maps to the rewritten text under the original path. Passes take no inventory parameter yet; l9 adds what it needs | 2026-10-16, agent |
+| l8 | `[build] passes` defaults to every pass (`["trim_highlight"]`); `passes = []` turns them off, an unknown name is a config error, a duplicate a build error. `[trim] highlight_languages` defaults to Pi's 21 startup languages plus the ones in `~/code`: armasm, css, diff, dockerfile, dts, erb, gradle, ini (also `toml`), makefile, markdown, plaintext, protobuf, scss, shell, sql, x86asm, xml (also html, svg), yaml, 39 in all (owner's option A: startup unchanged, only the set loaded after the first render shrinks). A name highlight.js does not register is an error that lists the ones it does | 2026-10-16, owner (list), agent (defaults on) |
+| l8 | `trim_highlight` cuts both of Pi 1.3.0's registration paths: `hljs.registerLanguage(...)` statements in highlight.js's `lib/index.js`, resolved from Pi's `dist/utils` as Node would (Pi imports it lazily, in interactive mode after the first render), and entries of `eagerLanguages` in Pi's `dist/utils/syntax-highlight.js`, together with their grammar imports (registered at startup). Either file in another shape fails the pass, naming the statement and the expected pattern. Every grammar import must be used exactly once, in `eagerLanguages` (oxc semantic reference count) | 2026-10-16, agent |
 
 ## Deviations
 
@@ -156,6 +160,53 @@ Per plan: where the work differed from the plan, and why.
 
   Shown to fail on deliberate mutations: hash always reused, order-sensitive `packages` comparison, seconds-only mtime on the Rust side, `packed-refs` ignored. `cargo fmt --check`, clippy and all tests pass, including every E2E test of l1–l7.
 
+### l8
+
+- **Plan check against the code, Pi 1.3.0 and Node 26.11.1.** Two findings, both taken to the owner before any code:
+  - **Pi already trims highlight.js itself.** `dist/utils/syntax-highlight.js` registers 21 languages at startup (`eagerLanguages`). The other 170 of highlight.js 10.7.3's 191 load through `import("highlight.js/lib/index.js")`, but only in interactive mode, from a `setImmediate` after the first render (`interactive-mode.js`, `loadAllHighlightLanguages`). The plan's premise ("each registration builds grammar objects at startup") no longer holds. RPC startup, which is what `bench` measures, gains nothing while the startup 21 are kept. What is left to gain: bundle size, and the main-thread block right after the first paint in interactive mode. In plain `node` (indicative), that block is the 170 later grammars: 60 ms at load ≈ 1, 120–170 ms at load ≈ 15. With the 18 later grammars the default list keeps, it is 19–23 ms at load ≈ 15. The 21 startup grammars take 15–17 ms.
+  - **Post-bundle passes cannot drop grammars,** see Decisions. The pipeline runs before esbuild.
+- **Step 1:** owner chose the default list (option A, see Decisions). hcl/terraform and vue, common in `~/code`, have no grammar in highlight.js 10.7.3, so stock Pi does not highlight them either.
+- **Step 2, the `noop` pass and its round-trip property, are not built.** They guarded oxc reprinting the 25 MB bundle, which the pre-bundle design never does. Instead:
+  - Hegel property: `splice` equals applying the same disjoint edits one by one.
+  - With `passes = []`, the live setup's `main.mjs` is byte-identical to l7's bundle of the same stage. The one difference is the stage path in the prologue, which comes from a different project directory. The map is byte-identical.
+  - With every language kept, the pass rewrites nothing (unit test).
+- **Step 4, the real shape:** in Pi 1.3.0, highlight.js's `lib/index.js` holds 191 direct `hljs.registerLanguage('<name>', require('./languages/<name>'))` statements, and `syntax-highlight.js` an object literal of default imports. Bundled, each grammar is an esbuild `__commonJS` wrapper. The pass accepts only these shapes.
+- **Step 5's render check runs through Pi's own highlighter in RPC mode, not a pty session** (l2 never built the pty harness). A fixture extension calls the exported `getMarkdownTheme().highlightCode` (what markdown fences render through) after loading `highlight.js/lib/index.js` as interactive mode does. It reports per language whether the output differs from plain text. With `highlight_languages = ["rust", "yaml"]`:
+  - The bundle highlights rust and yaml, and renders python (a dropped startup language) and fortran (a dropped later one) as plain text, without errors.
+  - With passes off, all four highlight.
+  - Stock Pi highlights its startup languages only, since the extension cannot reach highlight.js from disk there.
+  
+  COBOL became fortran: highlight.js 10.7.3 has no COBOL grammar, so stock Pi would not highlight it either. Pi's renderer was checked: `highlightCode` falls back to `mdCodeBlock` plain text when `hljs.getLanguage` does not know the language (`theme.js`), as the plan assumed.
+- **Completion, on the live setup** (scratch project `/tmp/pibake-l8`, stage copied from l7's, so it was a cache hit; indicative, machine busy):
+  - `pibake bundle` with the defaults: `kept 39 of 191 languages`, 9.7 KB of `index.js` removed.
+  - `main.mjs` went from 25,068,944 to 23,879,778 bytes (−1.19 MB, −4.7 %), its map from 43.7 to 42.1 MB, and the executable from 102,793,536 to 101,561,664 bytes (−1.23 MB, code cache included). That is most of the 1.33 MB of grammar sources, as the plan expected.
+  - `verify --pi <exe> --against pi`: `same: 13 tools, 82 commands, 295-line system prompt`, with passes on and off, and on against off.
+  - `build` takes 5–6 s with a new bundle.
+- **Step 6, bench on vs off** (indicative, not recorded, load 5–16 during the run): `pibake bench --runs 10 --pi <exe passes=[]> --pi <exe default>`. Medians [IQR], off vs on:
+  - startup 881 [755–1048] vs 825 [754–1023] ms;
+  - startup CPU 1100 vs 1019 ms;
+  - startup peak RSS 205.7 vs 201.6 MiB;
+  - big write 100.6 s vs 100.9 s wall (about twice the idle 46 s);
+  - big-write peak RSS 483 vs 454 MiB.
+  
+  The time IQRs overlap almost entirely, so only the ~4 MiB lower startup RSS reads as a real effect. As expected, RPC startup does not run the later-language load this pass mostly trims.
+- **Tests:**
+  - Unit: `splice`, line-break widening, duplicate passes, Node-style package lookup, config defaults, switching passes off, unknown pass names.
+  - `tests/passes.rs` on fixture files in Pi 1.3.0's shapes:
+    - exact output, report text, and `keep everything` rewriting nothing;
+    - idempotency: run again on its own output, nothing changes;
+    - unknown languages named, with the known list;
+    - each unknown `index.js` and `eagerLanguages` shape fails, naming the statement;
+    - missing highlight.js, and a nested copy found first.
+  - `tests/bundle.rs`, with a stand-in build:
+    - the rewrites reach `BuildConfig.overrides` as absolute paths;
+    - other options give another bundle, the same options a cache hit;
+    - a failing pass stops before esbuild and publishes nothing.
+  - Hegel property (300 cases): for random language sets, the two files come out exactly as if written with the kept languages only, and a second run changes nothing. It was shown to fail on two deliberate mutations: a prefix match instead of an exact one, and statements removed without their line break.
+  - `PIBAKE_E2E=1` render check (above).
+  - `cargo fmt --check`, clippy and all tests pass, including every E2E test of l1–l8. The l6 build E2E and the l5 live-setup E2E now run with the default passes and still `verify` same against stock Pi.
+  - Test-side change: the property's language pool first had no `c`, so a prefix-match mutation could not show. `c` was added beside `cpp` and `c-like`. Earlier failures in the new tests were mistakes in their expectations about `BTreeMap` key order and error precedence, not in the code.
+
 ## Found
 
 Bugs or debts found during a pass and kept out of its diff.
@@ -197,3 +248,7 @@ Bugs or debts found during a pass and kept out of its diff.
 - **l7: the line is hidden while the fullscreen TUI runs.** Pi 1.3.0 defaults to `tuiMode: "fullscreen"` (the alternate screen; the live settings.json does not override it). The stderr line is written before the TUI starts, so it shows on the normal screen only once Pi exits. `tuiMode: "regular"` keeps it above the first render (`TuiMainScreen` does not clear on its first render). Showing it inside the TUI would need a hook into Pi's startup notices; owner call whether that is worth it.
 - **l7: `.git` files.** The runtime does not follow a `.git` file (worktree, submodule), so such a git package would show as stale on every launch. Pi clones into a plain `.git` directory (`shortcut:` in `staleness.mjs`).
 - **l7: bench and the environment.** `bench` clears the environment, so an env toggle needs `env VAR=… <exe>` on both sides to keep the comparison fair. A startup-only mode would also make small startup effects cheaper to measure (each round here was almost all big write: 2 × 46 s against 2 × 0.5 s).
+- **l8 → l9: passes run before esbuild.** l9's `trim_providers` can stub a dropped provider in Pi's or pi-ai's own module source (`passes::Sources`, `splice`), and esbuild then leaves out the SDKs nothing imports any more. Lazily imported provider modules (`import()` with a literal) are still bundled, so a stub has to cut the `import()` itself.
+- **l8: interactive-only effects are invisible to `bench`.** The later-language load runs only in interactive mode, after the first render. `bench` measures RPC readiness, so this pass's main runtime effect (about 60 ms less main-thread work after first paint, plain-node indicative) is not in its numbers. The pty metric from l2 step 6 would show it.
+- **l8: sourcemaps of rewritten files.** esbuild's map shows the rewritten text (`sourcesContent`) under the original path, so a stack trace in `syntax-highlight.js` points at the rewrite's lines. Lines only differ when startup languages are dropped.
+- **l8: `verify`/`bench` need absolute executable paths.** The harness runs Pi from its own working directory, so `--pi target/pibake/bin/pi-baked` fails to spawn ("No such file or directory"). Resolving a relative first word against the caller's directory would fix it.

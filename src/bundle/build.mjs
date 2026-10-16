@@ -33,6 +33,9 @@ async function hostModules() {
 }
 
 const located = {};
+// Files a pibake pass rewrote (src/passes.rs): read instead of the stage's copy.
+const overrides = new Map(Object.entries(config.overrides ?? {}));
+const overridden = new Set();
 const fixes = [];
 const shimmed = new Set();
 const loaders = { ".ts": "ts", ".mts": "ts", ".cts": "ts", ".tsx": "tsx", ".jsx": "jsx" };
@@ -108,8 +111,11 @@ const plugin = {
 		}));
 
 		build.onLoad({ filter: /\.[cm]?[jt]sx?$/ }, async (args) => {
-			const text = await readFile(args.path, "utf8");
-			if (!/import\.meta|__dirname|__filename/.test(text)) return undefined;
+			const override = overrides.get(args.path);
+			if (override !== undefined) overridden.add(args.path);
+			const text = override ?? (await readFile(args.path, "utf8"));
+			const plain = override === undefined ? undefined : { contents: override, loader: loaders[extname(args.path)] ?? "js" };
+			if (!/import\.meta|__dirname|__filename/.test(text)) return plain;
 			const owned = config.owned.find((o) => under(args.path, o.stage));
 			const live = owned && !args.path.slice(owned.stage.length).split(sep).includes("node_modules");
 			let kind;
@@ -140,7 +146,7 @@ const plugin = {
 				tsconfigRaw: {},
 			});
 			// Mentioned only in strings or comments: nothing to rewrite.
-			if (!out.code.includes("__pibake_location")) return undefined;
+			if (!out.code.includes("__pibake_location")) return plain;
 			located[relative(config.stage, args.path)] = kind;
 			// A hashbang must stay first; the bundle drops it from non-entry modules anyway.
 			const code = out.code.startsWith("#!") ? out.code.slice(out.code.indexOf("\n") + 1) : out.code;
@@ -228,6 +234,13 @@ const result = await esbuild.build({
 for (const id of ["jiti", "jiti/static"]) {
 	if (result.errors.length === 0 && !shimmed.has(id)) {
 		result.errors.push({ text: `pibake: Pi's extension loader no longer imports "${id}" from ${loaderDir}/jiti-*loader.js` });
+	}
+}
+
+// A rewrite esbuild never loaded means Pi stopped importing that file: the pass did nothing.
+for (const file of overrides.keys()) {
+	if (result.errors.length === 0 && !overridden.has(file)) {
+		result.errors.push({ text: `pibake: a pass rewrote ${file}, but the bundle never loads it` });
 	}
 }
 

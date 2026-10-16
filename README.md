@@ -71,7 +71,7 @@ pibake.lock ─► stage ─► passes ─► bundle ─► backend ─► verif
 ```
 
 - **Stage:** a clean, pinned install of Pi and your packages.
-- **Passes:** optimizations on the bundled code that only make sense when the whole setup is known, such as dropping unused providers and highlight.js languages. Written in Rust on [oxc](https://oxc.rs).
+- **Passes:** optimizations that only make sense when the whole setup is known, such as dropping unused providers and highlight.js languages. Written in Rust on [oxc](https://oxc.rs), they rewrite the few module sources they target before bundling, so the bundler leaves out whatever they cut. Each one fails the build when Pi's code no longer has the shape it expects. `[build] passes` lists the passes to run (default: all; `[]` turns them off), and `[trim] highlight_languages` lists the highlight.js languages code blocks are coloured in. Others render as plain text, as an unknown language does in stock Pi.
 - **Bundle:** one file holding Pi and every extension. Pi still discovers and orders extensions as usual; the bundle answers its loader with the baked code instead of transpiling from disk, and anything it did not bake (a project extension, one added later) loads as in stock Pi.
 - **Backend:** Node's [single executable applications](https://nodejs.org/api/single-executable-applications.html), with V8's code cache first and a startup snapshot later. Node is the runtime Pi targets, so there is no runtime drift. Other backends ([Pi-Bolt](https://github.com/opensec-git/Pi-Bolt)'s ahead-of-time compiled JavaScriptCore, `deno compile`) can plug in at the same point later.
 

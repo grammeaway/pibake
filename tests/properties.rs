@@ -546,3 +546,81 @@ fn build_names_stay_one_file_name(tc: TestCase) {
         "{name:?} -> {components:?}"
     );
 }
+
+const LANGUAGE_POOL: [&str; 11] = [
+    "c", "1c", "bash", "c-like", "cpp", "rust", "x86asm", "xml", "yaml", "zephir", "go",
+];
+
+fn draw_subset(tc: &TestCase, from: &[&'static str]) -> Vec<&'static str> {
+    from.iter()
+        .copied()
+        .filter(|_| tc.draw(gs::booleans()))
+        .collect()
+}
+
+/// trim_highlight leaves the two files exactly as if written with only the kept languages, and
+/// running it on its own output changes nothing.
+#[hegel::test(test_cases = 300)]
+fn trim_highlight_keeps_exactly_the_list_and_is_idempotent(tc: TestCase) {
+    use common::{HIGHLIGHT_INDEX, SYNTAX_HIGHLIGHT, highlight_index_js, syntax_highlight_js};
+    use pibake::passes::{self, Options, Pass};
+
+    let index = draw_subset(&tc, &LANGUAGE_POOL);
+    let eager = draw_subset(&tc, &index);
+    let keep = draw_subset(&tc, &index);
+    let stage = tempfile::tempdir().unwrap();
+    common::write_highlight_stage(stage.path(), &index, &eager);
+    let options = Options {
+        passes: vec![Pass::TrimHighlight],
+        highlight_languages: keep.iter().map(|s| s.to_string()).collect(),
+    };
+    let out = passes::run(stage.path(), &options).unwrap();
+    let kept = |names: &[&'static str]| -> Vec<&'static str> {
+        names.iter().copied().filter(|n| keep.contains(n)).collect()
+    };
+    let file = |rel: &str| {
+        out.overrides
+            .get(rel)
+            .cloned()
+            .unwrap_or_else(|| std::fs::read_to_string(stage.path().join(rel)).unwrap())
+    };
+    assert_eq!(file(HIGHLIGHT_INDEX), highlight_index_js(&kept(&index)));
+    assert_eq!(file(SYNTAX_HIGHLIGHT), syntax_highlight_js(&kept(&eager)));
+    assert_eq!(
+        out.overrides.contains_key(HIGHLIGHT_INDEX),
+        kept(&index).len() < index.len()
+    );
+    assert_eq!(
+        out.overrides.contains_key(SYNTAX_HIGHLIGHT),
+        kept(&eager).len() < eager.len()
+    );
+
+    for (rel, text) in &out.overrides {
+        std::fs::write(stage.path().join(rel), text).unwrap();
+    }
+    let again = passes::run(stage.path(), &options).unwrap();
+    assert!(again.overrides.is_empty(), "{:?}", again.overrides);
+}
+
+/// `splice` equals applying the same non-overlapping edits one by one from the back.
+#[hegel::test(test_cases = 500)]
+fn splice_applies_disjoint_edits(tc: TestCase) {
+    let text: String = tc.draw(gs::from_regex(r"[a-z\n]{0,40}"));
+    let mut cuts: Vec<usize> =
+        tc.draw(gs::vecs(gs::integers::<usize>().max_value(text.len())).max_size(6));
+    cuts.sort();
+    let mut edits: Vec<(std::ops::Range<usize>, String)> = cuts
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|[a, b]| (*a..*b, tc.draw(gs::from_regex(r"[A-Z]{0,3}"))))
+        .collect();
+    // Two empty ranges at one point would be ambiguous in order; drop the duplicates.
+    edits.dedup_by(|a, b| a.0 == b.0);
+    let mut expected = text.clone();
+    for (r, with) in edits.iter().rev() {
+        expected.replace_range(r.clone(), with);
+    }
+    edits.reverse();
+    assert_eq!(pibake::passes::splice(&text, &mut edits).unwrap(), expected);
+}

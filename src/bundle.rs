@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::inventory::Inventory;
 use crate::lock::PI_PACKAGE;
+use crate::passes::{self, PassReport};
 use crate::paths;
 use crate::stage::{self, Outcome};
 
@@ -298,6 +299,8 @@ pub struct BuildConfig {
     pub owned: Vec<Owned>,
     pub outfile: PathBuf,
     pub write: bool,
+    /// Absolute path → the text a pass rewrote it to; the bundle reads this instead.
+    pub overrides: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -392,6 +395,7 @@ pub struct Report {
     /// Warnings in code no baked extension reaches: Pi and its dependencies.
     pub pi_warnings: Vec<Message>,
     pub unbaked: Vec<Unbaked>,
+    pub passes: Vec<PassReport>,
 }
 
 impl Report {
@@ -440,6 +444,12 @@ impl Report {
                 "  Pi and its dependencies: {} esbuild warnings\n",
                 self.pi_warnings.len()
             ));
+        }
+        for p in &self.passes {
+            for c in &p.changes {
+                let what = c.what.split(';').next().unwrap_or(&c.what);
+                out.push_str(&format!("  pass {}: {}: {what}\n", p.pass.name(), c.file));
+            }
         }
         out
     }
@@ -531,6 +541,7 @@ pub fn report(
         extensions,
         pi_warnings,
         unbaked,
+        passes: vec![],
     }
 }
 
@@ -538,6 +549,7 @@ pub struct Bundler<'a> {
     /// Holds one directory per hash.
     pub root: &'a Path,
     pub build: Build<'a>,
+    pub passes: &'a passes::Options,
 }
 
 impl Bundler<'_> {
@@ -556,6 +568,25 @@ impl Bundler<'_> {
         let owned_json = serde_json::to_string(&owned)?;
         let baked_all = baked_module(&all);
         let stage_path = plan.stage.to_string_lossy();
+        let rewritten = passes::run(&plan.stage, self.passes)?;
+        for p in &rewritten.reports {
+            log(format!(
+                "pass {}: {} files rewritten",
+                p.pass.name(),
+                p.changes.len()
+            ));
+        }
+        let overrides: BTreeMap<String, String> = rewritten
+            .overrides
+            .iter()
+            .map(|(rel, text)| {
+                (
+                    plan.stage.join(rel).to_string_lossy().into_owned(),
+                    text.clone(),
+                )
+            })
+            .collect();
+        let passes_json = serde_json::to_string(&(self.passes, &overrides))?;
         let hash = stage::content_hash([
             ("pibake", env!("CARGO_PKG_VERSION").as_bytes()),
             ("stage", stage_path.as_bytes()),
@@ -566,6 +597,7 @@ impl Bundler<'_> {
             ("staleness", STALENESS.as_bytes()),
             ("baked", baked_all.as_bytes()),
             ("owned", owned_json.as_bytes()),
+            ("passes", passes_json.as_bytes()),
         ]);
         let mut report_out = None;
         let outcome = stage::publish(self.root, &hash, log, |dir, log| {
@@ -580,6 +612,7 @@ impl Bundler<'_> {
                 owned: owned.clone(),
                 outfile: dir.join(MAIN),
                 write,
+                overrides: overrides.clone(),
             };
             log(format!(
                 "esbuild: Pi and {} extension entry points",
@@ -600,7 +633,8 @@ impl Bundler<'_> {
                     );
                 }
             }
-            let report = report(&plan.baked, &failed, &result, plan.unbaked.clone());
+            let mut report = report(&plan.baked, &failed, &result, plan.unbaked.clone());
+            report.passes = rewritten.reports.clone();
             fs::write(dir.join(LAUNCHER), LAUNCHER_TEXT)?;
             fs::write(dir.join("entry.mjs"), ENTRY)?;
             fs::write(dir.join("baked.mjs"), baked_module(&kept))?;

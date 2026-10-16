@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
+use crate::passes::{self, Pass};
 use crate::paths;
 
 pub const FILE_NAME: &str = "pibake.toml";
@@ -16,6 +17,7 @@ pub struct Config {
     pub dir: PathBuf,
     /// The executable's file name, in `target/pibake/bin/` and when installed.
     pub name: String,
+    pub passes: passes::Options,
 }
 
 #[derive(Deserialize, Default)]
@@ -25,12 +27,21 @@ struct RawConfig {
     source: RawSource,
     #[serde(default)]
     build: RawBuild,
+    #[serde(default)]
+    trim: RawTrim,
 }
 
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct RawBuild {
     name: Option<String>,
+    passes: Option<Vec<Pass>>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawTrim {
+    highlight_languages: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -67,6 +78,13 @@ impl Config {
             agent_dir: paths::normalize(&config_dir.join(paths::expand_tilde(agent_dir, home))),
             dir: config_dir.to_path_buf(),
             name,
+            passes: passes::Options {
+                passes: raw.build.passes.unwrap_or(passes::DEFAULT_PASSES.to_vec()),
+                highlight_languages: raw
+                    .trim
+                    .highlight_languages
+                    .unwrap_or_else(|| passes::DEFAULT_LANGUAGES.map(str::to_owned).to_vec()),
+            },
         })
     }
 }
@@ -116,6 +134,22 @@ mod tests {
             let err = parse(&format!("[build]\nname = {bad:?}")).unwrap_err();
             assert!(format!("{err:#}").contains("file name"), "{bad}: {err:#}");
         }
+    }
+
+    #[test]
+    fn passes_default_on_and_switch_off() {
+        let default = parse("").unwrap().passes;
+        assert_eq!(default.passes, [Pass::TrimHighlight]);
+        assert!(default.highlight_languages.iter().any(|l| l == "rust"));
+        let off = parse("[build]\npasses = []").unwrap().passes;
+        assert!(off.passes.is_empty());
+        let langs = parse("[trim]\nhighlight_languages = [\"rust\"]")
+            .unwrap()
+            .passes;
+        assert_eq!(langs.highlight_languages, ["rust"]);
+        let err = parse("[build]\npasses = [\"trim_everything\"]").unwrap_err();
+        assert!(format!("{err:#}").contains("trim_highlight"), "{err:#}");
+        assert!(parse("[trim]\nlanguages = []").is_err());
     }
 
     #[test]

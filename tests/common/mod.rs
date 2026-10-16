@@ -168,3 +168,52 @@ pub fn bundled_launcher(stdout: &str) -> std::path::PathBuf {
         .unwrap_or_else(|| panic!("no bundle path in:\n{stdout}"));
     std::path::PathBuf::from(line.rsplit(' ').next().unwrap())
 }
+
+/// highlight.js's `lib/index.js` (10.7.3 shape) registering `names`.
+pub fn highlight_index_js(names: &[&str]) -> String {
+    let mut s = String::from("var hljs = require('./core');\n\n");
+    for n in names {
+        s.push_str(&format!(
+            "hljs.registerLanguage('{n}', require('./languages/{n}'));\n"
+        ));
+    }
+    s.push_str("\nmodule.exports = hljs;\n");
+    s
+}
+
+fn grammar_binding(name: &str) -> String {
+    format!("lang_{}", name.replace('-', "_"))
+}
+
+/// Pi 1.3.0's `dist/utils/syntax-highlight.js` shape, registering `eager` at startup.
+pub fn syntax_highlight_js(eager: &[&str]) -> String {
+    let mut s = String::from("import hljs from \"highlight.js/lib/core.js\";\n");
+    for n in eager {
+        s.push_str(&format!(
+            "import {} from \"highlight.js/lib/languages/{n}.js\";\n",
+            grammar_binding(n)
+        ));
+    }
+    s.push_str("import { decodeHtmlEntityAt } from \"./html.js\";\nconst eagerLanguages = {\n");
+    for n in eager {
+        s.push_str(&format!("    \"{n}\": {},\n", grammar_binding(n)));
+    }
+    s.push_str(
+        "};\nfor (const [name, language] of Object.entries(eagerLanguages)) {\n    hljs.registerLanguage(name, language);\n}\nexport function loadAllHighlightLanguages() {\n    return import(\"highlight.js/lib/index.js\");\n}\nexport const decode = decodeHtmlEntityAt;\n",
+    );
+    s
+}
+
+pub const HIGHLIGHT_INDEX: &str = "node_modules/highlight.js/lib/index.js";
+pub const SYNTAX_HIGHLIGHT: &str =
+    "node_modules/@earendil-works/pi-coding-agent/dist/utils/syntax-highlight.js";
+
+/// The two files `trim_highlight` rewrites, in a stage.
+pub fn write_highlight_stage(stage: &Path, index: &[&str], eager: &[&str]) {
+    write(
+        &stage.join("node_modules/highlight.js/package.json"),
+        r#"{"name": "highlight.js", "version": "10.7.3"}"#,
+    );
+    write(&stage.join(HIGHLIGHT_INDEX), &highlight_index_js(index));
+    write(&stage.join(SYNTAX_HIGHLIGHT), &syntax_highlight_js(eager));
+}

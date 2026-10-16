@@ -12,6 +12,7 @@ use pibake::bundle::{
 };
 use pibake::inventory;
 use pibake::lock::PI_PACKAGE;
+use pibake::passes::{Options, Pass};
 use pibake::stage::{MARKER, Outcome};
 
 const PI_CLI: &str = "#!/usr/bin/env node\nimport { setupCli } from \"./cli/setup.js\";\nimport { main } from \"./main.js\";\nsetupCli();\nmain(process.argv.slice(2));\n//# sourceMappingURL=cli.js.map\n";
@@ -67,6 +68,7 @@ impl Fixture {
         Bundler {
             root: &self.path("bundles"),
             build: &build,
+            passes: &Options::none(),
         }
         .run(&self.plan()?, &mut |_| {})
     }
@@ -294,6 +296,7 @@ fn pi_failing_alone_is_an_error_and_leaves_nothing() {
     let err = Bundler {
         root: &f.path("bundles"),
         build: &build,
+        passes: &Options::none(),
     }
     .run(&f.plan().unwrap(), &mut |_| {})
     .unwrap_err();
@@ -326,6 +329,72 @@ fn changed_inputs_get_their_own_bundle() {
     assert!(matches!(second, Outcome::Built(_)));
     assert_ne!(dir(&first), dir(&second));
     assert_eq!(f.bundle_entries().len(), 2);
+}
+
+fn trim(langs: &[&str]) -> Options {
+    Options {
+        passes: vec![Pass::TrimHighlight],
+        highlight_languages: langs.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+#[test]
+fn pass_rewrites_reach_the_build_and_key_the_bundle() {
+    let f = Fixture::new();
+    common::write_highlight_stage(&f.path("stage"), &["rust", "go", "xml"], &["rust", "go"]);
+    let seen = RefCell::new(vec![]);
+    let build = |c: &BuildConfig| {
+        seen.borrow_mut().push(c.overrides.clone());
+        FakeBuild::new(&[]).run(c)
+    };
+    let run = |options: &Options| {
+        Bundler {
+            root: &f.path("bundles"),
+            build: &build,
+            passes: options,
+        }
+        .run(&f.plan().unwrap(), &mut |_| {})
+    };
+    let (first, report) = run(&trim(&["rust"])).unwrap();
+    let overrides = seen.borrow()[0].clone();
+    let index = f.path("stage").join(common::HIGHLIGHT_INDEX);
+    let syntax = f.path("stage").join(common::SYNTAX_HIGHLIGHT);
+    assert_eq!(
+        overrides.keys().cloned().collect::<Vec<_>>(),
+        [syntax, index].map(|p| p.to_string_lossy().into_owned())
+    );
+    assert_eq!(report.passes.len(), 1);
+    assert_eq!(report.passes[0].changes.len(), 2);
+    assert!(
+        report.summary().contains(&format!(
+            "  pass trim_highlight: {}: kept 1 of 3 languages\n",
+            common::HIGHLIGHT_INDEX
+        )),
+        "{}",
+        report.summary()
+    );
+    let stored: pibake::bundle::Report =
+        serde_json::from_slice(&fs::read(dir(&first).join(REPORT)).unwrap()).unwrap();
+    assert_eq!(stored, report);
+
+    // Other options are another bundle; the same ones a cache hit.
+    let (second, _) = run(&trim(&["rust", "xml"])).unwrap();
+    assert_ne!(dir(&first), dir(&second));
+    let (third, _) = run(&Options::none()).unwrap();
+    assert!(seen.borrow().last().unwrap().is_empty());
+    assert_ne!(dir(&third), dir(&first));
+    let calls = seen.borrow().len();
+    assert!(matches!(
+        run(&trim(&["rust"])).unwrap().0,
+        Outcome::Cached(_)
+    ));
+    assert_eq!(seen.borrow().len(), calls);
+
+    // A pass that fails stops the bundle before esbuild runs.
+    let err = run(&trim(&["cobol"])).unwrap_err();
+    assert!(format!("{err:#}").contains("cobol"), "{err:#}");
+    assert_eq!(seen.borrow().len(), calls);
+    assert_eq!(f.bundle_entries().len(), 3);
 }
 
 const ONCE_TS: &str = r#"const g = globalThis as any;
@@ -516,4 +585,131 @@ fn e2e_bundle_the_live_setup() {
         before,
         "~/.pi/agent changed"
     );
+}
+
+/// Calls Pi's own code-block highlighter (`getMarkdownTheme().highlightCode`, what markdown
+/// fences render through) and reports per language whether the output differs from plain text.
+/// Where it can, it first loads highlight.js's full language set, as interactive mode does
+/// after its first render.
+const RENDER_TS: &str = r#"import { getMarkdownTheme, initTheme } from "@earendil-works/pi-coding-agent";
+
+const samples: Record<string, string> = {
+	rust: "fn main() { let x = 1; }",
+	python: "def f():\n    return 1",
+	yaml: "key: value\nlist:\n  - 1",
+	fortran: "program hello\n  print *, \"hi\"\nend program hello",
+};
+
+export default async function (pi: any) {
+	let lazy = "unavailable";
+	try {
+		await import("highlight.js/lib/index.js");
+		lazy = "loaded";
+	} catch {}
+	initTheme();
+	const md = getMarkdownTheme();
+	const result: Record<string, string> = { lazy };
+	for (const [lang, code] of Object.entries(samples)) {
+		const out = md.highlightCode!(code, lang).join("\n");
+		result[lang] = out === md.highlightCode!(code, "pibake-unknown").join("\n") ? "plain" : "highlighted";
+	}
+	pi.registerCommand("render-check", { description: JSON.stringify(result), handler: async () => {} });
+}
+"#;
+
+/// Real `pi`, `node` and npm (network): a setup trimmed to rust and yaml highlights those, and
+/// renders python (startup) and fortran (loaded later) as plain text, without errors.
+#[test]
+fn e2e_trimmed_highlighting_renders() {
+    use pibake::fake_provider::FakeProvider;
+    use pibake::harness::PiCommand;
+    use pibake::snapshot;
+
+    if !e2e_enabled() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let agent = root.path().join("agent");
+    write(&agent.join("settings.json"), "{}");
+    write(&agent.join("extensions/render.ts"), RENDER_TS);
+    let project = root.path().join("project");
+    let source = format!("[source]\nagent_dir = \"{}\"\n", agent.display());
+    write(
+        &project.join("pibake.toml"),
+        &format!("{source}[trim]\nhighlight_languages = [\"rust\", \"yaml\"]\n"),
+    );
+    write(
+        &project.join("off.toml"),
+        &format!("{source}[build]\npasses = []\n"),
+    );
+    pibake(&project, &["lock"], true);
+    let stdout = pibake(&project, &["bundle"], true);
+    assert!(
+        stdout.contains(
+            "pass trim_highlight: node_modules/highlight.js/lib/index.js: kept 2 of 191 languages\n"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("startup languages: "),
+        "python and the other startup languages are dropped: {stdout}"
+    );
+    let trimmed = bundled_launcher(&stdout);
+    let off = bundled_launcher(&pibake(&project, &["--config", "off.toml", "bundle"], true));
+    let grammars = |launcher: &Path| -> Vec<String> {
+        let main = fs::read_to_string(launcher.with_file_name("main.mjs")).unwrap();
+        ["rust", "yaml", "python", "fortran"]
+            .into_iter()
+            .filter(|l| {
+                main.contains(&format!(
+                    "// node_modules/highlight.js/lib/languages/{l}.js\n"
+                ))
+            })
+            .map(str::to_owned)
+            .collect()
+    };
+    assert_eq!(grammars(&trimmed), ["rust", "yaml"]);
+    assert_eq!(grammars(&off), ["rust", "yaml", "python", "fortran"]);
+    let size = |l: &Path| fs::metadata(l.with_file_name("main.mjs")).unwrap().len();
+    assert!(
+        size(&trimmed) + 1_000_000 < size(&off),
+        "{} vs {}",
+        size(&trimmed),
+        size(&off)
+    );
+
+    let home = pibake::paths::home_dir().unwrap();
+    let provider = FakeProvider::start().unwrap();
+    let render = |pi: &str| -> serde_json::Value {
+        let snap =
+            snapshot::capture(&PiCommand::parse(pi).unwrap(), &agent, &home, &provider).unwrap();
+        let cmd = snap
+            .commands
+            .iter()
+            .find(|c| c["name"] == "render-check")
+            .unwrap_or_else(|| panic!("no render-check in {:?}", snap.commands));
+        serde_json::from_str(cmd["description"].as_str().unwrap()).unwrap()
+    };
+    let expect = |lazy: &str, highlighted: &[&str]| {
+        let mut v = serde_json::json!({ "lazy": lazy });
+        for l in ["rust", "python", "yaml", "fortran"] {
+            v[l] = (if highlighted.contains(&l) {
+                "highlighted"
+            } else {
+                "plain"
+            })
+            .into();
+        }
+        v
+    };
+    assert_eq!(
+        render(&format!("node {}", trimmed.display())),
+        expect("loaded", &["rust", "yaml"])
+    );
+    assert_eq!(
+        render(&format!("node {}", off.display())),
+        expect("loaded", &["rust", "python", "yaml", "fortran"])
+    );
+    // Stock Pi: its startup languages only; the extension cannot reach highlight.js from disk.
+    assert_eq!(render("pi"), expect("unavailable", &["rust", "python"]));
 }
