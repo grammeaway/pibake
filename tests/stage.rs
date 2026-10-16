@@ -140,7 +140,7 @@ impl Fixture {
 
 fn staged(outcome: Result<Outcome>) -> PathBuf {
     match outcome.unwrap() {
-        Outcome::Staged(dir) => dir,
+        Outcome::Built(dir) => dir,
         Outcome::Cached(dir) => panic!("expected a fresh stage, got the cached {}", dir.display()),
     }
 }

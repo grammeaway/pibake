@@ -16,7 +16,7 @@ use crate::package::Source;
 
 /// Under the directory holding `pibake.toml`.
 pub const STAGE_ROOT: &str = "target/pibake/stage";
-/// Written last; a stage directory without it is not used.
+/// Written last; a stage or bundle directory without it is not used.
 pub const MARKER: &str = ".pibake-staged";
 
 /// What a stage is built from, read once: the hash covers exactly the bytes that get staged.
@@ -235,9 +235,10 @@ pub fn run_npm(dir: &Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug)]
 pub enum Outcome {
     Cached(PathBuf),
-    Staged(PathBuf),
+    Built(PathBuf),
 }
 
 pub struct Stager<'a> {
@@ -246,34 +247,44 @@ pub struct Stager<'a> {
     pub npm: Npm<'a>,
 }
 
-impl Stager<'_> {
-    pub fn run(&self, inputs: &Inputs, log: &mut dyn FnMut(String)) -> Result<Outcome> {
-        let target = self.root.join(&inputs.hash);
+/// `<root>/<hash>`, reused if complete, else filled by `fill` beside it and renamed into place,
+/// so an interrupted build never sits at `<hash>`.
+pub fn publish(
+    root: &Path,
+    hash: &str,
+    log: &mut dyn FnMut(String),
+    fill: impl FnOnce(&Path, &mut dyn FnMut(String)) -> Result<()>,
+) -> Result<Outcome> {
+    let target = root.join(hash);
+    if target.join(MARKER).is_file() {
+        return Ok(Outcome::Cached(target));
+    }
+    if target.exists() {
+        log(format!("{} is incomplete; rebuilding it", target.display()));
+        fs::remove_dir_all(&target)?;
+    }
+    fs::create_dir_all(root)?;
+    // Dropped (removed) on error.
+    let tmp = tempfile::Builder::new().prefix(".tmp-").tempdir_in(root)?;
+    fill(tmp.path(), log)?;
+    fs::write(tmp.path().join(MARKER), format!("{hash}\n"))?;
+    let tmp = tmp.keep();
+    if let Err(e) = fs::rename(&tmp, &target) {
+        fs::remove_dir_all(&tmp)?;
+        // A concurrent build of the same inputs got there first.
         if target.join(MARKER).is_file() {
             return Ok(Outcome::Cached(target));
         }
-        if target.exists() {
-            log(format!("{} is incomplete; rebuilding it", target.display()));
-            fs::remove_dir_all(&target)?;
-        }
-        fs::create_dir_all(self.root)?;
-        // Built beside the target and renamed into place, so an interrupted stage never
-        // sits at `<hash>`. Dropped (removed) on error.
-        let tmp = tempfile::Builder::new()
-            .prefix(".tmp-")
-            .tempdir_in(self.root)?;
-        self.fill(tmp.path(), inputs, log)?;
-        fs::write(tmp.path().join(MARKER), format!("{}\n", inputs.hash))?;
-        let tmp = tmp.keep();
-        if let Err(e) = fs::rename(&tmp, &target) {
-            fs::remove_dir_all(&tmp)?;
-            // A concurrent stage of the same inputs got there first.
-            if target.join(MARKER).is_file() {
-                return Ok(Outcome::Cached(target));
-            }
-            return Err(e).with_context(|| format!("renaming into {}", target.display()));
-        }
-        Ok(Outcome::Staged(target))
+        return Err(e).with_context(|| format!("renaming into {}", target.display()));
+    }
+    Ok(Outcome::Built(target))
+}
+
+impl Stager<'_> {
+    pub fn run(&self, inputs: &Inputs, log: &mut dyn FnMut(String)) -> Result<Outcome> {
+        publish(self.root, &inputs.hash, log, |dir, log| {
+            self.fill(dir, inputs, log)
+        })
     }
 
     fn fill(&self, dir: &Path, inputs: &Inputs, log: &mut dyn FnMut(String)) -> Result<()> {

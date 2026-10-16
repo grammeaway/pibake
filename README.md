@@ -49,6 +49,7 @@ agent_dir = "."
 | `pibake inspect` | Lists what the setup contains, and what is config versus state |
 | `pibake lock [--update]` | Resolves and pins versions. Without `--update`, a second run changes nothing |
 | `pibake stage` | Installs the lock into `target/pibake/stage/<hash>/`, reused while the lock and local extensions are unchanged |
+| `pibake bundle` | Stages, then bundles Pi and every extension into `target/pibake/bundle/<hash>/pi.mjs` (`node` runs it), with a per-extension compatibility report |
 | `pibake build` | Builds the binary. Content-hashed caches skip unchanged work |
 | `pibake verify` | Diffs the binary's tools, commands and system prompt against stock Pi on the same setup |
 | `pibake bench` | Startup time, memory, and CPU over a streamed large write, against stock Pi |
@@ -71,7 +72,7 @@ pibake.lock ─► stage ─► passes ─► bundle ─► backend ─► verif
 
 - **Stage:** a clean, pinned install of Pi and your packages.
 - **Passes:** optimizations on the bundled code that only make sense when the whole setup is known, such as dropping unused providers and highlight.js languages. Written in Rust on [oxc](https://oxc.rs).
-- **Bundle:** one file, with every extension imported directly instead of discovered at runtime.
+- **Bundle:** one file holding Pi and every extension. Pi still discovers and orders extensions as usual; the bundle answers its loader with the baked code instead of transpiling from disk, and anything it did not bake (a project extension, one added later) loads as in stock Pi.
 - **Backend:** Node's [single executable applications](https://nodejs.org/api/single-executable-applications.html), with V8's code cache first and a startup snapshot later. Node is the runtime Pi targets, so there is no runtime drift. Other backends ([Pi-Bolt](https://github.com/opensec-git/Pi-Bolt)'s ahead-of-time compiled JavaScriptCore, `deno compile`) can plug in at the same point later.
 
 Every optimization is measured against stock Pi by `pibake bench`, and kept only if the numbers say so.

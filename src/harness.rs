@@ -9,6 +9,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
+use crate::lock::PI_PACKAGE;
 use crate::{fake_provider, inventory};
 
 /// Passed through from pibake's environment; everything else is cleared.
@@ -141,7 +142,8 @@ impl PiCommand {
         })
     }
 
-    /// The `@earendil-works/pi-coding-agent` package the program runs from, if it is a stock install.
+    /// The `@earendil-works/pi-coding-agent` package the program runs from: a stock install the
+    /// program is part of, or for `node <script>`, the one the script would import (a bundle).
     pub fn package_dir(&self) -> Option<PathBuf> {
         let program = Path::new(&self.program);
         let found = if program.components().count() > 1 {
@@ -151,16 +153,22 @@ impl PiCommand {
                 .map(|dir| dir.join(program))
                 .find(|p| p.is_file())?
         };
-        fs::canonicalize(found)
-            .ok()?
+        let is_pi = |dir: &Path| {
+            fs::read_to_string(dir.join("package.json"))
+                .ok()
+                .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+                .is_some_and(|p| p["name"] == PI_PACKAGE)
+        };
+        let found = fs::canonicalize(found).ok()?;
+        if let Some(dir) = found.ancestors().find(|d| is_pi(d)) {
+            return Some(dir.to_path_buf());
+        }
+        let script = fs::canonicalize(self.args.first()?).ok()?;
+        script
             .ancestors()
-            .find(|dir| {
-                fs::read_to_string(dir.join("package.json"))
-                    .ok()
-                    .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-                    .is_some_and(|p| p["name"] == "@earendil-works/pi-coding-agent")
-            })
-            .map(Path::to_path_buf)
+            .map(|d| d.join("node_modules").join(PI_PACKAGE))
+            .find(|d| is_pi(d))
+            .and_then(|d| fs::canonicalize(d).ok())
     }
 }
 
@@ -195,6 +203,31 @@ mod tests {
         assert_eq!(cmd.package_dir(), Some(fs::canonicalize(&pkg).unwrap()));
         let missing = PiCommand::parse("/nonexistent/pi").unwrap();
         assert_eq!(missing.package_dir(), None);
+    }
+
+    #[test]
+    fn finds_the_package_a_node_script_would_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("stage/node_modules").join(PI_PACKAGE);
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(
+            pkg.join("package.json"),
+            format!(r#"{{"name":"{PI_PACKAGE}"}}"#),
+        )
+        .unwrap();
+        let bundle = dir.path().join("bundle/abc");
+        fs::create_dir_all(&bundle).unwrap();
+        symlink(
+            dir.path().join("stage/node_modules"),
+            bundle.join("node_modules"),
+        )
+        .unwrap();
+        fs::write(bundle.join("pi.mjs"), "").unwrap();
+        let script = bundle.join("pi.mjs");
+        let cmd = PiCommand::parse(&format!("node {}", script.display())).unwrap();
+        assert_eq!(cmd.package_dir(), Some(fs::canonicalize(&pkg).unwrap()));
+        let no_script = PiCommand::parse("node /nonexistent.mjs").unwrap();
+        assert_eq!(no_script.package_dir(), None);
     }
 
     #[test]

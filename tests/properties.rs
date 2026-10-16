@@ -422,3 +422,108 @@ fn stage_hash_follows_extension_bytes_not_creation_order(tc: TestCase) {
     content[at] ^= tc.draw(gs::integers::<u8>().min_value(1));
     assert_ne!(agent("c", &changed), hash);
 }
+
+/// A random import graph over a few files, some of them in Pi's packages.
+fn draw_metafile(tc: &TestCase) -> (Vec<String>, pibake::bundle::Metafile) {
+    let names: Vec<String> = (0..8)
+        .map(|i| {
+            if i % 3 == 2 {
+                format!("node_modules/@earendil-works/pi-ai/f{i}.js")
+            } else {
+                format!("node_modules/p{i}/i.js")
+            }
+        })
+        .collect();
+    let edges = tc.draw(gs::vecs(gs::tuples2(
+        gs::integers::<usize>().max_value(7),
+        gs::integers::<usize>().max_value(7),
+    )));
+    let mut inputs = std::collections::BTreeMap::<String, pibake::bundle::Input>::new();
+    for (from, to) in edges {
+        inputs
+            .entry(names[from].clone())
+            .or_default()
+            .imports
+            .push(pibake::bundle::Import {
+                path: names[to].clone(),
+            });
+    }
+    (names, pibake::bundle::Metafile { inputs })
+}
+
+#[hegel::test(test_cases = 300)]
+fn reach_is_the_closure_outside_pi(tc: TestCase) {
+    let (names, metafile) = draw_metafile(&tc);
+    let start = &names[tc.draw(gs::integers::<usize>().max_value(7))];
+    let is_pi = |f: &str| f.starts_with("node_modules/@earendil-works/");
+    // Fixed point: add every non-Pi target of an edge out of the set.
+    let mut closure = std::collections::BTreeSet::new();
+    if !is_pi(start) {
+        closure.insert(start.clone());
+    }
+    loop {
+        let before = closure.len();
+        for (from, input) in &metafile.inputs {
+            if closure.contains(from) {
+                closure.extend(
+                    input
+                        .imports
+                        .iter()
+                        .map(|i| i.path.clone())
+                        .filter(|p| !is_pi(p)),
+                );
+            }
+        }
+        if closure.len() == before {
+            break;
+        }
+    }
+    assert_eq!(pibake::bundle::reach(&metafile, start), closure);
+}
+
+#[hegel::test(test_cases = 300)]
+fn every_warning_is_reported_once_for_pi_or_for_the_extensions_reaching_it(tc: TestCase) {
+    use pibake::bundle::{Baked, BuildResult, Message, reach, report};
+    let (names, metafile) = draw_metafile(&tc);
+    let entries = tc.draw(gs::vecs(gs::integers::<usize>().max_value(7)).max_size(4));
+    let baked: Vec<Baked> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, &n)| Baked {
+            owner: format!("o{i}"),
+            key: format!("k{i}"),
+            stage_path: names[n].clone(),
+        })
+        .collect();
+    let warnings: Vec<Message> = tc
+        .draw(gs::vecs(gs::integers::<usize>().max_value(7)).max_size(6))
+        .into_iter()
+        .enumerate()
+        .map(|(i, n)| Message {
+            text: format!("w{i}"),
+            id: None,
+            file: Some(names[n].clone()),
+            line: None,
+        })
+        .collect();
+    let result = BuildResult {
+        warnings: warnings.clone(),
+        metafile: Some(metafile.clone()),
+        ..Default::default()
+    };
+    let r = report(&baked, &Default::default(), &result, vec![]);
+    for w in &warnings {
+        let file = w.file.as_ref().unwrap();
+        let in_pi = r.pi_warnings.contains(w);
+        for (b, e) in baked.iter().zip(&r.extensions) {
+            assert_eq!(
+                e.warnings.contains(w),
+                reach(&metafile, &b.stage_path).contains(file),
+                "{w:?} for {}",
+                b.stage_path
+            );
+        }
+        let in_any = r.extensions.iter().any(|e| e.warnings.contains(w));
+        assert!(in_pi != in_any, "{w:?}: pi {in_pi}, extensions {in_any}");
+    }
+}

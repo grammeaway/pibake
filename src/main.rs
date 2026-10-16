@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 use pibake::bench::{self, Bench};
 use pibake::fake_provider::FakeProvider;
 use pibake::harness::PiCommand;
-use pibake::{config::Config, inventory, lock, paths, snapshot, stage};
+use pibake::{bundle, config::Config, inventory, lock, paths, snapshot, stage};
 
 #[derive(Parser)]
 #[command(version, about = "Build a Pi agent directory into one executable")]
@@ -34,6 +34,8 @@ enum Command {
     },
     /// Install the lock into target/pibake/stage/<hash>/ beside pibake.toml, or reuse it
     Stage,
+    /// Stage, then bundle Pi and its extensions into target/pibake/bundle/<hash>/pi.mjs
+    Bundle,
     /// Compare tools, system prompt and commands of two Pi commands on the same setup
     Verify {
         /// The Pi command under test, e.g. `pi` or `pi -ne`
@@ -54,6 +56,15 @@ enum Command {
         #[arg(long)]
         record: Option<String>,
     },
+}
+
+fn run_stage(config: &Config, inventory: &inventory::Inventory) -> Result<stage::Outcome> {
+    let inputs = stage::Inputs::read(&config.dir, inventory)?;
+    let stager = stage::Stager {
+        root: &config.dir.join(stage::STAGE_ROOT),
+        npm: &stage::run_npm,
+    };
+    stager.run(&inputs, &mut |step| eprintln!("stage: {step}"))
 }
 
 fn main() -> Result<ExitCode> {
@@ -102,16 +113,33 @@ fn main() -> Result<ExitCode> {
         }
         Command::Stage => {
             let inventory = inventory::read(&config.agent_dir, &home)?;
-            let inputs = stage::Inputs::read(&config.dir, &inventory)?;
-            let stager = stage::Stager {
-                root: &config.dir.join(stage::STAGE_ROOT),
-                npm: &stage::run_npm,
-            };
-            match stager.run(&inputs, &mut |step| eprintln!("stage: {step}"))? {
+            match run_stage(&config, &inventory)? {
                 stage::Outcome::Cached(dir) => {
                     writeln!(out, "stage up to date: {}", dir.display())?
                 }
-                stage::Outcome::Staged(dir) => writeln!(out, "staged {}", dir.display())?,
+                stage::Outcome::Built(dir) => writeln!(out, "staged {}", dir.display())?,
+            }
+        }
+        Command::Bundle => {
+            let inventory = inventory::read(&config.agent_dir, &home)?;
+            let (stage::Outcome::Cached(stage_dir) | stage::Outcome::Built(stage_dir)) =
+                run_stage(&config, &inventory)?;
+            let plan = bundle::Plan::new(&inventory, &stage_dir)?;
+            let bundler = bundle::Bundler {
+                root: &config.dir.join(bundle::BUNDLE_ROOT),
+                build: &bundle::run_node_build,
+            };
+            let (outcome, report) = bundler.run(&plan, &mut |step| eprintln!("bundle: {step}"))?;
+            write!(out, "{}", report.summary())?;
+            match outcome {
+                stage::Outcome::Cached(dir) => writeln!(
+                    out,
+                    "bundle up to date: {}",
+                    dir.join(bundle::LAUNCHER).display()
+                )?,
+                stage::Outcome::Built(dir) => {
+                    writeln!(out, "bundled {}", dir.join(bundle::LAUNCHER).display())?
+                }
             }
         }
         Command::Verify { pi, against } => {

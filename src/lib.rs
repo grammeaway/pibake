@@ -1,4 +1,5 @@
 pub mod bench;
+pub mod bundle;
 pub mod config;
 pub mod diff;
 pub mod fake_provider;
