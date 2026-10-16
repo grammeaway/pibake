@@ -219,7 +219,7 @@ impl Setup {
 }
 
 /// `HEAD` of the checkout at `dir`. Warns when tracked files differ from it.
-fn git_head(dir: &Path, warn: &mut dyn FnMut(String)) -> Result<String> {
+pub(crate) fn git_head(dir: &Path, warn: &mut dyn FnMut(String)) -> Result<String> {
     // Without its own `.git`, git would report an enclosing repository's HEAD.
     if !dir.join(".git").exists() {
         bail!("{} is not a git checkout", dir.display());

@@ -155,4 +155,38 @@ fn e2e_build_a_fixture_setup() {
         "{installed}"
     );
     assert!(fs::read(&target).unwrap() == first);
+
+    // An edited extension: one line on stderr and Pi still runs. The edit changes nothing Pi
+    // reports, so `verify` still agrees: the line never reaches the model.
+    let stderr = |envs: &[(&str, &str)]| {
+        let out = Command::new(&bin)
+            .arg("--help")
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", "/nonexistent")
+            .env("PI_CODING_AGENT_DIR", &agent)
+            .envs(envs.iter().copied())
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert!(String::from_utf8_lossy(&out.stdout).contains("Usage"));
+        String::from_utf8(out.stderr).unwrap()
+    };
+    assert_eq!(stderr(&[]), "");
+    let located = agent.join("extensions/located.js");
+    let source = fs::read_to_string(&located).unwrap();
+    fs::write(&located, format!("{source}// edited\n")).unwrap();
+    assert_eq!(
+        stderr(&[]),
+        "pi-test: built from an older setup (extensions/located.js edited); run pibake install\n"
+    );
+    assert_eq!(stderr(&[("PIBAKE_NO_STALENESS_CHECK", "1")]), "");
+    let verify = pibake(
+        &project,
+        &["verify", "--pi", bin.to_str().unwrap(), "--against", "pi"],
+        true,
+    );
+    assert!(verify.starts_with("same: "), "{verify}");
+    fs::write(&located, source).unwrap();
+    assert_eq!(stderr(&[]), "");
 }

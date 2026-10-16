@@ -98,6 +98,8 @@ const plugin = {
 			if (r.errors.length) throw new Error(`pibake: ${r.errors[0].text}`);
 			return { path: r.path };
 		});
+		build.onResolve({ filter: /^pibake:staleness$/ }, () => ({ path: "staleness", namespace: "pibake-staleness" }));
+		build.onLoad({ filter: /.*/, namespace: "pibake-staleness" }, () => ({ contents: config.staleness, loader: "js" }));
 		build.onResolve({ filter: /^pibake:baked$/ }, () => ({ path: "baked", namespace: "pibake-baked" }));
 		build.onLoad({ filter: /.*/, namespace: "pibake-baked" }, () => ({
 			contents: config.baked,

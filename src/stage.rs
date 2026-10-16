@@ -59,7 +59,12 @@ impl Inputs {
         let mut extensions = BTreeMap::new();
         let dir = inventory.agent_dir.join("extensions");
         if dir.exists() {
-            read_tree(&dir, "", &mut extensions)?;
+            walk_tree(&dir, "", &mut |rel, path, _| {
+                let bytes =
+                    fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+                extensions.insert(rel, bytes);
+                Ok(())
+            })?;
         }
 
         let version = env!("CARGO_PKG_VERSION").as_bytes();
@@ -148,8 +153,13 @@ fn check_git_pin(pin: &lock::GitPin) -> Result<()> {
     Ok(())
 }
 
-/// Files under `dir`, following file symlinks. Directory symlinks are refused (loops).
-fn read_tree(dir: &Path, prefix: &str, out: &mut BTreeMap<String, Vec<u8>>) -> Result<()> {
+/// Calls `file` with the `/`-separated relative path, path and (followed) metadata of each file
+/// under `dir`, following file symlinks. Directory symlinks are refused (loops).
+pub(crate) fn walk_tree(
+    dir: &Path,
+    prefix: &str,
+    file: &mut dyn FnMut(String, &Path, &fs::Metadata) -> Result<()>,
+) -> Result<()> {
     for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
         let entry = entry?;
         let name = entry.file_name();
@@ -166,12 +176,9 @@ fn read_tree(dir: &Path, prefix: &str, out: &mut BTreeMap<String, Vec<u8>>) -> R
                     path.display()
                 );
             }
-            read_tree(&path, &format!("{rel}/"), out)?;
+            walk_tree(&path, &format!("{rel}/"), file)?;
         } else if meta.is_file() {
-            out.insert(
-                rel,
-                fs::read(&path).with_context(|| format!("reading {}", path.display()))?,
-            );
+            file(rel, &path, &meta)?;
         } else {
             bail!("{} is neither a file nor a directory", path.display());
         }

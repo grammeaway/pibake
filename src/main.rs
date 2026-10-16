@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 use pibake::bench::{self, Bench};
 use pibake::fake_provider::FakeProvider;
 use pibake::harness::PiCommand;
-use pibake::{bundle, config::Config, inventory, lock, paths, sea, snapshot, stage};
+use pibake::{bundle, config::Config, inventory, lock, paths, sea, snapshot, stage, staleness};
 
 #[derive(Parser)]
 #[command(version, about = "Build a Pi agent directory into one executable")]
@@ -124,6 +124,7 @@ fn run_bundle(
 fn run_build(config: &Config, home: &Path, out: &mut dyn Write) -> Result<Option<PathBuf>> {
     let inventory = inventory::read(&config.agent_dir, home)?;
     let host = lock::Host::find()?;
+    let setup = serde_json::to_value(staleness::read(&inventory, &host)?)?;
     if let lock::Outcome::Drift(items) =
         locker(config, &host).run(&inventory, false, &mut |w| eprintln!("warning: {w}"))?
     {
@@ -145,6 +146,7 @@ fn run_build(config: &Config, home: &Path, out: &mut dyn Write) -> Result<Option
         stage: &stage_dir,
         bundle: &bundle_dir,
         version: &version,
+        setup: &setup,
         output: &output,
         node: &sea::run_node,
     }

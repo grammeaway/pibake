@@ -40,6 +40,9 @@ const INSTALL_ROOTS: [&str; 2] = ["npm", "git"];
 pub struct Inventory {
     pub agent_dir: PathBuf,
     pub packages: Vec<Package>,
+    /// `packages` of `settings.json` as written; `null` when absent.
+    #[serde(skip)]
+    pub settings_packages: Value,
     /// The `extensions`, `skills`, `prompts` and `themes` arrays of `settings.json`, raw.
     pub settings_resources: BTreeMap<&'static str, Vec<String>>,
     pub local: LocalResources,
@@ -166,6 +169,7 @@ pub fn read(agent_dir: &Path, home: &Path) -> Result<Inventory> {
     Ok(Inventory {
         agent_dir: agent_dir.to_path_buf(),
         packages,
+        settings_packages: settings.get("packages").cloned().unwrap_or(Value::Null),
         settings_resources,
         local,
         config,

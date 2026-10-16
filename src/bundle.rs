@@ -26,16 +26,23 @@ pub const REPORT: &str = "report.json";
 const MAIN: &str = "main.mjs";
 const BUILD_SCRIPT: &str = include_str!("bundle/build.mjs");
 const PROLOGUE: &str = include_str!("bundle/prologue.mjs");
+/// `pibake:staleness`: the entry's check of the setup an executable was built from.
+pub const STALENESS: &str = include_str!("bundle/staleness.mjs");
 
 /// Stock Pi's `dist/cli.js`, plus what Pi's single-file (Bun) entry `dist/bun/runtime-setup.js`
 /// registers statically: OAuth flows and Bedrock, which Pi otherwise imports through variable
-/// specifiers next to its release chunks. Resolved from Pi's package directory.
+/// specifiers next to its release chunks. Resolved from Pi's package directory. First, in an
+/// executable, the staleness check against the agent directory Pi will use. Pi's modules are
+/// evaluated in the stock order: `dist/config.js` is already a dependency of `dist/main.js`.
 const ENTRY: &str = r#"import { setupCli } from "./dist/cli/setup.js";
 import { main } from "./dist/main.js";
+import { getAgentDir } from "./dist/config.js";
 import { registerBunOAuthFlows } from "@earendil-works/pi-ai/bun-oauth";
 import { bedrockProviderModule } from "@earendil-works/pi-ai/bedrock-provider";
 import { setBedrockProviderModule } from "@earendil-works/pi-ai/compat";
+import { checkSetup } from "pibake:staleness";
 
+checkSetup(getAgentDir(), globalThis.__pibake_setup);
 registerBunOAuthFlows();
 setBedrockProviderModule(bedrockProviderModule);
 setupCli();
@@ -284,6 +291,8 @@ pub struct BuildConfig {
     pub entry: String,
     /// The bundle's first code: where it is (the stage, or extracted files in an executable).
     pub prologue: String,
+    /// The module `pibake:staleness`.
+    pub staleness: String,
     pub baked: String,
     /// Absolute stage directory → agent-relative directory.
     pub owned: Vec<Owned>,
@@ -554,6 +563,7 @@ impl Bundler<'_> {
             ("entry", ENTRY.as_bytes()),
             ("launcher", LAUNCHER_TEXT.as_bytes()),
             ("prologue", PROLOGUE.as_bytes()),
+            ("staleness", STALENESS.as_bytes()),
             ("baked", baked_all.as_bytes()),
             ("owned", owned_json.as_bytes()),
         ]);
@@ -565,6 +575,7 @@ impl Bundler<'_> {
                 pi_dir: pi_dir.clone(),
                 entry: ENTRY.to_owned(),
                 prologue: prologue(&plan.stage),
+                staleness: STALENESS.to_owned(),
                 baked: baked_module(baked),
                 owned: owned.clone(),
                 outfile: dir.join(MAIN),

@@ -17,6 +17,8 @@ function __pibake_start() {
 		__pibake_fs.writeSync(1, `${info.version}\n`);
 		process.exit(0);
 	}
+	// What the executable was built from, for the entry's staleness check.
+	globalThis.__pibake_setup = info.setup;
 	const cache = process.env.XDG_CACHE_HOME;
 	const base = __pibake_join(cache && __pibake_isAbsolute(cache) ? cache : __pibake_join(__pibake_homedir(), ".cache"), "pibake");
 	const root = __pibake_join(base, info.hash);

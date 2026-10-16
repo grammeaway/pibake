@@ -116,6 +116,8 @@ pub struct Builder<'a> {
     pub bundle: &'a Path,
     /// What the executable prints for a lone `--version`.
     pub version: &'a str,
+    /// The setup it is built from (`staleness::Fingerprint`), checked at startup.
+    pub setup: &'a serde_json::Value,
     pub output: &'a Path,
     pub node: Node<'a>,
 }
@@ -140,7 +142,9 @@ impl Builder<'_> {
         let info = work.path().join("pibake.json");
         fs::write(
             &info,
-            serde_json::to_vec(&json!({ "version": self.version, "hash": hash }))?,
+            serde_json::to_vec(
+                &json!({ "version": self.version, "hash": hash, "setup": self.setup }),
+            )?,
         )?;
         let parent = self.output.parent().context("output has no directory")?;
         fs::create_dir_all(parent)?;
@@ -287,6 +291,7 @@ mod tests {
             stage: dir.path(),
             bundle: Path::new("/b"),
             version: "1.3.0 (pibake x)",
+            setup: &json!({ "pi": "fingerprint" }),
             output: &output,
             node: &node,
         }
@@ -304,6 +309,7 @@ mod tests {
         assert_eq!(config["mainFormat"], "module");
         assert_eq!(config["useCodeCache"], true);
         assert_eq!(info["version"], "1.3.0 (pibake x)");
+        assert_eq!(info["setup"], json!({ "pi": "fingerprint" }));
         assert_eq!(info["hash"].as_str().unwrap().len(), 16);
         let assets = config["assets"].as_object().unwrap();
         for f in PI_CHUNK_FILES {
@@ -323,6 +329,7 @@ mod tests {
             stage: dir.path(),
             bundle: Path::new("/b"),
             version: "v",
+            setup: &json!(null),
             output: &output,
             node: &|_| bail!("node broke"),
         }
@@ -342,6 +349,7 @@ mod tests {
             stage: dir.path(),
             bundle: Path::new("/b"),
             version: "v",
+            setup: &json!(null),
             output: &output,
             node: &|_| bail!("node broke"),
         }

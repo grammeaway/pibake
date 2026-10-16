@@ -62,7 +62,7 @@ agent_dir = "."
 2. **The agent directory:** auth, sessions, settings, skills and prompts, shared with stock Pi, so you can switch between the two freely.
 3. **Project `.pi/settings.json`**, as Pi applies it today.
 
-A binary built from a setup that has since changed says so in one line at startup.
+A binary built from a setup that has since changed (packages, their versions or git commits, local `extensions/` files, the global Pi) says so in one line on stderr at startup, naming what changed. `PIBAKE_NO_STALENESS_CHECK=1` turns that off.
 
 ## How it builds
 
