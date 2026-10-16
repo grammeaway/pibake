@@ -124,3 +124,47 @@ pub fn sample_npm_lock() -> serde_json::Value {
         },
     })
 }
+
+pub fn e2e_enabled() -> bool {
+    if std::env::var_os("PIBAKE_E2E").is_none() {
+        eprintln!("skipped: set PIBAKE_E2E=1");
+        return false;
+    }
+    true
+}
+
+/// Runs the pibake binary in `dir`; panics with its output unless it exits as expected.
+pub fn pibake(dir: &Path, args: &[&str], expect_success: bool) -> String {
+    pibake_with(dir, args, &[], expect_success)
+}
+
+/// As `pibake`, with environment variables set.
+pub fn pibake_with(
+    dir: &Path,
+    args: &[&str],
+    envs: &[(&str, &std::ffi::OsStr)],
+    expect_success: bool,
+) -> String {
+    let out = Command::new(env!("CARGO_BIN_EXE_pibake"))
+        .args(args)
+        .envs(envs.iter().copied())
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(
+        out.status.success(),
+        expect_success,
+        "pibake {args:?}:\n{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    stdout
+}
+
+pub fn bundled_launcher(stdout: &str) -> std::path::PathBuf {
+    let line = stdout
+        .lines()
+        .find(|l| l.starts_with("bundled ") || l.starts_with("bundle up to date: "))
+        .unwrap_or_else(|| panic!("no bundle path in:\n{stdout}"));
+    std::path::PathBuf::from(line.rsplit(' ').next().unwrap())
+}

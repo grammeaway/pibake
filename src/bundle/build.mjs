@@ -1,7 +1,7 @@
 // pibake bundle driver: runs the staged esbuild with pibake's plugins, prints a JSON result.
 // Usage: node build.mjs <config.json>. Generated per build by `pibake bundle`; see src/bundle.rs.
 import { readFile } from "node:fs/promises";
-import { dirname, extname, join, relative, sep } from "node:path";
+import { dirname, extname, isAbsolute, join, relative, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const config = JSON.parse(await readFile(process.argv[2], "utf8"));
@@ -10,7 +10,7 @@ const piPackages = join(config.stage, "node_modules", "@earendil-works") + sep;
 const loaderDir = join(config.pi_dir, "dist", "core", "extensions");
 // Pi's own code sees the location of Pi's release chunks, as in stock Pi: its workers and
 // createRequire lookups resolve there.
-const piChunkUrl = pathToFileURL(join(config.pi_dir, "dist", "bundle", "chunks", "pibake.js")).href;
+const piChunk = relative(config.stage, join(config.pi_dir, "dist", "bundle", "chunks", "pibake.js"));
 
 const isPi = (file) => file.startsWith(piPackages);
 const under = (file, root) => file.startsWith(root + sep);
@@ -113,9 +113,11 @@ const plugin = {
 			let kind;
 			let location;
 			let define = LOCATION_DEFINES;
+			// Stage locations are relative to the root the prologue sets, so an executable can
+			// carry the files they point at.
 			if (isPi(args.path)) {
 				kind = "pi";
-				location = JSON.stringify({ url: piChunkUrl });
+				location = `globalThis.__pibake_at(${JSON.stringify(piChunk)})`;
 				define = { "import.meta.url": LOCATION_DEFINES["import.meta.url"] };
 			} else if (live) {
 				// Extension files see where they are installed in the agent directory, as under jiti.
@@ -124,7 +126,9 @@ const plugin = {
 				location = `globalThis.__pibake_live(${JSON.stringify(rel)})`;
 			} else {
 				kind = "stage";
-				location = JSON.stringify({ url: pathToFileURL(args.path).href, dirname: dirname(args.path), filename: args.path });
+				const rel = relative(config.stage, args.path);
+				if (rel.startsWith(`..${sep}`) || isAbsolute(rel)) throw new Error(`pibake: ${args.path} is outside the stage ${config.stage}`);
+				location = `globalThis.__pibake_at(${JSON.stringify(rel)})`;
 			}
 			const out = await esbuild.transform(text, {
 				loader: loaders[extname(args.path)] ?? "js",
@@ -215,8 +219,7 @@ const result = await esbuild.build({
 	logOverride: { "unsupported-dynamic-import": "warning", "unsupported-require-call": "warning" },
 	tsconfigRaw: {},
 	define: { PI_BUNDLED_NODE: "true" },
-	// Pi's release bundle defines `require` the same way, for CommonJS dependencies.
-	banner: { js: 'import { createRequire as __piCreateRequire } from "node:module"; const require = __piCreateRequire(import.meta.url);' },
+	banner: { js: config.prologue },
 	plugins: [plugin],
 }).catch((e) => ({ errors: e.errors ?? [{ text: String(e) }], warnings: e.warnings ?? [], metafile: null }));
 // Without the stand-in the bundle would still work, transpiling every extension from disk.

@@ -50,10 +50,10 @@ agent_dir = "."
 | `pibake lock [--update]` | Resolves and pins versions. Without `--update`, a second run changes nothing |
 | `pibake stage` | Installs the lock into `target/pibake/stage/<hash>/`, reused while the lock and local extensions are unchanged |
 | `pibake bundle` | Stages, then bundles Pi and every extension into `target/pibake/bundle/<hash>/pi.mjs` (`node` runs it), with a per-extension compatibility report |
-| `pibake build` | Builds the binary. Content-hashed caches skip unchanged work |
+| `pibake build` | Checks the lock for drift, bundles, then builds `target/pibake/bin/<name>` (`[build] name`, default `pi-baked`): one executable with Node inside. Content-hashed caches skip unchanged work |
 | `pibake verify` | Diffs the binary's tools, commands and system prompt against stock Pi on the same setup |
 | `pibake bench` | Startup time, memory, and CPU over a streamed large write, against stock Pi |
-| `pibake install` | Copies the binary to `~/.local/bin` |
+| `pibake install` | Builds, then copies the binary to `~/.local/bin/<name>` |
 | `pibake init` (planned) | Turns a live setup into a repo-mode directory, without credentials or state |
 
 ### What the binary reads at runtime

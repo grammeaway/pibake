@@ -527,3 +527,22 @@ fn every_warning_is_reported_once_for_pi_or_for_the_extensions_reaching_it(tc: T
         assert!(in_pi != in_any, "{w:?}: pi {in_pi}, extensions {in_any}");
     }
 }
+
+/// `install` writes `~/.local/bin/<name>`: an accepted name is one plain path component.
+#[hegel::test(test_cases = 500)]
+fn build_names_stay_one_file_name(tc: TestCase) {
+    let name = match tc.draw(gs::integers::<u8>().max_value(2)) {
+        0 => tc.draw(gs::from_regex(r"(\.{0,2}/)?[a-z.]{0,4}(/[a-z.]{0,4})?/?")),
+        _ => tc.draw(gs::text().max_size(12)),
+    };
+    let toml = format!("[build]\nname = {}", toml::Value::String(name.clone()));
+    let Ok(config) = pibake::config::Config::parse(&toml, Path::new("/p"), Path::new("/h")) else {
+        return;
+    };
+    assert_eq!(config.name, name);
+    let components: Vec<_> = Path::new(&name).components().collect();
+    assert!(
+        matches!(components[..], [Component::Normal(c)] if c == name.as_str()),
+        "{name:?} -> {components:?}"
+    );
+}

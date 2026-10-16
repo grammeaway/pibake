@@ -25,6 +25,7 @@ pub const LAUNCHER: &str = "pi.mjs";
 pub const REPORT: &str = "report.json";
 const MAIN: &str = "main.mjs";
 const BUILD_SCRIPT: &str = include_str!("bundle/build.mjs");
+const PROLOGUE: &str = include_str!("bundle/prologue.mjs");
 
 /// Stock Pi's `dist/cli.js`, plus what Pi's single-file (Bun) entry `dist/bun/runtime-setup.js`
 /// registers statically: OAuth flows and Bedrock, which Pi otherwise imports through variable
@@ -61,7 +62,7 @@ const BUN_SETUP_CALLS: [&str; 3] = [
     "setEmbeddedQuickJSWasmPath",
 ];
 /// Worker files Pi's code finds beside its release chunks, where the bundle points it.
-const PI_CHUNK_FILES: [&str; 2] = ["codemode-worker.js", "image-resize-worker.js"];
+pub const PI_CHUNK_FILES: [&str; 2] = ["codemode-worker.js", "image-resize-worker.js"];
 /// Pi's packages; their code is located as in Pi's release bundle, not rewritten.
 const PI_SCOPE: &str = "node_modules/@earendil-works/";
 
@@ -216,6 +217,13 @@ globalThis.__pibake_live = (rel) => {
     s
 }
 
+fn prologue(stage: &Path) -> String {
+    PROLOGUE.replace(
+        r#""__PIBAKE_STAGE__""#,
+        &js_string(&stage.to_string_lossy()),
+    )
+}
+
 fn js_string(s: &str) -> String {
     serde_json::to_string(s).expect("a string serializes")
 }
@@ -274,6 +282,8 @@ pub struct BuildConfig {
     pub stage: PathBuf,
     pub pi_dir: PathBuf,
     pub entry: String,
+    /// The bundle's first code: where it is (the stage, or extracted files in an executable).
+    pub prologue: String,
     pub baked: String,
     /// Absolute stage directory → agent-relative directory.
     pub owned: Vec<Owned>,
@@ -543,6 +553,7 @@ impl Bundler<'_> {
             ("build.mjs", BUILD_SCRIPT.as_bytes()),
             ("entry", ENTRY.as_bytes()),
             ("launcher", LAUNCHER_TEXT.as_bytes()),
+            ("prologue", PROLOGUE.as_bytes()),
             ("baked", baked_all.as_bytes()),
             ("owned", owned_json.as_bytes()),
         ]);
@@ -553,6 +564,7 @@ impl Bundler<'_> {
                 stage: plan.stage.clone(),
                 pi_dir: pi_dir.clone(),
                 entry: ENTRY.to_owned(),
+                prologue: prologue(&plan.stage),
                 baked: baked_module(baked),
                 owned: owned.clone(),
                 outfile: dir.join(MAIN),
@@ -585,8 +597,8 @@ impl Bundler<'_> {
                 dir.join(REPORT),
                 format!("{}\n", serde_json::to_string_pretty(&report)?),
             )?;
-            // Pi resolves optional dependencies and finds its package from here, as from its
-            // release bundle; `verify` finds the Pi package the same way.
+            // The bundle locates itself in the stage (see its prologue); this link is for
+            // `verify`, which finds the Pi package a script would import.
             symlink(plan.stage.join("node_modules"), dir.join("node_modules"))?;
             report_out = Some(report);
             Ok(())

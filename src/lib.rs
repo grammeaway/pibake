@@ -9,5 +9,6 @@ pub mod lock;
 pub mod package;
 pub mod paths;
 pub mod process;
+pub mod sea;
 pub mod snapshot;
 pub mod stage;

@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use common::write;
+use common::{bundled_launcher, e2e_enabled, pibake, write};
 use pibake::bundle::{
     BuildConfig, BuildResult, Bundler, Import, Input, LAUNCHER, Message, Metafile, Plan, REPORT,
     Status,
@@ -326,39 +326,6 @@ fn changed_inputs_get_their_own_bundle() {
     assert!(matches!(second, Outcome::Built(_)));
     assert_ne!(dir(&first), dir(&second));
     assert_eq!(f.bundle_entries().len(), 2);
-}
-
-fn e2e_enabled() -> bool {
-    if std::env::var_os("PIBAKE_E2E").is_none() {
-        eprintln!("skipped: set PIBAKE_E2E=1");
-        return false;
-    }
-    true
-}
-
-/// Runs the pibake binary in `dir`; panics with its output unless it exits as expected.
-fn pibake(dir: &Path, args: &[&str], expect_success: bool) -> String {
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_pibake"))
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .unwrap();
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    assert_eq!(
-        out.status.success(),
-        expect_success,
-        "pibake {args:?}:\n{stdout}{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    stdout
-}
-
-fn bundled_launcher(stdout: &str) -> PathBuf {
-    let line = stdout
-        .lines()
-        .find(|l| l.starts_with("bundled ") || l.starts_with("bundle up to date: "))
-        .unwrap_or_else(|| panic!("no bundle path in:\n{stdout}"));
-    PathBuf::from(line.rsplit(' ').next().unwrap())
 }
 
 const ONCE_TS: &str = r#"const g = globalThis as any;

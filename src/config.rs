@@ -1,18 +1,21 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::paths;
 
 pub const FILE_NAME: &str = "pibake.toml";
 const DEFAULT_AGENT_DIR: &str = "~/.pi/agent";
+const DEFAULT_NAME: &str = "pi-baked";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub agent_dir: PathBuf,
     /// Where `pibake.toml` is, or the working directory without one; lock files go here.
     pub dir: PathBuf,
+    /// The executable's file name, in `target/pibake/bin/` and when installed.
+    pub name: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -20,6 +23,14 @@ pub struct Config {
 struct RawConfig {
     #[serde(default)]
     source: RawSource,
+    #[serde(default)]
+    build: RawBuild,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawBuild {
+    name: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -48,9 +59,14 @@ impl Config {
     pub fn parse(text: &str, config_dir: &Path, home: &Path) -> Result<Self> {
         let raw: RawConfig = toml::from_str(text)?;
         let agent_dir = raw.source.agent_dir.as_deref().unwrap_or(DEFAULT_AGENT_DIR);
+        let name = raw.build.name.unwrap_or_else(|| DEFAULT_NAME.to_owned());
+        if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\0']) {
+            bail!("[build] name must be a file name, not {name:?}");
+        }
         Ok(Self {
             agent_dir: paths::normalize(&config_dir.join(paths::expand_tilde(agent_dir, home))),
             dir: config_dir.to_path_buf(),
+            name,
         })
     }
 }
@@ -90,6 +106,16 @@ mod tests {
                 .agent_dir,
             PathBuf::from("/abs/dir")
         );
+    }
+
+    #[test]
+    fn build_name_defaults_and_must_be_a_file_name() {
+        assert_eq!(parse("").unwrap().name, "pi-baked");
+        assert_eq!(parse("[build]\nname = \"pi\"").unwrap().name, "pi");
+        for bad in ["", ".", "..", "a/b", "/abs"] {
+            let err = parse(&format!("[build]\nname = {bad:?}")).unwrap_err();
+            assert!(format!("{err:#}").contains("file name"), "{bad}: {err:#}");
+        }
     }
 
     #[test]

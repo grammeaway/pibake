@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 use pibake::bench::{self, Bench};
 use pibake::fake_provider::FakeProvider;
 use pibake::harness::PiCommand;
-use pibake::{bundle, config::Config, inventory, lock, paths, snapshot, stage};
+use pibake::{bundle, config::Config, inventory, lock, paths, sea, snapshot, stage};
 
 #[derive(Parser)]
 #[command(version, about = "Build a Pi agent directory into one executable")]
@@ -36,6 +36,10 @@ enum Command {
     Stage,
     /// Stage, then bundle Pi and its extensions into target/pibake/bundle/<hash>/pi.mjs
     Bundle,
+    /// Check the lock, stage, bundle, then build target/pibake/bin/<name>, a single executable
+    Build,
+    /// Build, then copy the executable to ~/.local/bin/<name>
+    Install,
     /// Compare tools, system prompt and commands of two Pi commands on the same setup
     Verify {
         /// The Pi command under test, e.g. `pi` or `pi -ne`
@@ -67,6 +71,88 @@ fn run_stage(config: &Config, inventory: &inventory::Inventory) -> Result<stage:
     stager.run(&inputs, &mut |step| eprintln!("stage: {step}"))
 }
 
+fn locker<'a>(config: &'a Config, host: &'a lock::Host) -> lock::Locker<'a> {
+    lock::Locker {
+        agent_dir: &config.agent_dir,
+        dir: &config.dir,
+        host,
+        npm: &lock::npm_lock_only,
+    }
+}
+
+fn print_drift(out: &mut dyn Write, items: Vec<String>) -> Result<()> {
+    writeln!(out, "the setup has drifted from {}:", lock::LOCK_FILE)?;
+    for item in items {
+        writeln!(out, "  {item}")?;
+    }
+    writeln!(out, "run `pibake lock --update` to re-pin")?;
+    Ok(())
+}
+
+fn run_bundle(
+    config: &Config,
+    inventory: &inventory::Inventory,
+    out: &mut dyn Write,
+) -> Result<(PathBuf, PathBuf)> {
+    let (stage::Outcome::Cached(stage_dir) | stage::Outcome::Built(stage_dir)) =
+        run_stage(config, inventory)?;
+    let plan = bundle::Plan::new(inventory, &stage_dir)?;
+    let bundler = bundle::Bundler {
+        root: &config.dir.join(bundle::BUNDLE_ROOT),
+        build: &bundle::run_node_build,
+    };
+    let (outcome, report) = bundler.run(&plan, &mut |step| eprintln!("bundle: {step}"))?;
+    write!(out, "{}", report.summary())?;
+    let dir = match outcome {
+        stage::Outcome::Cached(dir) => {
+            writeln!(
+                out,
+                "bundle up to date: {}",
+                dir.join(bundle::LAUNCHER).display()
+            )?;
+            dir
+        }
+        stage::Outcome::Built(dir) => {
+            writeln!(out, "bundled {}", dir.join(bundle::LAUNCHER).display())?;
+            dir
+        }
+    };
+    Ok((stage_dir, dir))
+}
+
+/// The built executable, or `None` when the setup drifted from the lock (reported to `out`).
+fn run_build(config: &Config, home: &Path, out: &mut dyn Write) -> Result<Option<PathBuf>> {
+    let inventory = inventory::read(&config.agent_dir, home)?;
+    let host = lock::Host::find()?;
+    if let lock::Outcome::Drift(items) =
+        locker(config, &host).run(&inventory, false, &mut |w| eprintln!("warning: {w}"))?
+    {
+        print_drift(out, items)?;
+        return Ok(None);
+    }
+    let (stage_dir, bundle_dir) = run_bundle(config, &inventory, out)?;
+    let lock_text = std::fs::read(config.dir.join(lock::LOCK_FILE))?;
+    let pinned = lock::Lock::parse(&String::from_utf8_lossy(&lock_text))?;
+    let version = format!(
+        "{} (pibake {}, lock {})",
+        pinned.pi.version,
+        env!("CARGO_PKG_VERSION"),
+        &lock::sha256_hex(&lock_text)[..12]
+    );
+    let output = config.dir.join(sea::BIN_ROOT).join(&config.name);
+    eprintln!("build: node --build-sea");
+    sea::Builder {
+        stage: &stage_dir,
+        bundle: &bundle_dir,
+        version: &version,
+        output: &output,
+        node: &sea::run_node,
+    }
+    .run()?;
+    writeln!(out, "built {}", output.display())?;
+    Ok(Some(output))
+}
+
 fn main() -> Result<ExitCode> {
     let cli = Cli::parse();
     let home = paths::home_dir()?;
@@ -85,13 +171,9 @@ fn main() -> Result<ExitCode> {
         Command::Lock { update } => {
             let inventory = inventory::read(&config.agent_dir, &home)?;
             let host = lock::Host::find()?;
-            let locker = lock::Locker {
-                agent_dir: &config.agent_dir,
-                dir: &config.dir,
-                host: &host,
-                npm: &lock::npm_lock_only,
-            };
-            match locker.run(&inventory, update, &mut |w| eprintln!("warning: {w}"))? {
+            match locker(&config, &host)
+                .run(&inventory, update, &mut |w| eprintln!("warning: {w}"))?
+            {
                 lock::Outcome::UpToDate => writeln!(out, "lock up to date")?,
                 lock::Outcome::Written(files) if files.is_empty() => {
                     writeln!(out, "re-pinned; lock unchanged")?
@@ -102,11 +184,7 @@ fn main() -> Result<ExitCode> {
                     }
                 }
                 lock::Outcome::Drift(items) => {
-                    writeln!(out, "the setup has drifted from {}:", lock::LOCK_FILE)?;
-                    for item in items {
-                        writeln!(out, "  {item}")?;
-                    }
-                    writeln!(out, "run `pibake lock --update` to re-pin")?;
+                    print_drift(&mut out, items)?;
                     return Ok(ExitCode::FAILURE);
                 }
             }
@@ -122,25 +200,20 @@ fn main() -> Result<ExitCode> {
         }
         Command::Bundle => {
             let inventory = inventory::read(&config.agent_dir, &home)?;
-            let (stage::Outcome::Cached(stage_dir) | stage::Outcome::Built(stage_dir)) =
-                run_stage(&config, &inventory)?;
-            let plan = bundle::Plan::new(&inventory, &stage_dir)?;
-            let bundler = bundle::Bundler {
-                root: &config.dir.join(bundle::BUNDLE_ROOT),
-                build: &bundle::run_node_build,
-            };
-            let (outcome, report) = bundler.run(&plan, &mut |step| eprintln!("bundle: {step}"))?;
-            write!(out, "{}", report.summary())?;
-            match outcome {
-                stage::Outcome::Cached(dir) => writeln!(
-                    out,
-                    "bundle up to date: {}",
-                    dir.join(bundle::LAUNCHER).display()
-                )?,
-                stage::Outcome::Built(dir) => {
-                    writeln!(out, "bundled {}", dir.join(bundle::LAUNCHER).display())?
-                }
+            run_bundle(&config, &inventory, &mut out)?;
+        }
+        Command::Build => {
+            if run_build(&config, &home, &mut out)?.is_none() {
+                return Ok(ExitCode::FAILURE);
             }
+        }
+        Command::Install => {
+            let Some(built) = run_build(&config, &home, &mut out)? else {
+                return Ok(ExitCode::FAILURE);
+            };
+            let to = home.join(".local/bin").join(&config.name);
+            sea::install(&built, &to)?;
+            writeln!(out, "installed {}", to.display())?;
         }
         Command::Verify { pi, against } => {
             let (pi, against) = (PiCommand::parse(&pi)?, PiCommand::parse(&against)?);

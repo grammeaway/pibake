@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 use crate::diff;
 use crate::fake_provider::{FakeProvider, PROVIDER, Script};
 use crate::harness::{Harness, PiCommand};
+use crate::lock::PI_PACKAGE;
 use crate::process::Supervised;
 
 const TIMEOUT: Duration = Duration::from_secs(120);
@@ -158,9 +159,19 @@ pub fn capture(
             (harness.root().to_path_buf(), "harness"),
         ]
         .into_iter()
-        .chain(pi.package_dir().map(|d| (d, "pi_package_dir"))),
+        .chain(pi.package_dir().map(|d| (d, "pi_package_dir")))
+        .chain(extracted_pi(&harness.home).map(|d| (d, "pi_package_dir"))),
     );
     Ok(Snapshot::from_parts(request, commands)?.normalized(&normalizer))
+}
+
+/// Where a pibake executable extracted its Pi package, under the harness home's cache.
+fn extracted_pi(home: &Path) -> impl Iterator<Item = PathBuf> {
+    std::fs::read_dir(home.join(".cache/pibake"))
+        .into_iter()
+        .flatten()
+        .filter_map(|e| Some(e.ok()?.path().join("node_modules").join(PI_PACKAGE)))
+        .filter(|d| d.is_dir())
 }
 
 fn rpc_session(pi: &PiCommand, harness: &Harness) -> Result<Vec<Value>> {
