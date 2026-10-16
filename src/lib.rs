@@ -1,4 +1,10 @@
+pub mod bench;
 pub mod config;
+pub mod diff;
+pub mod fake_provider;
+pub mod harness;
 pub mod inventory;
 pub mod package;
 pub mod paths;
+pub mod process;
+pub mod snapshot;

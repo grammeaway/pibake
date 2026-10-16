@@ -340,6 +340,7 @@ dependencies = [
  "anyhow",
  "clap",
  "hegeltest",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",

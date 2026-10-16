@@ -143,3 +143,121 @@ fn resolved_paths_are_normal_and_normalising_is_idempotent(tc: TestCase) {
     );
     assert_eq!(paths::normalize(&resolved), resolved);
 }
+
+// --- l2: harness components ---
+
+use pibake::bench::{Summary, utc_date};
+use pibake::diff::{self, Op};
+use pibake::fake_provider::chunk_str;
+use pibake::snapshot::Normalizer;
+use std::path::PathBuf;
+
+/// Lines drawn from a small alphabet, so the two sides share lines often.
+fn draw_lines(tc: &TestCase) -> String {
+    tc.draw(gs::vecs(gs::sampled_from(vec!["a", "b", "c", "", " d"])).max_size(30))
+        .join("\n")
+}
+
+#[hegel::test(test_cases = 500)]
+fn line_diff_rebuilds_both_sides(tc: TestCase) {
+    let (a, b) = (draw_lines(&tc), draw_lines(&tc));
+    let ops = diff::lines(&a, &b);
+    let old: Vec<&str> = ops
+        .iter()
+        .filter_map(|op| match *op {
+            Op::Equal(l) | Op::Delete(l) => Some(l),
+            Op::Insert(_) => None,
+        })
+        .collect();
+    let new: Vec<&str> = ops
+        .iter()
+        .filter_map(|op| match *op {
+            Op::Equal(l) | Op::Insert(l) => Some(l),
+            Op::Delete(_) => None,
+        })
+        .collect();
+    assert_eq!(old, a.lines().collect::<Vec<_>>());
+    assert_eq!(new, b.lines().collect::<Vec<_>>());
+    // An equal pair of sides diffs to nothing, and only then.
+    assert_eq!(diff::render(&ops, 2).is_empty(), a.lines().eq(b.lines()));
+}
+
+#[hegel::test(test_cases = 500)]
+fn chunks_rejoin_and_fit(tc: TestCase) {
+    let text = tc.draw(gs::text().max_size(200));
+    let max = tc.draw(gs::integers::<usize>().min_value(4).max_value(40));
+    let chunks = chunk_str(&text, max);
+    assert_eq!(chunks.concat(), text);
+    assert!(chunks.iter().all(|c| !c.is_empty() && c.len() <= max));
+}
+
+#[hegel::test(test_cases = 500)]
+fn normalizing_is_idempotent_and_leaves_no_rule_path(tc: TestCase) {
+    let paths = [
+        "/t/pibake-q/home/.pi/agent",
+        "/t/pibake-q/home",
+        "/t/pibake-q/work",
+        "/t/pibake-q",
+    ];
+    let names = ["agent_dir", "home", "cwd", "harness"];
+    let normalizer = Normalizer::new(paths.iter().map(PathBuf::from).zip(names));
+    let count = tc.draw(gs::integers::<usize>().max_value(12));
+    let text: String = (0..count)
+        .map(|_| {
+            if tc.draw(gs::booleans()) {
+                tc.draw(gs::sampled_from(paths.to_vec())).to_string()
+            } else {
+                tc.draw(gs::from_regex(r"[a-z/._ <>-]{0,6}"))
+            }
+        })
+        .collect();
+    let once = normalizer.text(&text);
+    assert_eq!(normalizer.text(&once), once);
+    for path in paths {
+        for (i, _) in once.match_indices(path) {
+            let next = once[i + path.len()..].chars().next();
+            assert!(
+                next.is_some_and(|c| c.is_alphanumeric() || c == '-' || c == '_'),
+                "{path} left whole in {once:?}"
+            );
+        }
+    }
+}
+
+#[hegel::test(test_cases = 300)]
+fn summary_is_ordered_and_order_free(tc: TestCase) {
+    let samples = tc.draw(
+        gs::vecs(
+            gs::floats::<f64>()
+                .allow_nan(false)
+                .allow_infinity(false)
+                .min_value(-1e9)
+                .max_value(1e9),
+        )
+        .min_size(1)
+        .max_size(30),
+    );
+    let s = Summary::of(&samples).unwrap();
+    assert!(
+        s.min <= s.p25 && s.p25 <= s.median && s.median <= s.p75 && s.p75 <= s.max,
+        "{s:?}"
+    );
+    let mut reversed = samples.clone();
+    reversed.reverse();
+    assert_eq!(Summary::of(&reversed).unwrap(), s);
+    assert_eq!(s.n, samples.len());
+}
+
+#[hegel::test(test_cases = 100)]
+fn utc_date_matches_gnu_date(tc: TestCase) {
+    let secs = tc.draw(gs::integers::<u64>().max_value(253_402_300_799)); // through 9999-12-31
+    let out = std::process::Command::new("date")
+        .args(["-u", "-d", &format!("@{secs}"), "+%Y-%m-%d"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        utc_date(secs),
+        String::from_utf8(out.stdout).unwrap().trim(),
+        "{secs}"
+    );
+}
