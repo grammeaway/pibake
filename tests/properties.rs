@@ -261,3 +261,86 @@ fn utc_date_matches_gnu_date(tc: TestCase) {
         "{secs}"
     );
 }
+
+// --- l3: lock ---
+
+use pibake::lock::{self, GitPin, Lock, NodePin, NpmLockPin, PiPin, Setup};
+use std::collections::BTreeMap;
+
+fn draw_lock(tc: &TestCase) -> Lock {
+    let text = || tc.draw(gs::text().max_size(20));
+    let git = (0..tc.draw(gs::integers::<usize>().max_value(4)))
+        .map(|_| GitPin {
+            name: text(),
+            url: text(),
+            commit: text(),
+        })
+        .collect();
+    Lock {
+        pi: PiPin {
+            version: text(),
+            integrity: text(),
+        },
+        node: NodePin { version: text() },
+        npm_lock: NpmLockPin { sha256: text() },
+        git,
+    }
+}
+
+#[hegel::test(test_cases = 500)]
+fn lock_render_parse_render_is_byte_identical(tc: TestCase) {
+    let lock = draw_lock(&tc);
+    let text = lock.render();
+    let parsed = Lock::parse(&text).unwrap_or_else(|e| panic!("{e:#}\n{text}"));
+    assert_eq!(parsed.render(), text);
+    let mut sorted = lock.clone();
+    sorted.git.sort();
+    assert_eq!(parsed, sorted);
+    assert!(text.ends_with('\n'));
+}
+
+/// Setups over tiny alphabets, so two draws are often equal or differ in one place.
+fn draw_setup(tc: &TestCase) -> Setup {
+    let pick = |options: &[&str]| tc.draw(gs::sampled_from(options.to_vec())).to_owned();
+    let mut npm = BTreeMap::new();
+    for _ in 0..tc.draw(gs::integers::<usize>().max_value(2)) {
+        npm.insert(pick(&["a", "@s/b"]), pick(&["1.0.0", "1.0.1"]));
+    }
+    let mut git = BTreeMap::new();
+    for _ in 0..tc.draw(gs::integers::<usize>().max_value(2)) {
+        git.insert(
+            pick(&["h.org/o/r", "h.org/o/s"]),
+            (
+                pick(&["https://h.org/o/r", "git@h.org:o/r"]),
+                pick(&["c1", "c2"]),
+            ),
+        );
+    }
+    Setup {
+        pi_version: pick(&["1.3.0", "1.4.0"]),
+        node_version: pick(&["26.11.1", "26.12.0"]),
+        npm,
+        git,
+    }
+}
+
+#[hegel::test(test_cases = 1000)]
+fn drift_is_empty_exactly_when_the_setup_is_unchanged(tc: TestCase) {
+    let (locked, now) = (draw_setup(&tc), draw_setup(&tc));
+    let lock = Lock::pin(&locked, "sha512-x".into(), "00".into());
+    let drift = lock::drift(&lock, &locked.npm, &now);
+    assert_eq!(drift.is_empty(), locked == now, "{drift:?}");
+    // Each differing package is named once.
+    let changed_npm = locked
+        .npm
+        .keys()
+        .chain(now.npm.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .filter(|n| locked.npm.get(*n) != now.npm.get(*n))
+        .count();
+    assert_eq!(
+        drift.iter().filter(|d| d.starts_with("npm ")).count(),
+        changed_npm
+    );
+}

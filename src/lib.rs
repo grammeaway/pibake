@@ -4,6 +4,7 @@ pub mod diff;
 pub mod fake_provider;
 pub mod harness;
 pub mod inventory;
+pub mod lock;
 pub mod package;
 pub mod paths;
 pub mod process;

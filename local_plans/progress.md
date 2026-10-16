@@ -8,7 +8,7 @@ Live log for `README.md`'s plans. One row per plan; details under Deviations and
 |---|---|---|---|
 | l1 scaffold, inspect | done | db3648d | Pi 1.3.0 (plan: 1.2.0); Hegel for property tests; Pi-resolver oracle test added |
 | l2 bench, verify | done | b50e3d9 | stock baseline: `bench_results/2026-10-16_stock_baseline.json` (20 runs) |
-| l3 lock | planned | | |
+| l3 lock | done | 806f8ad | Pi 1.3.0 (plan: 1.2.0); npm 12.2.0; npm seeded with the installed `npm/package-lock.json` |
 | l4 stage | planned | | |
 | l5 bundle | planned | | |
 | l6 SEA backend | planned | | bench needs an idle machine |
@@ -38,6 +38,13 @@ Decisions taken during passes, with who took them (owner or agent) and when.
 | l2 | `verify` takes the snapshot from the first model request of the run (asserted to open with the system message) and adds `request_options` (the request body minus messages and tools) to the plan's three parts: it is model-visible and free | 2026-10-16, agent |
 | l2 | `bench`: one discarded warm-up round, the first command rotates per round, startup also records the startup process's CPU and peak RSS (free from `wait4`). Spread is the interquartile range; raw samples are kept in the JSON | 2026-10-16, agent |
 | l2 | Line diff written in-crate (LCS, about 60 lines) instead of adding `similar` | 2026-10-16, agent |
+| l3 | Lock files go next to `pibake.toml`, or into the working directory without one (`Config.dir`) | 2026-10-16, agent |
+| l3 | `pibake.lock` holds `[pi]` (version, integrity), `[node]` (version), `[npm_lock]` (sha256) and one `[[git]]` per git package (`name` = `<host>/<path>`, `url`, `commit`), sorted; a fixed comment header; unknown keys rejected. npm package versions live only in `pibake.package-lock.json` (its root `dependencies`), kept as npm wrote it | 2026-10-16, agent |
+| l3 | npm runs as `npm install --package-lock-only --ignore-scripts --legacy-peer-deps --no-audit --no-fund` in a temp directory, seeded with `<agent_dir>/npm/package-lock.json` when present. `--legacy-peer-deps` is what Pi itself passes (`getNpmInstallArgs`), so peers are not solved; the seed makes npm keep the installed transitive versions | 2026-10-16, agent |
+| l3 | Pi's integrity comes from npm's lock entry for Pi, not a separate registry query. Pi is the package behind `pi` on `PATH` (as `verify` finds it) | 2026-10-16, agent |
+| l3 | After npm resolves, every `name@version` in the npm lock is looked up in the installed trees (Pi's package dir, `<agent_dir>/npm/node_modules`); misses are a warning, not an error, since reinstalling Pi is the only fix | 2026-10-16, agent |
+| l3 | Git: a package dir must have its own `.git` (else git would answer for an enclosing repo); HEAD is pinned; tracked local changes warn; git runs with `--no-optional-locks` so `status` never rewrites the index inside the agent dir. Local packages are not pinned | 2026-10-16, agent |
+| l3 | Drift also covers the lock files themselves: one file missing, or `pibake.package-lock.json` not matching its recorded sha256. A `pibake.lock` that does not parse is an error; `--update` replaces it. Writes are temp-then-rename, mode 0644, skipped when the bytes are unchanged (also under `--update`), npm lock first so `pibake.lock` is the commit point | 2026-10-16, agent |
 
 ## Deviations
 
@@ -63,6 +70,15 @@ Per plan: where the work differed from the plan, and why.
 - **Stock baseline recorded** (owner confirmed idle, 2026-10-16 14:09–14:27 UTC+local): `bench_results/2026-10-16_stock_baseline.json`, `pibake bench --pi pi --runs 20 --record stock_baseline`. Machine: i7-8850H (12 threads), AC power, platform profile and EPP `performance` (`intel_pstate` active, governor `powersave` = its dynamic mode), load 0.32 at start, Node v26.11.1, Pi 1.3.0. The JSON says `dirty: true`: l2 itself was uncommitted; the measured binary is stock Pi, so this does not touch the numbers. Medians [IQR]: startup 2600 ms [2589–2622], 3985 ms CPU, 366 MiB; big write 48.1 s [47.6–48.4] wall, 50.6 s CPU, 681 MiB [589–694]. CPU reached 91 °C mid-run; big-write samples drift ~3 % slower from the first five rounds to the last five (startup does not), so later recorded comparisons should rotate commands as `bench` does and run under the same power and cooling setup.
 - **Indicative numbers (busy machine, load ≈ 4.5, not recorded):** `pi`: startup 3.2 s to RPC-ready, 4.7 s CPU, 367 MiB peak; big write 54 s wall, 57 s CPU, 651 MiB peak. `pi -ne`: startup 0.55 s, big write 52 s.
 
+### l3
+
+- **Plan check against the code and Pi 1.3.0 holds**, with these corrections. Pi is 1.3.0, so the lock lists 1.3.0, not the plan's 1.2.0. The global Pi package has no `_integrity` field and no hidden lockfile (npm ≥ 7 writes neither), so the integrity comes from npm's lock (see Decisions). Pi installs packages with `--legacy-peer-deps` (`dist/core/package-manager.js`, `getNpmInstallArgs`); the plan's npm command lacked it.
+- **Seeded resolution, not a fresh one.** The plan's `npm install --package-lock-only` from a bare `package.json` resolves transitive dependencies against today's registry. On the live setup that gave 11 transitive versions that are not installed (e.g. `zod` 4.6.7 vs 4.6.5, `unpdf` 1.9.0 vs 1.6.2). Seeded with `~/.pi/agent/npm/package-lock.json`, the lock's 325 `name@version` entries match the installed trees exactly. Pi's own tree still resolves fresh (no lockfile to seed from); it matches today because Pi was installed today, and the not-installed warning reports it when it stops matching.
+- **Added beyond the plan:** the installed-tree warning; drift on edited or missing lock files; the git `.git` and local-changes checks; `Lock::pin` and `drift` as pure functions, so the drift property test runs without npm.
+- **npm version used:** 12.2.0 (Node v26.11.1).
+- **Completion, on the live setup** (run in a scratch directory with `agent_dir = "~/.pi/agent"`, so no lock was written into this repo): `pibake lock` wrote both files in 1.2 s; a second `pibake lock` printed `lock up to date` with bytes and mtimes unchanged; `--update` re-pinned to identical bytes and wrote nothing. `pibake.lock` lists Pi 1.3.0 with its integrity, Node 26.11.1, and ponytail at `84740e3d344b69b4a133201fa519eb37a62a2b2a` (= `git rev-parse HEAD`). All 11 npm packages of `settings.json` are in `pibake.package-lock.json` at their installed versions. A fingerprint (path, size, mtime) of `npm/`, `git/`, `settings.json` and `extensions/` was unchanged across the runs, `.git/index` included.
+- **Tests:** unit tests for rendering, parsing, Node version gate, drift messages, the installed-tree lookup and write-if-changed; integration tests through `Locker` with a stand-in npm (create then hold, drift then `--update`, edited and missing files, not-installed packages, git checks, npm output not matching the request); Hegel properties (render → parse → render is byte-identical; drift is empty exactly when the setup is unchanged, one line per changed npm package; both checked against a deliberate mutation); `PIBAKE_E2E=1` CLI test with real `pi`, `node` and npm: lock twice, bump the installed `pi-btw` 0.8.0 → 0.7.1, exit 1 naming it, `--update` re-pins.
+
 ## Found
 
 Bugs or debts found during a pass and kept out of its diff.
@@ -78,3 +94,9 @@ Bugs or debts found during a pass and kept out of its diff.
 - **l2 → l5: command paths.** `get_commands` reports `sourceInfo.path` and `baseDir` of each extension command (e.g. `<agent_dir>/extensions/init.ts`). A bundle will report something else. l5 decides whether the bundle keeps these paths or `verify` compares baked extension commands without them.
 - **l2: side traffic seen under the harness.** `pi-observational-memory` makes its own model calls after each turn, on the current model. `pi-observational-memory` and `@grammeaway/pi-cook` emit `extension_error` "ctx is stale" on `agent_settled` in `--mode rpc --no-session` runs (upstream, harmless to `verify`). Pi creates `auth.json` and `models-store.json` in an agent dir that lacks them.
 - **l2 step 6: interactive time-to-prompt** through a pseudo-terminal is not built. RPC readiness is the startup metric; add a pty metric if l6 or l10 needs time-to-first-paint.
+- **l3 → l4: npm flags.** The npm lock was resolved with `--legacy-peer-deps`; `npm ci` in the stage must pass it too, or npm solves peers the lock never had.
+- **l3 → l4: no `package.json` is stored.** `pibake.package-lock.json`'s root entry (`packages[""]`: `name`, `dependencies`) is the generated `package.json`; l4 rebuilds it from there (adding esbuild re-pins, as l4 plans).
+- **l3 → l4: git package dependencies are not locked.** Pi runs `npm install --omit=dev --legacy-peer-deps` inside git packages; their trees are outside the npm lock. Ponytail has no dependencies, so nothing is lost today.
+- **l3 → l7: reuse `lock::Setup`.** It reads exactly what the staleness fingerprint needs for packages (npm versions, git HEADs, Pi version).
+- **l3: where the live lock lives.** Without a `pibake.toml`, `pibake lock` writes into the working directory, which in this repo is the repo itself. Owner call: a local-mode `pibake.toml` somewhere outside the repo, or ignore `pibake.lock`/`pibake.package-lock.json` here.
+- **l3: `npmCommand`.** A `settings.json` `npmCommand` of pnpm or bun leaves no npm lock to seed from; pibake still locks with npm. Not used on this setup.

@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 use pibake::bench::{self, Bench};
 use pibake::fake_provider::FakeProvider;
 use pibake::harness::PiCommand;
-use pibake::{config::Config, inventory, paths, snapshot};
+use pibake::{config::Config, inventory, lock, paths, snapshot};
 
 #[derive(Parser)]
 #[command(version, about = "Build a Pi agent directory into one executable")]
@@ -25,6 +25,12 @@ enum Command {
     Inspect {
         #[arg(long)]
         json: bool,
+    },
+    /// Pin Pi, Node, npm and git packages as installed, in pibake.lock beside pibake.toml
+    Lock {
+        /// Re-pin to what is installed now, instead of reporting drift
+        #[arg(long)]
+        update: bool,
     },
     /// Compare tools, system prompt and commands of two Pi commands on the same setup
     Verify {
@@ -61,6 +67,35 @@ fn main() -> Result<ExitCode> {
                 writeln!(out)?;
             } else {
                 write!(out, "{}", inventory::render_text(&inventory))?;
+            }
+        }
+        Command::Lock { update } => {
+            let inventory = inventory::read(&config.agent_dir, &home)?;
+            let host = lock::Host::find()?;
+            let locker = lock::Locker {
+                agent_dir: &config.agent_dir,
+                dir: &config.dir,
+                host: &host,
+                npm: &lock::npm_lock_only,
+            };
+            match locker.run(&inventory, update, &mut |w| eprintln!("warning: {w}"))? {
+                lock::Outcome::UpToDate => writeln!(out, "lock up to date")?,
+                lock::Outcome::Written(files) if files.is_empty() => {
+                    writeln!(out, "re-pinned; lock unchanged")?
+                }
+                lock::Outcome::Written(files) => {
+                    for f in files {
+                        writeln!(out, "wrote {}", f.display())?;
+                    }
+                }
+                lock::Outcome::Drift(items) => {
+                    writeln!(out, "the setup has drifted from {}:", lock::LOCK_FILE)?;
+                    for item in items {
+                        writeln!(out, "  {item}")?;
+                    }
+                    writeln!(out, "run `pibake lock --update` to re-pin")?;
+                    return Ok(ExitCode::FAILURE);
+                }
             }
         }
         Command::Verify { pi, against } => {

@@ -11,6 +11,8 @@ const DEFAULT_AGENT_DIR: &str = "~/.pi/agent";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub agent_dir: PathBuf,
+    /// Where `pibake.toml` is, or the working directory without one; lock files go here.
+    pub dir: PathBuf,
 }
 
 #[derive(Deserialize, Default)]
@@ -48,6 +50,7 @@ impl Config {
         let agent_dir = raw.source.agent_dir.as_deref().unwrap_or(DEFAULT_AGENT_DIR);
         Ok(Self {
             agent_dir: paths::normalize(&config_dir.join(paths::expand_tilde(agent_dir, home))),
+            dir: config_dir.to_path_buf(),
         })
     }
 }
@@ -120,6 +123,17 @@ mod tests {
                 .unwrap()
                 .agent_dir,
             other.join("rel")
+        );
+
+        assert_eq!(
+            Config::load(Some(Path::new("other/x.toml")), dir.path(), home)
+                .unwrap()
+                .dir,
+            other
+        );
+        assert_eq!(
+            Config::load(None, dir.path(), home).unwrap().dir,
+            dir.path()
         );
 
         assert!(Config::load(Some(Path::new("missing.toml")), dir.path(), home).is_err());
