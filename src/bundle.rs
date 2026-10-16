@@ -29,12 +29,16 @@ const BUILD_SCRIPT: &str = include_str!("bundle/build.mjs");
 const PROLOGUE: &str = include_str!("bundle/prologue.mjs");
 /// `pibake:staleness`: the entry's check of the setup an executable was built from.
 pub const STALENESS: &str = include_str!("bundle/staleness.mjs");
+/// `pibake:frozen`'s code: the entry's check of settings passes baked in; `frozen_module` adds
+/// the data.
+pub const FROZEN: &str = include_str!("bundle/frozen.mjs");
 
 /// Stock Pi's `dist/cli.js`, plus what Pi's single-file (Bun) entry `dist/bun/runtime-setup.js`
 /// registers statically: OAuth flows and Bedrock, which Pi otherwise imports through variable
 /// specifiers next to its release chunks. Resolved from Pi's package directory. First, in an
 /// executable, the staleness check against the agent directory Pi will use. Pi's modules are
 /// evaluated in the stock order: `dist/config.js` is already a dependency of `dist/main.js`.
+/// Then the check of settings passes baked in.
 const ENTRY: &str = r#"import { setupCli } from "./dist/cli/setup.js";
 import { main } from "./dist/main.js";
 import { getAgentDir } from "./dist/config.js";
@@ -42,8 +46,10 @@ import { registerBunOAuthFlows } from "@earendil-works/pi-ai/bun-oauth";
 import { bedrockProviderModule } from "@earendil-works/pi-ai/bedrock-provider";
 import { setBedrockProviderModule } from "@earendil-works/pi-ai/compat";
 import { checkSetup } from "pibake:staleness";
+import { checkFrozen, frozen } from "pibake:frozen";
 
 checkSetup(getAgentDir(), globalThis.__pibake_setup);
+checkFrozen(getAgentDir(), process.argv.slice(2), frozen);
 registerBunOAuthFlows();
 setBedrockProviderModule(bedrockProviderModule);
 setupCli();
@@ -100,6 +106,7 @@ pub struct Unbaked {
 }
 
 pub struct Plan {
+    pub agent_dir: PathBuf,
     pub stage: PathBuf,
     pub baked: Vec<Baked>,
     pub owned: Vec<Owned>,
@@ -178,6 +185,7 @@ impl Plan {
             add("extensions", entry.clone())?;
         }
         Ok(Self {
+            agent_dir: inventory.agent_dir.clone(),
             stage: stage_dir.to_path_buf(),
             baked,
             owned: owned.into_iter().collect(),
@@ -294,6 +302,8 @@ pub struct BuildConfig {
     pub prologue: String,
     /// The module `pibake:staleness`.
     pub staleness: String,
+    /// The module `pibake:frozen`.
+    pub frozen: String,
     pub baked: String,
     /// Absolute stage directory → agent-relative directory.
     pub owned: Vec<Owned>,
@@ -568,14 +578,22 @@ impl Bundler<'_> {
         let owned_json = serde_json::to_string(&owned)?;
         let baked_all = baked_module(&all);
         let stage_path = plan.stage.to_string_lossy();
-        let rewritten = passes::run(&plan.stage, self.passes)?;
+        let setup = passes::Setup {
+            agent_dir: plan.agent_dir.clone(),
+            extension_dirs: plan.owned.iter().map(|o| o.stage.clone()).collect(),
+        };
+        let rewritten = passes::run(&plan.stage, self.passes, &setup)?;
         for p in &rewritten.reports {
             log(format!(
                 "pass {}: {} files rewritten",
                 p.pass.name(),
                 p.changes.len()
             ));
+            for note in &p.notes {
+                log(format!("pass {}: {note}", p.pass.name()));
+            }
         }
+        let frozen = frozen_module(&rewritten.frozen)?;
         let overrides: BTreeMap<String, String> = rewritten
             .overrides
             .iter()
@@ -595,6 +613,7 @@ impl Bundler<'_> {
             ("launcher", LAUNCHER_TEXT.as_bytes()),
             ("prologue", PROLOGUE.as_bytes()),
             ("staleness", STALENESS.as_bytes()),
+            ("frozen", frozen.as_bytes()),
             ("baked", baked_all.as_bytes()),
             ("owned", owned_json.as_bytes()),
             ("passes", passes_json.as_bytes()),
@@ -608,6 +627,7 @@ impl Bundler<'_> {
                 entry: ENTRY.to_owned(),
                 prologue: prologue(&plan.stage),
                 staleness: STALENESS.to_owned(),
+                frozen: frozen.clone(),
                 baked: baked_module(baked),
                 owned: owned.clone(),
                 outfile: dir.join(MAIN),
@@ -686,6 +706,14 @@ impl Bundler<'_> {
         }
         Ok(failed)
     }
+}
+
+/// `pibake:frozen`: its check, and what the passes froze.
+pub fn frozen_module(frozen: &[passes::Frozen]) -> Result<String> {
+    Ok(format!(
+        "{FROZEN}\nexport const frozen = {};\n",
+        serde_json::to_string(frozen)?
+    ))
 }
 
 fn render_errors(errors: &[Message]) -> String {

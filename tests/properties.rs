@@ -573,8 +573,10 @@ fn trim_highlight_keeps_exactly_the_list_and_is_idempotent(tc: TestCase) {
     let options = Options {
         passes: vec![Pass::TrimHighlight],
         highlight_languages: keep.iter().map(|s| s.to_string()).collect(),
+        apis: None,
     };
-    let out = passes::run(stage.path(), &options).unwrap();
+    let setup = common::no_setup(stage.path());
+    let out = passes::run(stage.path(), &options, &setup).unwrap();
     let kept = |names: &[&'static str]| -> Vec<&'static str> {
         names.iter().copied().filter(|n| keep.contains(n)).collect()
     };
@@ -598,7 +600,7 @@ fn trim_highlight_keeps_exactly_the_list_and_is_idempotent(tc: TestCase) {
     for (rel, text) in &out.overrides {
         std::fs::write(stage.path().join(rel), text).unwrap();
     }
-    let again = passes::run(stage.path(), &options).unwrap();
+    let again = passes::run(stage.path(), &options, &setup).unwrap();
     assert!(again.overrides.is_empty(), "{:?}", again.overrides);
 }
 

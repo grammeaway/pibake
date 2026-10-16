@@ -42,6 +42,7 @@ struct RawBuild {
 #[serde(deny_unknown_fields)]
 struct RawTrim {
     highlight_languages: Option<Vec<String>>,
+    apis: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -84,6 +85,7 @@ impl Config {
                     .trim
                     .highlight_languages
                     .unwrap_or_else(|| passes::DEFAULT_LANGUAGES.map(str::to_owned).to_vec()),
+                apis: raw.trim.apis,
             },
         })
     }
@@ -139,8 +141,13 @@ mod tests {
     #[test]
     fn passes_default_on_and_switch_off() {
         let default = parse("").unwrap().passes;
-        assert_eq!(default.passes, [Pass::TrimHighlight]);
+        assert_eq!(default.passes, [Pass::TrimHighlight, Pass::TrimApis]);
         assert!(default.highlight_languages.iter().any(|l| l == "rust"));
+        assert_eq!(default.apis, None);
+        let apis = parse("[trim]\napis = [\"anthropic-messages\"]")
+            .unwrap()
+            .passes;
+        assert_eq!(apis.apis.unwrap(), ["anthropic-messages"]);
         let off = parse("[build]\npasses = []").unwrap().passes;
         assert!(off.passes.is_empty());
         let langs = parse("[trim]\nhighlight_languages = [\"rust\"]")

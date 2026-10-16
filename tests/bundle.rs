@@ -335,6 +335,7 @@ fn trim(langs: &[&str]) -> Options {
     Options {
         passes: vec![Pass::TrimHighlight],
         highlight_languages: langs.iter().map(|s| s.to_string()).collect(),
+        apis: None,
     }
 }
 

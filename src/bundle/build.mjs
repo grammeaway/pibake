@@ -103,6 +103,8 @@ const plugin = {
 		});
 		build.onResolve({ filter: /^pibake:staleness$/ }, () => ({ path: "staleness", namespace: "pibake-staleness" }));
 		build.onLoad({ filter: /.*/, namespace: "pibake-staleness" }, () => ({ contents: config.staleness, loader: "js" }));
+		build.onResolve({ filter: /^pibake:frozen$/ }, () => ({ path: "frozen", namespace: "pibake-frozen" }));
+		build.onLoad({ filter: /.*/, namespace: "pibake-frozen" }, () => ({ contents: config.frozen, loader: "js" }));
 		build.onResolve({ filter: /^pibake:baked$/ }, () => ({ path: "baked", namespace: "pibake-baked" }));
 		build.onLoad({ filter: /.*/, namespace: "pibake-baked" }, () => ({
 			contents: config.baked,
@@ -226,7 +228,9 @@ const result = await esbuild.build({
 	logLimit: 0,
 	logOverride: { "unsupported-dynamic-import": "warning", "unsupported-require-call": "warning" },
 	tsconfigRaw: {},
-	define: { PI_BUNDLED_NODE: "true" },
+	// No bundled module is the program's main, as none is under jiti; in an executable main.mjs
+	// would otherwise be, and run every `if (import.meta.main)` self-check.
+	define: { PI_BUNDLED_NODE: "true", "import.meta.main": "false" },
 	banner: { js: config.prologue },
 	plugins: [plugin],
 }).catch((e) => ({ errors: e.errors ?? [{ text: String(e) }], warnings: e.warnings ?? [], metafile: null }));

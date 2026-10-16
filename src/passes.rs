@@ -4,13 +4,17 @@
 //! own tree shaking drops whatever a rewrite stops importing. Passes on esbuild's output could
 //! not: nothing marks its `__commonJS(...)` wrappers as pure. A pass edits source text at the
 //! spans oxc finds, so everything outside its edits stays byte-identical.
+//!
+//! A pass that bakes a setting into the build records it as `Frozen`; the bundle's entry checks
+//! the live setup against it at startup (`bundle/frozen.mjs`).
 
+mod trim_apis;
 mod trim_highlight;
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use oxc::allocator::Allocator;
@@ -18,6 +22,7 @@ use oxc::ast::ast::Program;
 use oxc::span::SourceType;
 use serde::{Deserialize, Serialize};
 
+pub use trim_apis::left_out_message;
 pub use trim_highlight::DEFAULT_LANGUAGES;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,22 +30,27 @@ pub use trim_highlight::DEFAULT_LANGUAGES;
 pub enum Pass {
     /// Registers only `[trim] highlight_languages` with highlight.js.
     TrimHighlight,
+    /// Stubs pi-ai's stream APIs outside `[trim] apis` (default: derived from the setup).
+    TrimApis,
 }
 
 impl Pass {
     pub fn name(self) -> &'static str {
         match self {
             Pass::TrimHighlight => "trim_highlight",
+            Pass::TrimApis => "trim_apis",
         }
     }
 }
 
-pub const DEFAULT_PASSES: [Pass; 1] = [Pass::TrimHighlight];
+pub const DEFAULT_PASSES: [Pass; 2] = [Pass::TrimHighlight, Pass::TrimApis];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Options {
     pub passes: Vec<Pass>,
     pub highlight_languages: Vec<String>,
+    /// `None`: derived from the setup.
+    pub apis: Option<Vec<String>>,
 }
 
 impl Options {
@@ -48,8 +58,30 @@ impl Options {
         Self {
             passes: vec![],
             highlight_languages: vec![],
+            apis: None,
         }
     }
+}
+
+/// What a pass may read besides the stage: the setup the build is for.
+#[derive(Debug, Clone)]
+pub struct Setup {
+    pub agent_dir: PathBuf,
+    /// Stage-relative directories of extension code (packages and local `extensions/`).
+    pub extension_dirs: Vec<String>,
+}
+
+/// A setting a pass baked into the build, for the startup check in `bundle/frozen.mjs`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Frozen {
+    Apis {
+        /// The `pibake.toml` setting to change.
+        setting: String,
+        left_out: Vec<String>,
+        /// Built-in provider → the stream APIs its catalog models use.
+        providers: BTreeMap<String, Vec<String>>,
+    },
 }
 
 /// One rewritten file.
@@ -65,6 +97,9 @@ pub struct Change {
 pub struct PassReport {
     pub pass: Pass,
     pub changes: Vec<Change>,
+    /// What the pass decided and why, beyond its file changes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -72,10 +107,11 @@ pub struct Output {
     /// Stage-relative file → its rewritten text. Files no pass changed are absent.
     pub overrides: BTreeMap<String, String>,
     pub reports: Vec<PassReport>,
+    pub frozen: Vec<Frozen>,
 }
 
 /// Runs `options.passes` in order over the stage's sources; each sees its predecessors' output.
-pub fn run(stage: &Path, options: &Options) -> Result<Output> {
+pub fn run(stage: &Path, options: &Options, setup: &Setup) -> Result<Output> {
     let mut sources = Sources {
         stage,
         changed: BTreeMap::new(),
@@ -86,19 +122,31 @@ pub fn run(stage: &Path, options: &Options) -> Result<Output> {
         }
     }
     let mut reports = vec![];
+    let mut frozen = vec![];
     for pass in &options.passes {
-        let changes = match pass {
-            Pass::TrimHighlight => trim_highlight::run(&mut sources, &options.highlight_languages)
-                .context("pass trim_highlight")?,
+        let (changes, notes) = match pass {
+            Pass::TrimHighlight => (
+                trim_highlight::run(&mut sources, &options.highlight_languages)
+                    .context("pass trim_highlight")?,
+                vec![],
+            ),
+            Pass::TrimApis => {
+                let out = trim_apis::run(&mut sources, options.apis.as_deref(), setup)
+                    .context("pass trim_apis")?;
+                frozen.push(out.frozen);
+                (out.changes, out.notes)
+            }
         };
         reports.push(PassReport {
             pass: *pass,
             changes,
+            notes,
         });
     }
     Ok(Output {
         overrides: sources.changed,
         reports,
+        frozen,
     })
 }
 
@@ -109,6 +157,10 @@ pub struct Sources<'a> {
 }
 
 impl Sources<'_> {
+    pub fn stage(&self) -> &Path {
+        self.stage
+    }
+
     pub fn read(&self, rel: &str) -> Result<String> {
         if let Some(text) = self.changed.get(rel) {
             return Ok(text.clone());
@@ -213,9 +265,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let options = Options {
             passes: vec![Pass::TrimHighlight, Pass::TrimHighlight],
-            highlight_languages: vec![],
+            ..Options::none()
         };
-        let err = format!("{:#}", run(dir.path(), &options).unwrap_err());
+        let setup = Setup {
+            agent_dir: dir.path().into(),
+            extension_dirs: vec![],
+        };
+        let err = format!("{:#}", run(dir.path(), &options, &setup).unwrap_err());
         assert!(err.contains("listed twice"), "{err}");
     }
 

@@ -19,7 +19,8 @@ fn run_bare(bin: &Path, home: &Path, args: &[&str]) -> std::process::Output {
 
 /// Real `pi`, `node` and npm (network): a fixture setup is built into an executable, which runs
 /// without `node`, matches stock Pi and its node bundle, extracts its files once under
-/// concurrent launches, rebuilds byte for byte, and installs.
+/// concurrent launches, rebuilds byte for byte, and installs. It keeps only the fake provider's API,
+/// so asking for another names it in one line each at startup and on the request, without a trace.
 #[test]
 fn e2e_build_a_fixture_setup() {
     if !e2e_enabled() {
@@ -32,6 +33,11 @@ fn e2e_build_a_fixture_setup() {
         &agent.join("extensions/located.js"),
         "import { fileURLToPath } from \"node:url\";\nexport default function (pi) {\n\tpi.registerCommand(\"located\", { description: fileURLToPath(import.meta.url), handler: async () => {} });\n}\n",
     );
+    // In the executable, main.mjs is the main module; no bundled module may think it is.
+    write(
+        &agent.join("extensions/self_check.ts"),
+        "if ((import.meta as any).main) console.error(\"self-check ran\");\nexport default function () {}\n",
+    );
     // esbuild cannot resolve its import, so it loads through jiti inside the executable.
     write(
         &agent.join("extensions/broken.ts"),
@@ -41,7 +47,7 @@ fn e2e_build_a_fixture_setup() {
     write(
         &project.join("pibake.toml"),
         &format!(
-            "[source]\nagent_dir = \"{}\"\n\n[build]\nname = \"pi-test\"\n",
+            "[source]\nagent_dir = \"{}\"\n\n[build]\nname = \"pi-test\"\n\n[trim]\napis = [\"openai-completions\"]\n",
             agent.display()
         ),
     );
@@ -73,6 +79,33 @@ fn e2e_build_a_fixture_setup() {
     let version = run_bare(&bin, &home, &["--version"]);
     let version = String::from_utf8_lossy(&version.stdout);
     assert!(version.contains(" (pibake "), "{version}");
+
+    let google = Command::new(&bin)
+        .args([
+            "--provider",
+            "google",
+            "--model",
+            "gemini-2.5-pro",
+            "-p",
+            "hi",
+            "--no-session",
+        ])
+        .current_dir(root.path())
+        .env_clear()
+        .env("HOME", &home)
+        .env("PATH", "/nonexistent")
+        .env("PI_CODING_AGENT_DIR", &agent)
+        .env("PI_OFFLINE", "1")
+        .env("GEMINI_API_KEY", "unused")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!google.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&google.stderr),
+        "pi-test: this build left out the google-generative-ai API (--provider google); add it to [trim] apis in pibake.toml, then run pibake install\n\
+         the google-generative-ai API was left out of this pibake build; add it to [trim] apis in pibake.toml\n"
+    );
 
     // Launched together on a fresh cache, every run works and one extraction is kept.
     let children: Vec<_> = (0..8)

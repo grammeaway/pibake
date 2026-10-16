@@ -217,3 +217,108 @@ pub fn write_highlight_stage(stage: &Path, index: &[&str], eager: &[&str]) {
     write(&stage.join(HIGHLIGHT_INDEX), &highlight_index_js(index));
     write(&stage.join(SYNTAX_HIGHLIGHT), &syntax_highlight_js(eager));
 }
+
+pub const PI_AI: &str = "node_modules/@earendil-works/pi-ai";
+pub const BEDROCK: &str = "bedrock-converse-stream";
+pub const BEDROCK_PROVIDER: &str = "node_modules/@earendil-works/pi-ai/dist/bedrock-provider.js";
+
+fn api_factory(api: &str) -> String {
+    format!("{}Api", api.replace('-', "_"))
+}
+
+/// The file `trim_apis` rewrites to leave `api` out.
+pub fn api_file(api: &str) -> String {
+    if api == BEDROCK {
+        BEDROCK_PROVIDER.to_owned()
+    } else {
+        format!("{PI_AI}/dist/api/{api}.lazy.js")
+    }
+}
+
+/// pi-ai 1.3.0's `api/<api>.lazy.js`, or `bedrock-provider.js` for Bedrock; `stubbed` as
+/// `trim_apis` leaves it.
+pub fn api_js(api: &str, stubbed: bool) -> String {
+    let message = serde_json::Value::from(pibake::passes::left_out_message(api));
+    if api == BEDROCK {
+        let import = if stubbed {
+            format!(
+                "const stream = () => {{ throw new Error({message}); }};\nconst streamSimple = stream;"
+            )
+        } else {
+            "import { stream, streamSimple } from \"./api/bedrock-converse-stream.js\";".to_owned()
+        };
+        return format!(
+            "{import}\nexport const bedrockProviderModule = {{\n    stream,\n    streamSimple,\n}};\n//# sourceMappingURL=bedrock-provider.js.map"
+        );
+    }
+    let loader = if stubbed {
+        format!("() => Promise.reject(new Error({message}))")
+    } else {
+        format!("() => import(\"./{api}.js\")")
+    };
+    format!(
+        "import {{ lazyApi }} from \"./lazy.js\";\nexport const {} = () => lazyApi({loader});\n//# sourceMappingURL={api}.lazy.js.map",
+        api_factory(api)
+    )
+}
+
+/// pi-ai 1.3.0's `compat.js` registering `apis`.
+pub fn compat_js(apis: &[&str]) -> String {
+    let mut s = String::from("export * from \"./index.js\";\n");
+    for api in apis {
+        s.push_str(&format!(
+            "import {{ {} }} from \"./api/{api}.lazy.js\";\n",
+            api_factory(api)
+        ));
+    }
+    s.push_str("const apiProviderRegistry = new Map();\nconst BUILTIN_APIS = [\n");
+    for api in apis {
+        s.push_str(&format!("    [\"{api}\", {}()],\n", api_factory(api)));
+    }
+    s.push_str("];\nexport function registerBuiltInApiProviders() {}\n");
+    s
+}
+
+/// A pi-ai with `apis` in compat's registry and a catalog of `providers` (`id`, its models' APIs).
+pub fn write_apis_stage(stage: &Path, apis: &[&str], providers: &[(&str, &[&str])]) {
+    write(
+        &stage.join(PI_AI).join("package.json"),
+        r#"{"name": "@earendil-works/pi-ai", "version": "1.3.0"}"#,
+    );
+    write(&stage.join(PI_AI).join("dist/compat.js"), &compat_js(apis));
+    for api in apis {
+        write(&stage.join(api_file(api)), &api_js(api, false));
+    }
+    let data = stage.join(PI_AI).join("dist/providers/data");
+    write(
+        &data.join(".manifest.json"),
+        r#"{"generatedAt": "2026-10-16"}"#,
+    );
+    for (provider, model_apis) in providers {
+        let mut catalog = serde_json::Map::new();
+        // As pi-ai's classifier-only providers: a model whose API is not a stream API.
+        let classifier = format!("{provider}-classify");
+        catalog.insert(
+            "system-one".into(),
+            serde_json::json!({ classifier.clone(): { "id": classifier, "provider": provider, "api": "system-one", "type": "classifier" } }),
+        );
+        for (i, api) in model_apis.iter().enumerate() {
+            let id = format!("{provider}-m{i}");
+            catalog.insert(
+                api.to_string(),
+                serde_json::json!({ id.clone(): { "id": id, "provider": provider, "api": api, "type": "chat" } }),
+            );
+        }
+        write(
+            &data.join(format!("{provider}.json")),
+            &serde_json::Value::Object(catalog).to_string(),
+        );
+    }
+}
+
+pub fn no_setup(dir: &Path) -> pibake::passes::Setup {
+    pibake::passes::Setup {
+        agent_dir: dir.join("no-agent-dir"),
+        extension_dirs: vec![],
+    }
+}

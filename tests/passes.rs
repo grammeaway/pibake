@@ -12,7 +12,9 @@ fn trim(stage: &Path, keep: &[&str]) -> anyhow::Result<Output> {
         &Options {
             passes: vec![Pass::TrimHighlight],
             highlight_languages: keep.iter().map(|s| s.to_string()).collect(),
+            apis: None,
         },
+        &common::no_setup(stage),
     )
 }
 
@@ -89,7 +91,7 @@ fn running_on_its_own_output_changes_nothing() {
 #[test]
 fn passes_off_rewrite_nothing() {
     let s = stage(&INDEX, &EAGER);
-    let out = passes::run(s.path(), &Options::none()).unwrap();
+    let out = passes::run(s.path(), &Options::none(), &common::no_setup(s.path())).unwrap();
     assert_eq!(out, Output::default());
 }
 
