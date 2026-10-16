@@ -4,7 +4,7 @@
 
 pibake takes a Pi agent directory (the `~/.pi/agent` you already have, or a git repo laid out the same way) and builds it into one executable: Pi, your packages and your extensions, bundled, optimized for that exact setup, and pinned to exact versions.
 
-> **Status:** planning. Nothing is built yet. The first round of work is in [`local_plans/`](local_plans/README.md).
+> **Status:** early. `pibake inspect` works; the rest of the first round is in [`local_plans/`](local_plans/README.md).
 
 ## Why
 

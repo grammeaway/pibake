@@ -1,0 +1,1 @@
+{ "name": "repo", "version": "2.0.0", "pi": { "extensions": ["./ext/*.ts", "!ext/skip.ts"] } }

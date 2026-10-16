@@ -1,0 +1,11 @@
+{
+  "lastChangelogVersion": "1.3.0",
+  "packages": [
+    "npm:@scope/manifest-pkg@1.2.0",
+    { "source": "npm:conventional-pkg", "extensions": ["extensions/a.ts"], "skills": [] },
+    "git:github.com/owner/repo@v1",
+    "./local-pkg",
+    "npm:not-installed"
+  ],
+  "extensions": ["-builtin:mcp"]
+}

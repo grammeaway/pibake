@@ -5,6 +5,7 @@
 
 # Node
 node_modules/
+!tests/fixtures/**/node_modules/
 npm-debug.log*
 .npm/
 *.tsbuildinfo
@@ -18,3 +19,6 @@ npm-debug.log*
 # Env
 .env
 .env.*
+
+# Hegel example database
+.hegel/

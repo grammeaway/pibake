@@ -1,0 +1,1 @@
+{ "name": "local-pkg", "pi": { "extensions": ["./main.js"], "prompts": ["./prompts"] } }
