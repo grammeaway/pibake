@@ -20,6 +20,8 @@ use crate::package::Source;
 pub const LOCK_FILE: &str = "pibake.lock";
 pub const NPM_LOCK_FILE: &str = "pibake.package-lock.json";
 pub const PI_PACKAGE: &str = "@earendil-works/pi-coding-agent";
+/// The bundler (D5), pinned by pibake: the npm lock's only dev dependency.
+pub const ESBUILD_VERSION: &str = "0.28.2";
 /// `--build-sea` (D4).
 const MIN_NODE: (u64, u64) = (25, 5);
 const HEADER: &str =
@@ -377,18 +379,32 @@ impl Locker<'_> {
                 lock.npm_lock.sha256
             )]));
         }
-        let mut locked_npm =
-            root_dependencies(&npm_bytes).with_context(|| format!("in {}", npm_path.display()))?;
+        let in_npm_lock = || format!("in {}", npm_path.display());
+        let npm_json: Value = serde_json::from_slice(&npm_bytes).with_context(in_npm_lock)?;
+        let mut locked_npm = root_deps(&npm_json, "dependencies").with_context(in_npm_lock)?;
         locked_npm.remove(PI_PACKAGE);
-        Ok(Some(drift(&lock, &locked_npm, setup)))
+        let mut out = drift(&lock, &locked_npm, setup);
+        let locked_dev = root_deps(&npm_json, "devDependencies").with_context(in_npm_lock)?;
+        if locked_dev != dev_dependencies() {
+            out.push(format!(
+                "esbuild: locked {}, pibake uses {ESBUILD_VERSION}",
+                locked_dev.get("esbuild").map_or("none", String::as_str)
+            ));
+        }
+        Ok(Some(out))
     }
 
     fn generate(&self, setup: &Setup, warn: &mut dyn FnMut(String)) -> Result<(Lock, Vec<u8>)> {
         let work = tempfile::tempdir()?;
         let mut dependencies = setup.npm.clone();
         dependencies.insert(PI_PACKAGE.to_owned(), setup.pi_version.clone());
-        let package_json =
-            json!({"name": "pibake-stage", "private": true, "dependencies": dependencies});
+        let dev_dependencies = dev_dependencies();
+        let package_json = json!({
+            "name": "pibake-stage",
+            "private": true,
+            "dependencies": dependencies,
+            "devDependencies": dev_dependencies,
+        });
         fs::write(
             work.path().join("package.json"),
             format!("{}\n", serde_json::to_string_pretty(&package_json)?),
@@ -404,10 +420,12 @@ impl Locker<'_> {
             .context("npm wrote no package-lock.json")?;
         let lock_json: Value = serde_json::from_slice(&npm_lock)?;
 
-        if root_dependencies(&npm_lock)? != dependencies {
+        if root_deps(&lock_json, "dependencies")? != dependencies
+            || root_deps(&lock_json, "devDependencies")? != dev_dependencies
+        {
             bail!("npm's package-lock.json root does not list the generated dependencies");
         }
-        for (name, version) in &dependencies {
+        for (name, version) in dependencies.iter().chain(&dev_dependencies) {
             let entry = &lock_json["packages"][format!("node_modules/{name}")];
             if entry["version"].as_str() != Some(version) {
                 bail!("npm locked {name} at {}, not {version}", entry["version"]);
@@ -461,12 +479,22 @@ pub fn npm_lock_only(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn root_dependencies(npm_lock: &[u8]) -> Result<BTreeMap<String, String>> {
-    let json: Value = serde_json::from_slice(npm_lock)?;
-    let deps = json["packages"][""]["dependencies"]
-        .as_object()
-        .context("no root dependencies")?;
-    deps.iter()
+fn dev_dependencies() -> BTreeMap<String, String> {
+    BTreeMap::from([("esbuild".to_owned(), ESBUILD_VERSION.to_owned())])
+}
+
+/// `field` (`dependencies`, `devDependencies`) of the npm lock's root package; absent is empty.
+pub(crate) fn root_deps(npm_lock: &Value, field: &str) -> Result<BTreeMap<String, String>> {
+    let root = &npm_lock["packages"][""];
+    if !root.is_object() {
+        bail!("no root package");
+    }
+    let Some(deps) = root.get(field) else {
+        return Ok(BTreeMap::new());
+    };
+    deps.as_object()
+        .with_context(|| format!("root {field}: not an object"))?
+        .iter()
         .map(|(name, v)| {
             let v = v
                 .as_str()
@@ -491,7 +519,8 @@ fn not_installed(npm_lock: &Value, roots: &[PathBuf]) -> Vec<String> {
     };
     let locked: BTreeSet<String> = packages
         .iter()
-        .filter(|(path, entry)| !path.is_empty() && entry["link"] != true)
+        // Dev entries are pibake's own (esbuild), never part of the installed setup.
+        .filter(|(path, entry)| !path.is_empty() && entry["link"] != true && entry["dev"] != true)
         .filter_map(|(path, entry)| {
             let name = entry["name"].as_str().unwrap_or_else(|| {
                 path.rsplit_once("node_modules/")
@@ -698,6 +727,7 @@ mod tests {
             "node_modules/d": {"version": "4.0.0"},
             "node_modules/aliased": {"name": "e", "version": "5.0.0"},
             "node_modules/linked": {"link": true, "resolved": "../x"},
+            "node_modules/esbuild": {"version": "0.28.2", "dev": true},
         }});
         let roots = [dir.path().join("pi"), dir.path().join("ext/node_modules")];
         assert_eq!(not_installed(&lock, &roots), ["@s/b@2.0.1", "e@5.0.0"]);

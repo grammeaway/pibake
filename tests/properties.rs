@@ -344,3 +344,81 @@ fn drift_is_empty_exactly_when_the_setup_is_unchanged(tc: TestCase) {
         changed_npm
     );
 }
+
+// --- l4: stage ---
+
+mod common;
+
+use pibake::stage::{Inputs, content_hash};
+
+fn hash_of(files: &[(String, Vec<u8>)]) -> String {
+    content_hash(files.iter().map(|(n, c)| (n.as_str(), c.as_slice())))
+}
+
+#[hegel::test(test_cases = 500)]
+fn content_hash_is_order_free_and_sees_every_byte(tc: TestCase) {
+    let files: Vec<(String, Vec<u8>)> = tc
+        .draw(
+            gs::btree_maps(gs::from_regex(r"[a-z/.]{0,6}"), gs::binary().max_size(16)).max_size(6),
+        )
+        .into_iter()
+        .collect();
+    let hash = hash_of(&files);
+    assert_eq!(hash_of(&tc.draw(gs::permutations(files.clone()))), hash);
+
+    let mut changed = files.clone();
+    let i = tc.draw(gs::integers::<usize>().max_value(files.len()));
+    match changed.get_mut(i) {
+        // A new file, possibly empty.
+        None => changed.push(("new/".into(), tc.draw(gs::binary().max_size(4)))),
+        Some((_, content)) if !content.is_empty() => {
+            let at = tc.draw(gs::integers::<usize>().max_value(content.len() - 1));
+            content[at] ^= tc.draw(gs::integers::<u8>().min_value(1));
+        }
+        Some((_, content)) => content.push(tc.draw(gs::integers::<u8>())),
+    }
+    assert_ne!(hash_of(&changed), hash);
+}
+
+#[hegel::test(test_cases = 100)]
+fn stage_hash_follows_extension_bytes_not_creation_order(tc: TestCase) {
+    let files: Vec<(String, Vec<u8>)> = tc
+        .draw(
+            gs::btree_maps(
+                gs::from_regex(r"[a-z]{1,3}(/[a-z]{1,3}){0,2}\.ts"),
+                gs::binary().min_size(1).max_size(16),
+            )
+            .min_size(1)
+            .max_size(6),
+        )
+        .into_iter()
+        .collect();
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    common::write_lock_files(&project, &common::sample_npm_lock(), vec![]);
+    let agent = |name: &str, files: &[(String, Vec<u8>)]| -> String {
+        let dir = root.path().join(name);
+        for (rel, content) in files {
+            let path = dir.join("extensions").join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        let inventory = pibake::inventory::read(&dir, Path::new("/nonexistent-home")).unwrap();
+        Inputs::read(&project, &inventory)
+            .unwrap()
+            .hash()
+            .to_owned()
+    };
+    let hash = agent("a", &files);
+    assert_eq!(agent("b", &tc.draw(gs::permutations(files.clone()))), hash);
+
+    let mut changed = files.clone();
+    let (i, at) = (
+        tc.draw(gs::integers::<usize>().max_value(files.len() - 1)),
+        tc.draw(gs::integers::<usize>()),
+    );
+    let content = &mut changed[i].1;
+    let at = at % content.len();
+    content[at] ^= tc.draw(gs::integers::<u8>().min_value(1));
+    assert_ne!(agent("c", &changed), hash);
+}

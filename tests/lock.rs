@@ -1,3 +1,5 @@
+mod common;
+
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fs;
@@ -6,14 +8,12 @@ use std::process::Command;
 use std::time::SystemTime;
 
 use anyhow::Result;
+use common::{commit, git, write};
 use pibake::inventory;
-use pibake::lock::{Host, LOCK_FILE, Lock, Locker, NPM_LOCK_FILE, Outcome, PI_PACKAGE};
+use pibake::lock::{
+    ESBUILD_VERSION, Host, LOCK_FILE, Lock, Locker, NPM_LOCK_FILE, Outcome, PI_PACKAGE,
+};
 use serde_json::{Value, json};
-
-fn write(path: &Path, content: &str) {
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(path, content).unwrap();
-}
 
 fn install_npm(agent: &Path, name: &str, version: &str) {
     write(
@@ -23,35 +23,6 @@ fn install_npm(agent: &Path, name: &str, version: &str) {
             .join("package.json"),
         &json!({"name": name, "version": version}).to_string(),
     );
-}
-
-/// git isolated from the user's config (signing, hooks), so commits work anywhere.
-fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_AUTHOR_NAME", "t")
-        .env("GIT_AUTHOR_EMAIL", "t@t")
-        .env("GIT_COMMITTER_NAME", "t")
-        .env("GIT_COMMITTER_EMAIL", "t@t")
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "git {args:?}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8(out.stdout).unwrap().trim().to_owned()
-}
-
-fn commit(repo: &Path, file: &str, content: &str) -> String {
-    write(&repo.join(file), content);
-    git(repo, &["add", "-A"]);
-    git(repo, &["commit", "-q", "-m", file]);
-    git(repo, &["rev-parse", "HEAD"])
 }
 
 /// An agent dir with two npm packages, a git checkout and a local package, plus a stock-Pi stand-in.
@@ -121,15 +92,22 @@ impl Setup {
             let package: Value =
                 serde_json::from_str(&fs::read_to_string(dir.join("package.json"))?)?;
             let deps = package["dependencies"].as_object().unwrap();
+            let dev = package["devDependencies"].as_object().unwrap();
             let mut packages = serde_json::Map::new();
             packages.insert(
                 String::new(),
-                json!({"name": package["name"], "dependencies": deps}),
+                json!({"name": package["name"], "dependencies": deps, "devDependencies": dev}),
             );
             for (name, version) in deps {
                 packages.insert(
                     format!("node_modules/{name}"),
                     json!({"version": version, "integrity": format!("sha512-{name}")}),
+                );
+            }
+            for (name, version) in dev {
+                packages.insert(
+                    format!("node_modules/{name}"),
+                    json!({"version": version, "dev": true}),
                 );
             }
             let lock = json!({"name": package["name"], "lockfileVersion": 3, "packages": packages});
@@ -209,6 +187,10 @@ fn creates_both_files_then_leaves_them_alone() {
         npm_lock["packages"][""]["dependencies"],
         json!({PI_PACKAGE: "1.3.0", "@s/dep": "1.2.3", "pi-btw": "0.8.0"})
     );
+    assert_eq!(
+        npm_lock["packages"][""]["devDependencies"],
+        json!({"esbuild": ESBUILD_VERSION})
+    );
 
     let before = setup.lock_files();
     std::thread::sleep(std::time::Duration::from_millis(20));
@@ -286,6 +268,45 @@ fn edited_or_missing_lock_files_are_drift() {
     fs::write(setup.project().join(LOCK_FILE), "[pi]\n").unwrap();
     assert!(setup.lock(false, &npm_runs).is_err());
     assert!(setup.lock(true, &npm_runs).is_ok());
+    assert!(matches!(
+        setup.lock(false, &npm_runs).unwrap().0,
+        Outcome::UpToDate
+    ));
+}
+
+/// A lock written before pibake pinned esbuild, or by a pibake pinning another version.
+#[test]
+fn an_esbuild_pin_other_than_pibakes_is_drift() {
+    let setup = Setup::new();
+    let npm_runs = Cell::new(0);
+    setup.lock(false, &npm_runs).unwrap();
+    let npm_path = setup.project().join(NPM_LOCK_FILE);
+    let lock_path = setup.project().join(LOCK_FILE);
+    let rewrite = |dev: Value| {
+        let mut npm_lock: Value = serde_json::from_slice(&fs::read(&npm_path).unwrap()).unwrap();
+        npm_lock["packages"][""]["devDependencies"] = dev;
+        let bytes = serde_json::to_vec_pretty(&npm_lock).unwrap();
+        fs::write(&npm_path, &bytes).unwrap();
+        let mut lock = Lock::parse(&fs::read_to_string(&lock_path).unwrap()).unwrap();
+        lock.npm_lock.sha256 = pibake::lock::sha256_hex(&bytes);
+        fs::write(&lock_path, lock.render()).unwrap();
+    };
+
+    rewrite(json!({}));
+    assert_eq!(
+        drift(setup.lock(false, &npm_runs).unwrap().0),
+        [format!(
+            "esbuild: locked none, pibake uses {ESBUILD_VERSION}"
+        )]
+    );
+    rewrite(json!({"esbuild": "0.1.0"}));
+    assert_eq!(
+        drift(setup.lock(false, &npm_runs).unwrap().0),
+        [format!(
+            "esbuild: locked 0.1.0, pibake uses {ESBUILD_VERSION}"
+        )]
+    );
+    setup.lock(true, &npm_runs).unwrap();
     assert!(matches!(
         setup.lock(false, &npm_runs).unwrap().0,
         Outcome::UpToDate

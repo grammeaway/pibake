@@ -1,9 +1,11 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+mod common;
+
+use common::{all_names, fingerprint};
 use pibake::harness::{Harness, PiCommand};
 use pibake::{inventory, paths};
 
@@ -22,48 +24,6 @@ fn copy_dir(from: &Path, to: &Path) {
             fs::copy(entry.path(), target).unwrap();
         }
     }
-}
-
-/// Every path under the given top-level entries, with type, size, mtime and link target.
-/// Symlinks are recorded, not followed.
-fn fingerprint(dir: &Path, names: &[String]) -> Vec<String> {
-    fn walk(path: &Path, root: &Path, out: &mut Vec<String>) {
-        let meta = fs::symlink_metadata(path).unwrap();
-        let link = fs::read_link(path).ok();
-        out.push(format!(
-            "{} {:?} {} {}.{} {:?}",
-            path.strip_prefix(root).unwrap().display(),
-            meta.file_type(),
-            meta.len(),
-            meta.mtime(),
-            meta.mtime_nsec(),
-            link
-        ));
-        if meta.is_dir() {
-            let mut children: Vec<_> = fs::read_dir(path)
-                .unwrap()
-                .map(|e| e.unwrap().path())
-                .collect();
-            children.sort();
-            for child in children {
-                walk(&child, root, out);
-            }
-        }
-    }
-    let mut out = Vec::new();
-    for name in names {
-        walk(&dir.join(name), dir, &mut out);
-    }
-    out
-}
-
-fn all_names(dir: &Path) -> Vec<String> {
-    let mut names: Vec<String> = fs::read_dir(dir)
-        .unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .collect();
-    names.sort();
-    names
 }
 
 #[test]
