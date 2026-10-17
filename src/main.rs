@@ -37,7 +37,11 @@ enum Command {
     /// Stage, then bundle Pi and its extensions into target/pibake/bundle/<hash>/pi.mjs
     Bundle,
     /// Check the lock, stage, bundle, then build target/pibake/bin/<name>, a single executable
-    Build,
+    Build {
+        /// Build <name>-profiling instead, with V8's `perf` symbol map and native JS frames
+        #[arg(long)]
+        profiling: bool,
+    },
     /// Build, then copy the executable to ~/.local/bin/<name>
     Install,
     /// Compare tools, system prompt and commands of two Pi commands on the same setup
@@ -49,19 +53,24 @@ enum Command {
         #[arg(long, default_value = "pi")]
         against: String,
     },
-    /// Measure startup and a streamed write (200 KiB by default), interleaved across Pi commands
+    /// Measure RPC and interactive startup, and a streamed write (200 KiB by default), interleaved
+    /// across Pi commands
     Bench {
         /// A Pi command to measure; repeat to compare
         #[arg(long = "pi", required = true)]
         pi: Vec<String>,
         #[arg(long, default_value_t = 10)]
         runs: usize,
-        /// Size of the streamed write, in KiB
+        /// Size of the streamed write, in KiB; 0 skips it
         #[arg(long, default_value_t = 200)]
         big_write_kib: usize,
         /// Write the results to bench_results/<date>_<label>.json
         #[arg(long)]
         record: Option<String>,
+        /// Also count each run's user-space instructions with `perf stat` (`*_minstr`): far less
+        /// noisy than time. Needs `perf`; times then include perf's own small overhead
+        #[arg(long)]
+        perf_stat: bool,
     },
 }
 
@@ -130,7 +139,12 @@ fn run_bundle(
 }
 
 /// The built executable, or `None` when the setup drifted from the lock (reported to `out`).
-fn run_build(config: &Config, home: &Path, out: &mut dyn Write) -> Result<Option<PathBuf>> {
+fn run_build(
+    config: &Config,
+    home: &Path,
+    profiling: bool,
+    out: &mut dyn Write,
+) -> Result<Option<PathBuf>> {
     let inventory = inventory::read(&config.agent_dir, home)?;
     let host = lock::Host::find()?;
     let setup = serde_json::to_value(staleness::read(&inventory, &host)?)?;
@@ -149,7 +163,15 @@ fn run_build(config: &Config, home: &Path, out: &mut dyn Write) -> Result<Option
         env!("CARGO_PKG_VERSION"),
         &lock::sha256_hex(&lock_text)[..12]
     );
-    let output = config.dir.join(sea::BIN_ROOT).join(&config.name);
+    let (name, v8_flags) = if profiling {
+        (
+            format!("{}-profiling", config.name),
+            sea::profiling_flags(config.backend),
+        )
+    } else {
+        (config.name.clone(), &[][..])
+    };
+    let output = config.dir.join(sea::BIN_ROOT).join(name);
     eprintln!("build: node --build-sea");
     let kept = sea::Builder {
         stage: &stage_dir,
@@ -159,6 +181,7 @@ fn run_build(config: &Config, home: &Path, out: &mut dyn Write) -> Result<Option
         version: &version,
         setup: &setup,
         output: &output,
+        v8_flags,
         node: &sea::run_node,
     }
     .run()?;
@@ -218,13 +241,13 @@ fn main() -> Result<ExitCode> {
             let inventory = inventory::read(&config.agent_dir, &home)?;
             run_bundle(&config, &inventory, &mut out)?;
         }
-        Command::Build => {
-            if run_build(&config, &home, &mut out)?.is_none() {
+        Command::Build { profiling } => {
+            if run_build(&config, &home, profiling, &mut out)?.is_none() {
                 return Ok(ExitCode::FAILURE);
             }
         }
         Command::Install => {
-            let Some(built) = run_build(&config, &home, &mut out)? else {
+            let Some(built) = run_build(&config, &home, false, &mut out)? else {
                 return Ok(ExitCode::FAILURE);
             };
             let to = home.join(".local/bin").join(&config.name);
@@ -254,12 +277,10 @@ fn main() -> Result<ExitCode> {
             runs,
             big_write_kib,
             record,
+            perf_stat,
         } => {
             if runs == 0 {
                 bail!("--runs must be at least 1");
-            }
-            if big_write_kib == 0 {
-                bail!("--big-write-kib must be at least 1");
             }
             let commands = pi
                 .iter()
@@ -271,6 +292,7 @@ fn main() -> Result<ExitCode> {
                 big_write_bytes: big_write_kib * 1024,
                 source: &config.agent_dir,
                 real_home: &home,
+                perf_stat,
             };
             let results = bench.run(|step| eprintln!("bench: {step}"))?;
             write!(out, "{}", bench::render_table(&results))?;

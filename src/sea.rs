@@ -154,7 +154,20 @@ pub struct Builder<'a> {
     /// The setup it is built from (`staleness::Fingerprint`), checked at startup.
     pub setup: &'a serde_json::Value,
     pub output: &'a Path,
+    /// V8 flags given to both the build and the executable, so the code cache or snapshot is made
+    /// under the flags it runs with; V8 rejects a code cache made under other flags.
+    pub v8_flags: &'a [&'a str],
     pub node: Node<'a>,
+}
+
+/// `pibake build --profiling`: `perf`'s JIT symbol map, and with the code cache, interpreted JS
+/// frames on the native stack. A snapshot executable built with both segfaults at launch
+/// (Node 26.11.1).
+pub fn profiling_flags(backend: Backend) -> &'static [&'static str] {
+    match backend {
+        Backend::SeaCodecache => &["--perf-basic-prof", "--interpreted-frames-native-stack"],
+        Backend::SeaSnapshot => &["--perf-basic-prof"],
+    }
 }
 
 impl Builder<'_> {
@@ -200,6 +213,10 @@ impl Builder<'_> {
             "disableExperimentalSEAWarning": true,
             "assets": assets,
         });
+        if !self.v8_flags.is_empty() {
+            config["execArgv"] = json!(self.v8_flags);
+        }
+        let flags = self.v8_flags.iter().map(|f| f.as_ref());
         let config_path = work.path().join("sea.json");
         let mut kept = vec![];
         match self.backend {
@@ -209,14 +226,11 @@ impl Builder<'_> {
                 fs::File::create(&config_path)?.write_all(&serde_json::to_vec_pretty(&config)?)?;
                 // A fixed seed makes the code cache, and so the executable, the same bytes every
                 // build; `--hash-seed` would too, but V8 then rejects the cache at runtime.
-                (self.node)(
-                    &[
-                        "--random-seed=1".as_ref(),
-                        "--build-sea".as_ref(),
-                        config_path.as_os_str(),
-                    ],
-                    None,
-                )?;
+                let args: Vec<&std::ffi::OsStr> = std::iter::once("--random-seed=1".as_ref())
+                    .chain(flags)
+                    .chain(["--build-sea".as_ref(), config_path.as_os_str()])
+                    .collect();
+                (self.node)(&args, None)?;
             }
             Backend::SeaSnapshot => {
                 let root = self.cache.join(&hash);
@@ -225,10 +239,10 @@ impl Builder<'_> {
                 config["useSnapshot"] = json!(true);
                 fs::File::create(&config_path)?.write_all(&serde_json::to_vec_pretty(&config)?)?;
                 // The build's environment is what the snapshot could keep: only the root.
-                (self.node)(
-                    &["--build-sea".as_ref(), config_path.as_os_str()],
-                    Some(&[("PIBAKE_SNAPSHOT_ROOT", root.as_os_str())]),
-                )?;
+                let args: Vec<&std::ffi::OsStr> = flags
+                    .chain(["--build-sea".as_ref(), config_path.as_os_str()])
+                    .collect();
+                (self.node)(&args, Some(&[("PIBAKE_SNAPSHOT_ROOT", root.as_os_str())]))?;
             }
         }
         fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))?;
@@ -402,6 +416,7 @@ mod tests {
             version: "1.3.0 (pibake x)",
             setup: &json!({ "pi": "fingerprint" }),
             output: &output,
+            v8_flags: &[],
             node: &node,
         }
         .run()
@@ -429,6 +444,41 @@ mod tests {
     }
 
     #[test]
+    fn v8_flags_reach_both_the_build_and_the_executable() {
+        let dir = staged_with_workers();
+        let out = tempfile::tempdir().unwrap();
+        let output = out.path().join("pi");
+        let seen = std::cell::RefCell::new(vec![]);
+        let node = |args: &[&std::ffi::OsStr], _: Env| -> Result<()> {
+            let config: serde_json::Value =
+                serde_json::from_slice(&fs::read(args.last().unwrap())?)?;
+            fs::write(config["output"].as_str().unwrap(), "new")?;
+            let args: Vec<String> = args.iter().map(|a| a.to_string_lossy().into()).collect();
+            seen.borrow_mut().push((args, config["execArgv"].clone()));
+            Ok(())
+        };
+        Builder {
+            stage: dir.path(),
+            bundle: Path::new("/b"),
+            backend: Backend::SeaCodecache,
+            cache: Path::new("/unused"),
+            version: "v",
+            setup: &json!(null),
+            output: &output,
+            v8_flags: &["--perf-basic-prof"],
+            node: &node,
+        }
+        .run()
+        .unwrap();
+        let (args, exec_argv) = seen.into_inner().pop().unwrap();
+        assert_eq!(
+            args[..3],
+            ["--random-seed=1", "--perf-basic-prof", "--build-sea"]
+        );
+        assert_eq!(exec_argv, json!(["--perf-basic-prof"]));
+    }
+
+    #[test]
     fn a_failed_build_keeps_the_old_output() {
         let dir = stage();
         let out_dir = tempfile::tempdir().unwrap();
@@ -442,6 +492,7 @@ mod tests {
             version: "v",
             setup: &json!(null),
             output: &output,
+            v8_flags: &[],
             node: &|_, _| bail!("node broke"),
         }
         .run()
@@ -464,6 +515,7 @@ mod tests {
             version: "v",
             setup: &json!(null),
             output: &output,
+            v8_flags: &[],
             node: &|_, _| bail!("node broke"),
         }
         .run()
@@ -528,6 +580,7 @@ mod tests {
             version: "v",
             setup: &serde_json::Value::Null,
             output,
+            v8_flags: &[],
             node,
         }
     }

@@ -89,6 +89,46 @@ fn e2e_build_a_fixture_setup() {
     let version = String::from_utf8_lossy(&version.stdout);
     assert!(version.contains(" (pibake "), "{version}");
 
+    // Interactive startup in a pty, with the readiness check, for stock Pi and the executable.
+    let bin_command = bin.to_str().unwrap();
+    let benched = pibake(
+        &project,
+        &[
+            "bench",
+            "--pi",
+            "pi",
+            "--pi",
+            bin_command,
+            "--runs",
+            "1",
+            "--big-write-kib",
+            "0",
+            "--record",
+            "e2e",
+        ],
+        true,
+    );
+    let recorded = benched
+        .lines()
+        .last()
+        .unwrap()
+        .strip_prefix("recorded: ")
+        .unwrap();
+    let report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(project.join(recorded)).unwrap()).unwrap();
+    for result in report["results"].as_array().unwrap() {
+        let samples = |m: &str| result["metrics"][m]["samples"].as_array().unwrap().clone();
+        let (first_paint, ready) = (samples("first_paint_ms"), samples("ready_ms"));
+        // Equal when the first frame is `renderNow()`'s own: Pi's first timer render can lose
+        // the race against the DA1 reply.
+        assert!(
+            first_paint[0].as_f64().unwrap() <= ready[0].as_f64().unwrap(),
+            "{result}"
+        );
+        assert!(samples("interactive_peak_rss_mib")[0].as_f64().unwrap() > 0.0);
+        assert!(samples("big_write_wall_ms").is_empty(), "{result}");
+    }
+
     let google = Command::new(&bin)
         .args([
             "--provider",

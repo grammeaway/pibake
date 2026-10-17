@@ -56,9 +56,9 @@ agent_dir = "."
 | `pibake lock [--update]` | Resolves and pins versions. Without `--update`, a second run changes nothing |
 | `pibake stage` | Installs the lock into `target/pibake/stage/<hash>/`, reused while the lock and local extensions are unchanged |
 | `pibake bundle` | Stages, then bundles Pi and every extension into `target/pibake/bundle/<hash>/pi.mjs` (`node` runs it), with a per-extension compatibility report |
-| `pibake build` | Checks the lock for drift, bundles, then builds `target/pibake/bin/<name>` (`[build] name`, default `pi-baked`): one executable with Node inside. Content-hashed caches skip unchanged work |
+| `pibake build` | Checks the lock for drift, bundles, then builds `target/pibake/bin/<name>` (`[build] name`, default `pi-baked`): one executable with Node inside. Content-hashed caches skip unchanged work. `--profiling` builds `<name>-profiling` for `perf` (see [Profiling](#profiling)) |
 | `pibake verify` | Diffs the binary's tools, commands and system prompt against stock Pi on the same setup |
-| `pibake bench` | Startup time, memory, and CPU over a streamed large write (`--big-write-kib`, default 200), against stock Pi |
+| `pibake bench` | RPC and interactive startup (first paint, ready), memory, and CPU, and a streamed large write (`--big-write-kib`, default 200; 0 skips it), against stock Pi. `--perf-stat` also counts each run's instructions |
 | `pibake install` | Builds, then copies the binary to `~/.local/bin/<name>` |
 | `pibake init` (planned) | Turns a live setup into a repo-mode directory, without credentials or state |
 
@@ -86,6 +86,21 @@ pibake.lock ─► stage ─► passes ─► bundle ─► backend ─► verif
   For `sea_snapshot`, pibake defers what module code would otherwise freeze at build time: environment and terminal reads, ICU objects, signal listeners, and the HTTP stack. Those run at launch instead. A traced build fails, naming the module, on anything else read at load. The files Pi reads from disk are extracted to the user's cache at build time, and the executable keeps using that path. Other backends ([Pi-Bolt](https://github.com/opensec-git/Pi-Bolt)'s ahead-of-time compiled JavaScriptCore, `deno compile`) can plug in at the same point later.
 
 Every optimization is measured against stock Pi by `pibake bench`, and kept only if the numbers say so.
+
+### Profiling
+
+`perf` (Linux) can see what `--cpu-prof` cannot: V8's compiler, deserialiser and GC, ICU, and Node's own C++. User-space events need no root at `perf_event_paranoid` 2.
+
+- **Count, don't time.** `pibake bench --perf-stat` runs each command under `perf stat` and records `startup_minstr`, `interactive_minstr` and `big_write_minstr` (millions of user-space instructions). On a laptop their spread is about ±0.3 %, against several percent for wall time, so small A/B effects show. Times then include `perf`'s own start, ~10 ms.
+- **Name JS frames with a profiling build.** `pibake build --profiling` writes `<name>-profiling`, built with `--perf-basic-prof` (and `--interpreted-frames-native-stack` on the code-cache backend) both at build time and in the executable. Passing those flags at runtime instead (`NODE_OPTIONS`) makes V8 reject the code cache, and you profile a cold start. The flags have costs of their own: map writing, and line-end computation over the 20 MB bundle. So read a profiling build for names, not for shares.
+
+  ```bash
+  perf record -e cycles:u -g -o pi.data -- target/pibake/bin/pi-baked-profiling --help
+  perf report -i pi.data --no-children --sort dso,sym
+  ```
+
+  To profile a bench run, wrap the command: `pibake bench --pi "perf record -e cycles:u -g -o /tmp/run.data -- <executable>"` (each run overwrites the file, so use `--runs 1` or a wrapper script that names files per run).
+- **Node's own symbols.** Distribution builds of `node` are usually stripped, and the executable keeps their build ID. Either fetch the debug file through debuginfod (Arch: `DEBUGINFOD_URLS=https://debuginfod.archlinux.org`, ~3 GB), or build with the official nodejs.org binary of the locked version first on `PATH`: it ships unstripped. It is a different build (static OpenSSL and ICU), so use it to find where time goes, and the usual build for the numbers.
 
 ## Not goals
 

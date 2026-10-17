@@ -627,3 +627,70 @@ fn splice_applies_disjoint_edits(tc: TestCase) {
     edits.reverse();
     assert_eq!(pibake::passes::splice(&text, &mut edits).unwrap(), expected);
 }
+
+// --- p1: pty bench ---
+
+use pibake::bench::Screen;
+use std::time::Duration;
+
+/// Terminal output from the pieces the scanner looks at, and arbitrary bytes between them.
+fn draw_terminal_output(tc: &TestCase) -> Vec<u8> {
+    let pieces: [&[u8]; 8] = [
+        b"\x1b[?2026h",
+        b"\x1b[?2026l",
+        b"\x1b[c",
+        b"\x1b[?1049l",
+        b"\x1b]0;title\x07",
+        b"\x1b\\",
+        b"\x1b[38;5;116m",
+        b"hello",
+    ];
+    let count = tc.draw(gs::integers::<usize>().max_value(30));
+    (0..count)
+        .flat_map(
+            |_| match tc.draw(gs::integers::<usize>().max_value(pieces.len())) {
+                i if i < pieces.len() => pieces[i].to_vec(),
+                _ => tc.draw(gs::binary().max_size(4)),
+            },
+        )
+        .collect()
+}
+
+/// Reading the output in any pieces gives the same text, and dates each frame end and DA1 query
+/// by the read that completed it, as reading it a byte at a time shows.
+#[hegel::test(test_cases = 500)]
+fn screen_is_the_same_however_the_output_is_split(tc: TestCase) {
+    let bytes = draw_terminal_output(&tc);
+    let at = |end: usize| Duration::from_nanos(end as u64);
+    let mut reference = Screen::default();
+    let mut query_ends = vec![];
+    for (i, b) in bytes.iter().enumerate() {
+        if reference.feed(&[*b], at(i + 1)) > 0 {
+            query_ends.push(i + 1);
+        }
+    }
+
+    let mut cuts: Vec<usize> =
+        tc.draw(gs::vecs(gs::integers::<usize>().max_value(bytes.len())).max_size(8));
+    cuts.push(bytes.len());
+    cuts.sort();
+    cuts.dedup();
+    let mut screen = Screen::default();
+    let mut start = 0;
+    for &end in &cuts {
+        let queries = screen.feed(&bytes[start..end], at(end));
+        let expected = query_ends
+            .iter()
+            .filter(|&&q| q > start && q <= end)
+            .count();
+        assert_eq!(queries, expected, "DA1 queries in {start}..{end}");
+        start = end;
+    }
+    assert_eq!(screen.text, reference.text);
+    let completed_by: Vec<Duration> = reference
+        .frames
+        .iter()
+        .map(|&t| at(*cuts.iter().find(|&&c| at(c) >= t).unwrap()))
+        .collect();
+    assert_eq!(screen.frames, completed_by);
+}
