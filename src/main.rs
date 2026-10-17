@@ -101,6 +101,7 @@ fn run_bundle(
         root: &config.dir.join(bundle::BUNDLE_ROOT),
         build: &bundle::run_node_build,
         passes: &config.passes,
+        backend: config.backend,
     };
     let (outcome, report) = bundler.run(&plan, &mut |step| eprintln!("bundle: {step}"))?;
     write!(out, "{}", report.summary())?;
@@ -109,12 +110,16 @@ fn run_bundle(
             writeln!(
                 out,
                 "bundle up to date: {}",
-                dir.join(bundle::LAUNCHER).display()
+                dir.join(bundle::launcher(config.backend)).display()
             )?;
             dir
         }
         stage::Outcome::Built(dir) => {
-            writeln!(out, "bundled {}", dir.join(bundle::LAUNCHER).display())?;
+            writeln!(
+                out,
+                "bundled {}",
+                dir.join(bundle::launcher(config.backend)).display()
+            )?;
             dir
         }
     };
@@ -143,15 +148,20 @@ fn run_build(config: &Config, home: &Path, out: &mut dyn Write) -> Result<Option
     );
     let output = config.dir.join(sea::BIN_ROOT).join(&config.name);
     eprintln!("build: node --build-sea");
-    sea::Builder {
+    let kept = sea::Builder {
         stage: &stage_dir,
         bundle: &bundle_dir,
+        backend: config.backend,
+        cache: &sea::cache_dir(home),
         version: &version,
         setup: &setup,
         output: &output,
         node: &sea::run_node,
     }
     .run()?;
+    for k in kept {
+        eprintln!("build: the snapshot keeps {k}");
+    }
     writeln!(out, "built {}", output.display())?;
     Ok(Some(output))
 }

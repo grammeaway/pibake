@@ -1,6 +1,7 @@
 // pibake bundle driver: runs the staged esbuild with pibake's plugins, prints a JSON result.
 // Usage: node build.mjs <config.json>. Generated per build by `pibake bundle`; see src/bundle.rs.
 import { readFile } from "node:fs/promises";
+import { createRequire, isBuiltin } from "node:module";
 import { dirname, extname, isAbsolute, join, relative, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -101,6 +102,7 @@ const plugin = {
 			if (r.errors.length) throw new Error(`pibake: ${r.errors[0].text}`);
 			return { path: r.path };
 		});
+		if (config.lazy) lazyModules(build, config.lazy);
 		build.onResolve({ filter: /^pibake:staleness$/ }, () => ({ path: "staleness", namespace: "pibake-staleness" }));
 		build.onLoad({ filter: /.*/, namespace: "pibake-staleness" }, () => ({ contents: config.staleness, loader: "js" }));
 		build.onResolve({ filter: /^pibake:frozen$/ }, () => ({ path: "frozen", namespace: "pibake-frozen" }));
@@ -195,6 +197,38 @@ const LOCATION_DEFINES = {
 	__filename: "__pibake_location.filename",
 };
 
+/**
+ * Snapshot bundles: the listed builtins and packages are loaded on first use instead of at import,
+ * since loading them creates native state a snapshot cannot hold. Each import gets an object with
+ * a getter per export name, read from the real module in this process.
+ */
+function lazyModules(build, lazy) {
+	const builtins = new Set(lazy.builtins);
+	const packages = new Set(lazy.packages);
+	const names = [...builtins, ...packages].map((n) => n.replace(/[/.]/g, "\\$&")).join("|");
+	build.onResolve({ filter: new RegExp(`^(node:)?(${names})$`) }, async (args) => {
+		if (args.namespace === "pibake-lazy") return undefined;
+		const name = args.path.replace(/^node:/, "");
+		if (builtins.has(name) && isBuiltin(args.path)) return { path: `node:${name}`, namespace: "pibake-lazy" };
+		if (!packages.has(args.path)) return undefined;
+		const r = await build.resolve(args.path, { importer: args.importer, resolveDir: args.resolveDir, kind: args.kind, namespace: "pibake-lazy" });
+		if (r.errors.length) return undefined;
+		return { path: r.path, namespace: "pibake-lazy" };
+	});
+	build.onLoad({ filter: /.*/, namespace: "pibake-lazy" }, (args) => {
+		const real = createRequire(join(config.stage, "pibake.js"))(args.path);
+		const getters = Object.getOwnPropertyNames(real)
+			// esbuild's interop reads `__esModule` at import.
+			.map((n) => `\t${JSON.stringify(n)}: ${n === "__esModule" ? `{ value: ${real[n]} }` : `{ enumerable: true, get: () => load()[${JSON.stringify(n)}] }`},\n`)
+			.join("");
+		return {
+			contents: `let real;\nconst load = () => (real ??= require(${JSON.stringify(args.path)}));\nmodule.exports = Object.defineProperties({}, {\n${getters}});\n`,
+			resolveDir: args.path.startsWith("node:") ? config.stage : dirname(args.path),
+			loader: "js",
+		};
+	});
+}
+
 function jitiShim(id) {
 	return `import { bakedLoader } from "pibake:baked";
 export function createJiti(id, options) {
@@ -220,7 +254,9 @@ const result = await esbuild.build({
 	absWorkingDir: config.stage,
 	bundle: true,
 	platform: "node",
-	format: "esm",
+	format: config.format,
+	// A snapshot script cannot `import()`; Node 26 can `require()` ES modules.
+	supported: config.format === "cjs" ? { "dynamic-import": false } : {},
 	sourcemap: "linked",
 	metafile: true,
 	write: config.write ?? true,

@@ -1,6 +1,14 @@
-//! `pibake build`: the bundle as a Node single executable application (SEA). `main.mjs` is the
-//! SEA's main, with V8's code cache; the stage files Pi reads at runtime ride along as assets,
-//! which the bundle's prologue (`bundle/prologue.mjs`) extracts once into the user's cache.
+//! `pibake build`: the bundle as a Node single executable application (SEA). The stage files Pi
+//! reads at runtime ride along as assets, extracted once into the user's cache.
+//!
+//! `sea_codecache`: `main.mjs` is the SEA's main, with V8's code cache; its prologue
+//! (`bundle/prologue.mjs`) extracts the files at launch.
+//!
+//! `sea_snapshot`: `main.cjs` runs at build time and the SEA carries the resulting V8 startup
+//! snapshot. Module code reads its location while the snapshot is built, so the files are
+//! extracted at build time to the path the executable then always uses; a launch re-extracts them
+//! only if they are gone. Before the build, `bundle/trace.cjs` runs the same evaluation and
+//! `passes::snapshot_safety::check` judges what it saw.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -12,9 +20,15 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use serde_json::json;
 
-use crate::bundle::PI_CHUNK_FILES;
+use crate::bundle::{self, PI_CHUNK_FILES};
+use crate::config::Backend;
 use crate::lock::PI_PACKAGE;
+use crate::passes::snapshot_safety;
 use crate::stage;
+
+const TRACE: &str = include_str!("bundle/trace.cjs");
+/// Marks a complete extraction; the prologues use the same name.
+const EXTRACTED: &str = ".pibake-extracted";
 
 /// Under the directory holding `pibake.toml`.
 pub const BIN_ROOT: &str = "target/pibake/bin";
@@ -91,14 +105,32 @@ fn pi_workers(stage_dir: &Path) -> Vec<(String, PathBuf)> {
         .collect()
 }
 
-/// Runs `node` with the given arguments; the stand-in point for tests.
-pub type Node<'a> = &'a dyn Fn(&[&std::ffi::OsStr]) -> Result<()>;
+/// Where executables extract their files: `$XDG_CACHE_HOME/pibake` if absolute, else
+/// `~/.cache/pibake`, as the prologues decide.
+pub fn cache_dir(home: &Path) -> PathBuf {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| home.join(".cache"));
+    base.join("pibake")
+}
 
-pub fn run_node(args: &[&std::ffi::OsStr]) -> Result<()> {
-    let out = Command::new("node")
-        .args(args)
-        .output()
-        .context("running node")?;
+/// Runs `node` with the given arguments, and with only `env` when given (`PATH` is kept); the
+/// stand-in point for tests.
+pub type Node<'a> = &'a dyn Fn(&[&std::ffi::OsStr], Env) -> Result<()>;
+/// The only environment variables a `node` run gets, besides `PATH`; `None` inherits pibake's.
+pub type Env<'a> = Option<&'a [(&'a str, &'a std::ffi::OsStr)]>;
+
+pub fn run_node(args: &[&std::ffi::OsStr], env: Env) -> Result<()> {
+    let mut cmd = Command::new("node");
+    cmd.args(args);
+    if let Some(env) = env {
+        cmd.env_clear().envs(env.iter().copied());
+        if let Some(path) = std::env::var_os("PATH") {
+            cmd.env("PATH", path);
+        }
+    }
+    let out = cmd.output().context("running node")?;
     if !out.status.success() {
         bail!(
             "node {:?} failed:\n{}{}",
@@ -112,8 +144,11 @@ pub fn run_node(args: &[&std::ffi::OsStr]) -> Result<()> {
 
 pub struct Builder<'a> {
     pub stage: &'a Path,
-    /// Holds `main.mjs`.
+    /// Holds the bundle's main file.
     pub bundle: &'a Path,
+    pub backend: Backend,
+    /// `cache_dir`, where a snapshot executable's files are extracted at build time.
+    pub cache: &'a Path,
     /// What the executable prints for a lone `--version`.
     pub version: &'a str,
     /// The setup it is built from (`staleness::Fingerprint`), checked at startup.
@@ -124,7 +159,8 @@ pub struct Builder<'a> {
 
 impl Builder<'_> {
     /// Writes the executable at `output`, replacing what is there only once it is complete.
-    pub fn run(&self) -> Result<()> {
+    /// Returns what a snapshot keeps from its build, as `snapshot_safety::check` accepted it.
+    pub fn run(&self) -> Result<Vec<String>> {
         let mut files = shipped_files(self.stage)?;
         for (rel, path) in pi_workers(self.stage) {
             if !path.is_file() {
@@ -157,28 +193,98 @@ impl Builder<'_> {
         for (rel, path) in &files {
             assets.insert(format!("files/{rel}"), json!(path));
         }
-        let config = json!({
-            "main": self.bundle.join("main.mjs"),
-            "mainFormat": "module",
+        let main = self.bundle.join(bundle::main_file(self.backend));
+        let mut config = json!({
+            "main": main,
             "output": &*tmp,
-            "useCodeCache": true,
             "disableExperimentalSEAWarning": true,
             "assets": assets,
         });
         let config_path = work.path().join("sea.json");
-        fs::File::create(&config_path)?.write_all(&serde_json::to_vec_pretty(&config)?)?;
-        // A fixed seed makes the code cache, and so the executable, the same bytes every build;
-        // `--hash-seed` would too, but V8 then rejects the cache at runtime.
-        (self.node)(&[
-            "--random-seed=1".as_ref(),
-            "--build-sea".as_ref(),
-            config_path.as_os_str(),
-        ])?;
+        let mut kept = vec![];
+        match self.backend {
+            Backend::SeaCodecache => {
+                config["mainFormat"] = json!("module");
+                config["useCodeCache"] = json!(true);
+                fs::File::create(&config_path)?.write_all(&serde_json::to_vec_pretty(&config)?)?;
+                // A fixed seed makes the code cache, and so the executable, the same bytes every
+                // build; `--hash-seed` would too, but V8 then rejects the cache at runtime.
+                (self.node)(
+                    &[
+                        "--random-seed=1".as_ref(),
+                        "--build-sea".as_ref(),
+                        config_path.as_os_str(),
+                    ],
+                    None,
+                )?;
+            }
+            Backend::SeaSnapshot => {
+                let root = self.cache.join(&hash);
+                extract(&contents, &root, &hash)?;
+                kept = self.gate(&main, &root, work.path())?;
+                config["useSnapshot"] = json!(true);
+                fs::File::create(&config_path)?.write_all(&serde_json::to_vec_pretty(&config)?)?;
+                // The build's environment is what the snapshot could keep: only the root.
+                (self.node)(
+                    &["--build-sea".as_ref(), config_path.as_os_str()],
+                    Some(&[("PIBAKE_SNAPSHOT_ROOT", root.as_os_str())]),
+                )?;
+            }
+        }
         fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))?;
         tmp.persist(self.output)
             .with_context(|| format!("writing {}", self.output.display()))?;
-        Ok(())
+        Ok(kept)
     }
+
+    /// Evaluates the snapshot bundle's modules under `bundle/trace.cjs`, as the snapshot build
+    /// will, and fails on what `snapshot_safety` does not accept.
+    fn gate(&self, main: &Path, root: &Path, work: &Path) -> Result<Vec<String>> {
+        let trace = work.join("trace.cjs");
+        let out = work.join("trace.json");
+        fs::write(&trace, TRACE)?;
+        (self.node)(
+            &["--require".as_ref(), trace.as_os_str(), main.as_os_str()],
+            Some(&[
+                ("PIBAKE_SNAPSHOT_ROOT", root.as_os_str()),
+                ("PIBAKE_TRACE_OUT", out.as_os_str()),
+            ]),
+        )
+        .context("evaluating the bundle's modules as the snapshot build would")?;
+        let findings: Vec<snapshot_safety::Finding> =
+            serde_json::from_slice(&fs::read(&out).context("the trace wrote no findings")?)?;
+        snapshot_safety::check(&findings)
+    }
+}
+
+/// The executable's files at `root`, written as the prologues extract them (`bundle/extract.js`):
+/// into a temporary directory beside it, renamed into place, marked complete.
+fn extract(contents: &[(&str, Vec<u8>)], root: &Path, hash: &str) -> Result<()> {
+    if root.join(EXTRACTED).is_file() {
+        return Ok(());
+    }
+    if root.exists() {
+        bail!("{} exists without {EXTRACTED}; remove it", root.display());
+    }
+    let base = root.parent().context("extraction root has no directory")?;
+    fs::create_dir_all(base)?;
+    let tmp = tempfile::Builder::new()
+        .prefix(&format!(".tmp-{hash}-"))
+        .tempdir_in(base)?;
+    for (rel, bytes) in contents {
+        let path = tmp.path().join(rel);
+        fs::create_dir_all(path.parent().context("a file has a directory")?)?;
+        fs::write(&path, bytes)?;
+    }
+    fs::write(tmp.path().join(EXTRACTED), format!("{hash}\n"))?;
+    let tmp = tmp.keep();
+    if let Err(e) = fs::rename(&tmp, root) {
+        let _ = fs::remove_dir_all(&tmp);
+        if !root.join(EXTRACTED).is_file() {
+            return Err(e).with_context(|| format!("extracting into {}", root.display()));
+        }
+    }
+    Ok(())
 }
 
 /// Copies `from` to `to` through a temporary file beside `to`, so `to` is never half-written.
@@ -277,7 +383,8 @@ mod tests {
         fs::create_dir_all(output.parent().unwrap()).unwrap();
         fs::write(&output, "old").unwrap();
         let seen = std::cell::RefCell::new(None);
-        let node = |args: &[&std::ffi::OsStr]| -> Result<()> {
+        let node = |args: &[&std::ffi::OsStr], env: Env| -> Result<()> {
+            assert!(env.is_none());
             let config: serde_json::Value =
                 serde_json::from_slice(&fs::read(args.last().unwrap())?)?;
             fs::write(config["output"].as_str().unwrap(), "new")?;
@@ -290,6 +397,8 @@ mod tests {
         Builder {
             stage: dir.path(),
             bundle: Path::new("/b"),
+            backend: Backend::SeaCodecache,
+            cache: Path::new("/unused"),
             version: "1.3.0 (pibake x)",
             setup: &json!({ "pi": "fingerprint" }),
             output: &output,
@@ -328,10 +437,12 @@ mod tests {
         let err = Builder {
             stage: dir.path(),
             bundle: Path::new("/b"),
+            backend: Backend::SeaCodecache,
+            cache: Path::new("/unused"),
             version: "v",
             setup: &json!(null),
             output: &output,
-            node: &|_| bail!("node broke"),
+            node: &|_, _| bail!("node broke"),
         }
         .run()
         .unwrap_err();
@@ -348,16 +459,202 @@ mod tests {
         let err = Builder {
             stage: dir.path(),
             bundle: Path::new("/b"),
+            backend: Backend::SeaCodecache,
+            cache: Path::new("/unused"),
             version: "v",
             setup: &json!(null),
             output: &output,
-            node: &|_| bail!("node broke"),
+            node: &|_, _| bail!("node broke"),
         }
         .run()
         .unwrap_err();
         assert!(format!("{err:#}").contains("node broke"), "{err:#}");
         assert_eq!(fs::read_to_string(&output).unwrap(), "old");
         assert_eq!(fs::read_dir(out_dir.path()).unwrap().count(), 1);
+    }
+
+    fn staged_with_workers() -> tempfile::TempDir {
+        let dir = stage();
+        for f in PI_CHUNK_FILES {
+            touch(
+                dir.path(),
+                &format!("node_modules/{PI_PACKAGE}/dist/bundle/chunks/{f}"),
+            );
+        }
+        dir
+    }
+
+    type Calls = std::cell::RefCell<Vec<(Vec<String>, Option<Vec<(String, String)>>)>>;
+
+    /// A node that answers the gate with `findings` and builds by writing "new".
+    fn snapshot_node<'a>(
+        findings: &'a serde_json::Value,
+        calls: &'a Calls,
+    ) -> impl Fn(&[&std::ffi::OsStr], Env) -> Result<()> + 'a {
+        move |args, env| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string_lossy().into()).collect();
+            let env: Option<Vec<(String, String)>> = env.map(|e| {
+                e.iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string_lossy().into()))
+                    .collect()
+            });
+            let var = |k: &str| {
+                env.as_ref()
+                    .and_then(|e| e.iter().find(|(n, _)| n == k))
+                    .map(|(_, v)| v.clone())
+            };
+            if args[0] == "--require" {
+                fs::write(var("PIBAKE_TRACE_OUT").unwrap(), findings.to_string())?;
+            } else {
+                let config: serde_json::Value = serde_json::from_slice(&fs::read(&args[1])?)?;
+                fs::write(config["output"].as_str().unwrap(), "new")?;
+            }
+            calls.borrow_mut().push((args, env));
+            Ok(())
+        }
+    }
+
+    fn snapshot_builder<'a>(
+        dir: &'a Path,
+        cache: &'a Path,
+        output: &'a Path,
+        node: Node<'a>,
+    ) -> Builder<'a> {
+        Builder {
+            stage: dir,
+            bundle: Path::new("/b"),
+            backend: Backend::SeaSnapshot,
+            cache,
+            version: "v",
+            setup: &serde_json::Value::Null,
+            output,
+            node,
+        }
+    }
+
+    #[test]
+    fn a_snapshot_is_built_from_files_extracted_to_its_root_after_the_gate() {
+        let dir = staged_with_workers();
+        let out = tempfile::tempdir().unwrap();
+        let (cache, output) = (out.path().join("cache"), out.path().join("bin/pi"));
+        let findings = json!([{ "module": "node_modules/which/which.js", "kind": "env", "detail": "OSTYPE", "line": 9 }]);
+        let calls = Calls::default();
+        let node = snapshot_node(&findings, &calls);
+        let kept = snapshot_builder(dir.path(), &cache, &output, &node)
+            .run()
+            .unwrap();
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert!(
+            kept[0].starts_with("which/which.js: env OSTYPE"),
+            "{kept:?}"
+        );
+        assert_eq!(fs::read_to_string(&output).unwrap(), "new");
+
+        let roots: Vec<_> = fs::read_dir(&cache)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(roots.len(), 1, "{roots:?}");
+        let root = &roots[0];
+        let hash = root.file_name().unwrap().to_str().unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join(EXTRACTED)).unwrap(),
+            format!("{hash}\n")
+        );
+        for rel in shipped_files(dir.path()).unwrap().keys() {
+            assert_eq!(fs::read_to_string(root.join(rel)).unwrap(), *rel);
+        }
+
+        drop(node);
+        let calls = calls.into_inner();
+        assert_eq!(calls.len(), 2);
+        let (gate, gate_env) = &calls[0];
+        assert_eq!(gate[0], "--require");
+        assert_eq!(gate[2], "/b/main.cjs");
+        let root_var = (
+            "PIBAKE_SNAPSHOT_ROOT".to_owned(),
+            root.to_string_lossy().into_owned(),
+        );
+        assert!(gate_env.as_ref().unwrap().contains(&root_var));
+        let (build, build_env) = &calls[1];
+        assert_eq!(build[0], "--build-sea");
+        assert_eq!(build_env.as_deref(), Some(&[root_var][..]));
+
+        // A second build reuses the extraction.
+        let calls = Calls::default();
+        let node = snapshot_node(&findings, &calls);
+        snapshot_builder(dir.path(), &cache, &output, &node)
+            .run()
+            .unwrap();
+        assert_eq!(fs::read_dir(&cache).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_snapshot_config_asks_for_the_snapshot_of_main_cjs() {
+        let dir = staged_with_workers();
+        let out = tempfile::tempdir().unwrap();
+        let (cache, output) = (out.path().join("cache"), out.path().join("pi"));
+        let seen = std::cell::RefCell::new(None);
+        let node = |args: &[&std::ffi::OsStr], env: Env| -> Result<()> {
+            if args[0] == "--require" {
+                let out = env
+                    .unwrap()
+                    .iter()
+                    .find(|(k, _)| *k == "PIBAKE_TRACE_OUT")
+                    .unwrap()
+                    .1;
+                return Ok(fs::write(out, "[]")?);
+            }
+            let config: serde_json::Value = serde_json::from_slice(&fs::read(args[1])?)?;
+            fs::write(config["output"].as_str().unwrap(), "new")?;
+            *seen.borrow_mut() = Some(config);
+            Ok(())
+        };
+        snapshot_builder(dir.path(), &cache, &output, &node)
+            .run()
+            .unwrap();
+        let config = seen.into_inner().unwrap();
+        assert_eq!(config["main"], "/b/main.cjs");
+        assert_eq!(config["useSnapshot"], true);
+        assert!(config.get("mainFormat").is_none() && config.get("useCodeCache").is_none());
+    }
+
+    #[test]
+    fn an_unhandled_finding_fails_before_the_snapshot_is_built() {
+        let dir = staged_with_workers();
+        let out = tempfile::tempdir().unwrap();
+        let (cache, output) = (out.path().join("cache"), out.path().join("pi"));
+        fs::write(&output, "old").unwrap();
+        let findings = json!([{ "module": "node_modules/x/start.js", "kind": "time", "detail": "Date.now()", "line": 42 }]);
+        let calls = Calls::default();
+        let node = snapshot_node(&findings, &calls);
+        let err = snapshot_builder(dir.path(), &cache, &output, &node)
+            .run()
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("node_modules/x/start.js (main.cjs:42): time Date.now()"),
+            "{err:#}"
+        );
+        assert_eq!(calls.borrow().len(), 1);
+        assert_eq!(fs::read_to_string(&output).unwrap(), "old");
+    }
+
+    #[test]
+    fn a_root_without_its_marker_is_not_reused() {
+        let out = tempfile::tempdir().unwrap();
+        let contents = vec![("a/b.js", b"x".to_vec())];
+        let root = out.path().join("cache/abc");
+        fs::create_dir_all(&root).unwrap();
+        let err = extract(&contents, &root, "abc").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("without .pibake-extracted"),
+            "{err:#}"
+        );
+        fs::remove_dir(&root).unwrap();
+        extract(&contents, &root, "abc").unwrap();
+        assert_eq!(fs::read_to_string(root.join("a/b.js")).unwrap(), "x");
+        // Nothing is left beside it.
+        assert_eq!(fs::read_dir(out.path().join("cache")).unwrap().count(), 1);
     }
 
     #[test]

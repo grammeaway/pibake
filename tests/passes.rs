@@ -13,6 +13,7 @@ fn trim(stage: &Path, keep: &[&str]) -> anyhow::Result<Output> {
             passes: vec![Pass::TrimHighlight],
             highlight_languages: keep.iter().map(|s| s.to_string()).collect(),
             apis: None,
+            snapshot: false,
         },
         &common::no_setup(stage),
     )

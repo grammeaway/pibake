@@ -8,6 +8,7 @@
 //! A pass that bakes a setting into the build records it as `Frozen`; the bundle's entry checks
 //! the live setup against it at startup (`bundle/frozen.mjs`).
 
+pub mod snapshot_safety;
 mod trim_apis;
 mod trim_highlight;
 
@@ -32,6 +33,8 @@ pub enum Pass {
     TrimHighlight,
     /// Stubs pi-ai's stream APIs outside `[trim] apis` (default: derived from the setup).
     TrimApis,
+    /// Defers module code that reads launch state; added by `backend = "sea_snapshot"`.
+    SnapshotSafety,
 }
 
 impl Pass {
@@ -39,6 +42,7 @@ impl Pass {
         match self {
             Pass::TrimHighlight => "trim_highlight",
             Pass::TrimApis => "trim_apis",
+            Pass::SnapshotSafety => "snapshot_safety",
         }
     }
 }
@@ -51,6 +55,8 @@ pub struct Options {
     pub highlight_languages: Vec<String>,
     /// `None`: derived from the setup.
     pub apis: Option<Vec<String>>,
+    /// Runs `snapshot_safety` after `passes`.
+    pub snapshot: bool,
 }
 
 impl Options {
@@ -59,6 +65,7 @@ impl Options {
             passes: vec![],
             highlight_languages: vec![],
             apis: None,
+            snapshot: false,
         }
     }
 }
@@ -123,7 +130,8 @@ pub fn run(stage: &Path, options: &Options, setup: &Setup) -> Result<Output> {
     }
     let mut reports = vec![];
     let mut frozen = vec![];
-    for pass in &options.passes {
+    let snapshot = options.snapshot.then_some(Pass::SnapshotSafety);
+    for pass in options.passes.iter().chain(&snapshot) {
         let (changes, notes) = match pass {
             Pass::TrimHighlight => (
                 trim_highlight::run(&mut sources, &options.highlight_languages)
@@ -136,6 +144,10 @@ pub fn run(stage: &Path, options: &Options, setup: &Setup) -> Result<Output> {
                 frozen.push(out.frozen);
                 (out.changes, out.notes)
             }
+            Pass::SnapshotSafety => (
+                snapshot_safety::run(&mut sources).context("pass snapshot_safety")?,
+                vec![],
+            ),
         };
         reports.push(PassReport {
             pass: *pass,

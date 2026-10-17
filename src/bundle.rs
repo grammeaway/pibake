@@ -1,4 +1,5 @@
-//! `pibake bundle`: Pi and every extension entry point of the stage in one ESM file.
+//! `pibake bundle`: Pi and every extension entry point of the stage in one file: an ES module, or
+//! for the `sea_snapshot` backend a CommonJS script that defers launch state to its resume.
 //!
 //! Pi's own extension loader still decides what loads, from where and in what order. The bundle
 //! only answers its jiti imports for the baked entry points (see `bundle/build.mjs`), so filters,
@@ -13,9 +14,10 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::config::Backend;
 use crate::inventory::Inventory;
 use crate::lock::PI_PACKAGE;
-use crate::passes::{self, PassReport};
+use crate::passes::{self, PassReport, snapshot_safety};
 use crate::paths;
 use crate::stage::{self, Outcome};
 
@@ -24,9 +26,11 @@ pub const BUNDLE_ROOT: &str = "target/pibake/bundle";
 /// What `node` runs.
 pub const LAUNCHER: &str = "pi.mjs";
 pub const REPORT: &str = "report.json";
-const MAIN: &str = "main.mjs";
 const BUILD_SCRIPT: &str = include_str!("bundle/build.mjs");
 const PROLOGUE: &str = include_str!("bundle/prologue.mjs");
+const PROLOGUE_SNAPSHOT: &str = include_str!("bundle/prologue_snapshot.cjs");
+/// Both prologues' extraction of an executable's files, spliced in at `// pibake:extract`.
+const EXTRACT: &str = include_str!("bundle/extract.js");
 /// `pibake:staleness`: the entry's check of the setup an executable was built from.
 pub const STALENESS: &str = include_str!("bundle/staleness.mjs");
 /// `pibake:frozen`'s code: the entry's check of settings passes baked in; `frozen_module` adds
@@ -54,6 +58,31 @@ registerBunOAuthFlows();
 setBedrockProviderModule(bedrockProviderModule);
 setupCli();
 main(process.argv.slice(2));
+"#;
+/// `ENTRY` for a snapshot: the build evaluates every module, and the executable starts at `run`,
+/// after the prologue's `__pibake_resume`. Traced (`bundle/trace.cjs`), it only evaluates.
+const ENTRY_SNAPSHOT: &str = r#"import { startupSnapshot } from "node:v8";
+import { setupCli } from "./dist/cli/setup.js";
+import { main } from "./dist/main.js";
+import { getAgentDir } from "./dist/config.js";
+import { registerBunOAuthFlows } from "@earendil-works/pi-ai/bun-oauth";
+import { bedrockProviderModule } from "@earendil-works/pi-ai/bedrock-provider";
+import { setBedrockProviderModule } from "@earendil-works/pi-ai/compat";
+import { checkSetup } from "pibake:staleness";
+import { checkFrozen, frozen } from "pibake:frozen";
+
+function run() {
+	globalThis.__pibake_resume();
+	checkSetup(getAgentDir(), globalThis.__pibake_setup);
+	checkFrozen(getAgentDir(), process.argv.slice(2), frozen);
+	registerBunOAuthFlows();
+	setBedrockProviderModule(bedrockProviderModule);
+	setupCli();
+	main(process.argv.slice(2));
+}
+
+if (startupSnapshot.isBuildingSnapshot()) startupSnapshot.setDeserializeMainFunction(run);
+else if (globalThis.__pibake_trace === undefined) run();
 "#;
 /// As stock Pi's `dist/bundle/cli.js`: the compile cache is on before the runtime loads.
 const LAUNCHER_TEXT: &str = r#"import { enableCompileCache } from "node:module";
@@ -233,8 +262,46 @@ globalThis.__pibake_live = (rel) => {
     s
 }
 
-fn prologue(stage: &Path) -> String {
-    PROLOGUE.replace(
+/// What the bundle's format and texts are for each backend.
+struct Flavor {
+    format: &'static str,
+    main: &'static str,
+    entry: &'static str,
+    prologue: &'static str,
+}
+
+fn flavor(backend: Backend) -> Flavor {
+    match backend {
+        Backend::SeaCodecache => Flavor {
+            format: "esm",
+            main: "main.mjs",
+            entry: ENTRY,
+            prologue: PROLOGUE,
+        },
+        Backend::SeaSnapshot => Flavor {
+            format: "cjs",
+            main: "main.cjs",
+            entry: ENTRY_SNAPSHOT,
+            prologue: PROLOGUE_SNAPSHOT,
+        },
+    }
+}
+
+/// The bundle's main file: what an executable embeds.
+pub fn main_file(backend: Backend) -> &'static str {
+    flavor(backend).main
+}
+
+/// What `node` runs: the launcher of an ES module bundle, or a CommonJS bundle itself.
+pub fn launcher(backend: Backend) -> &'static str {
+    match backend {
+        Backend::SeaCodecache => LAUNCHER,
+        Backend::SeaSnapshot => main_file(backend),
+    }
+}
+
+fn prologue(text: &str, stage: &Path) -> String {
+    text.replace("// pibake:extract\n", EXTRACT).replace(
         r#""__PIBAKE_STAGE__""#,
         &js_string(&stage.to_string_lossy()),
     )
@@ -311,6 +378,17 @@ pub struct BuildConfig {
     pub write: bool,
     /// Absolute path → the text a pass rewrote it to; the bundle reads this instead.
     pub overrides: BTreeMap<String, String>,
+    /// esbuild's output format: `esm` or `cjs`.
+    pub format: &'static str,
+    /// Modules loaded on first use rather than at import (snapshot bundles).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lazy: Option<Lazy>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Lazy {
+    pub builtins: Vec<&'static str>,
+    pub packages: Vec<&'static str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -560,12 +638,18 @@ pub struct Bundler<'a> {
     pub root: &'a Path,
     pub build: Build<'a>,
     pub passes: &'a passes::Options,
+    pub backend: Backend,
 }
 
 impl Bundler<'_> {
     pub fn run(&self, plan: &Plan, log: &mut dyn FnMut(String)) -> Result<(Outcome, Report)> {
         let pi_dir = plan.pi_dir();
         check_pi(&pi_dir)?;
+        let flavor = flavor(self.backend);
+        let lazy = (self.backend == Backend::SeaSnapshot).then(|| Lazy {
+            builtins: snapshot_safety::LAZY_BUILTINS.to_vec(),
+            packages: snapshot_safety::LAZY_PACKAGES.to_vec(),
+        });
         let all: Vec<&Baked> = plan.baked.iter().collect();
         let owned: Vec<Owned> = plan
             .owned
@@ -609,9 +693,12 @@ impl Bundler<'_> {
             ("pibake", env!("CARGO_PKG_VERSION").as_bytes()),
             ("stage", stage_path.as_bytes()),
             ("build.mjs", BUILD_SCRIPT.as_bytes()),
-            ("entry", ENTRY.as_bytes()),
+            ("format", flavor.format.as_bytes()),
+            ("entry", flavor.entry.as_bytes()),
             ("launcher", LAUNCHER_TEXT.as_bytes()),
-            ("prologue", PROLOGUE.as_bytes()),
+            ("prologue", flavor.prologue.as_bytes()),
+            ("extract", EXTRACT.as_bytes()),
+            ("lazy", serde_json::to_string(&lazy)?.as_bytes()),
             ("staleness", STALENESS.as_bytes()),
             ("frozen", frozen.as_bytes()),
             ("baked", baked_all.as_bytes()),
@@ -624,15 +711,17 @@ impl Bundler<'_> {
                 esbuild: plan.stage.join("node_modules/esbuild/lib/main.js"),
                 stage: plan.stage.clone(),
                 pi_dir: pi_dir.clone(),
-                entry: ENTRY.to_owned(),
-                prologue: prologue(&plan.stage),
+                entry: flavor.entry.to_owned(),
+                prologue: prologue(flavor.prologue, &plan.stage),
                 staleness: STALENESS.to_owned(),
                 frozen: frozen.clone(),
                 baked: baked_module(baked),
                 owned: owned.clone(),
-                outfile: dir.join(MAIN),
+                outfile: dir.join(flavor.main),
                 write,
                 overrides: overrides.clone(),
+                format: flavor.format,
+                lazy: lazy.clone(),
             };
             log(format!(
                 "esbuild: Pi and {} extension entry points",
@@ -655,8 +744,10 @@ impl Bundler<'_> {
             }
             let mut report = report(&plan.baked, &failed, &result, plan.unbaked.clone());
             report.passes = rewritten.reports.clone();
-            fs::write(dir.join(LAUNCHER), LAUNCHER_TEXT)?;
-            fs::write(dir.join("entry.mjs"), ENTRY)?;
+            if self.backend == Backend::SeaCodecache {
+                fs::write(dir.join(LAUNCHER), LAUNCHER_TEXT)?;
+            }
+            fs::write(dir.join("entry.mjs"), flavor.entry)?;
             fs::write(dir.join("baked.mjs"), baked_module(&kept))?;
             fs::write(
                 dir.join(REPORT),

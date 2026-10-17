@@ -78,6 +78,7 @@ impl Fixture {
                 passes: vec![Pass::TrimApis],
                 highlight_languages: vec![],
                 apis: apis.map(|a| a.iter().map(|s| s.to_string()).collect()),
+                snapshot: false,
             },
             &Setup {
                 agent_dir: self.agent(),

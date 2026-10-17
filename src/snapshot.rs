@@ -14,6 +14,7 @@ use crate::fake_provider::{FakeProvider, PROVIDER, Script};
 use crate::harness::{Harness, PiCommand};
 use crate::lock::PI_PACKAGE;
 use crate::process::Supervised;
+use crate::sea;
 
 const TIMEOUT: Duration = Duration::from_secs(120);
 const PROMPT: &str = "Say hello.";
@@ -160,14 +161,16 @@ pub fn capture(
         ]
         .into_iter()
         .chain(pi.package_dir().map(|d| (d, "pi_package_dir")))
-        .chain(extracted_pi(&harness.home).map(|d| (d, "pi_package_dir"))),
+        .chain(extracted_pi(&harness.home.join(".cache/pibake")).map(|d| (d, "pi_package_dir")))
+        .chain(extracted_pi(&sea::cache_dir(real_home)).map(|d| (d, "pi_package_dir"))),
     );
     Ok(Snapshot::from_parts(request, commands)?.normalized(&normalizer))
 }
 
-/// Where a pibake executable extracted its Pi package, under the harness home's cache.
-fn extracted_pi(home: &Path) -> impl Iterator<Item = PathBuf> {
-    std::fs::read_dir(home.join(".cache/pibake"))
+/// Where pibake executables extracted their Pi package: at launch under the harness home's
+/// cache, or for a snapshot executable, at build time under the real one.
+fn extracted_pi(cache: &Path) -> impl Iterator<Item = PathBuf> {
+    std::fs::read_dir(cache)
         .into_iter()
         .flatten()
         .filter_map(|e| Some(e.ok()?.path().join("node_modules").join(PI_PACKAGE)))

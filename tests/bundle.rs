@@ -10,6 +10,7 @@ use pibake::bundle::{
     BuildConfig, BuildResult, Bundler, Import, Input, LAUNCHER, Message, Metafile, Plan, REPORT,
     Status,
 };
+use pibake::config::Backend;
 use pibake::inventory;
 use pibake::lock::PI_PACKAGE;
 use pibake::passes::{Options, Pass};
@@ -69,6 +70,7 @@ impl Fixture {
             root: &self.path("bundles"),
             build: &build,
             passes: &Options::none(),
+            backend: Backend::SeaCodecache,
         }
         .run(&self.plan()?, &mut |_| {})
     }
@@ -297,6 +299,7 @@ fn pi_failing_alone_is_an_error_and_leaves_nothing() {
         root: &f.path("bundles"),
         build: &build,
         passes: &Options::none(),
+        backend: Backend::SeaCodecache,
     }
     .run(&f.plan().unwrap(), &mut |_| {})
     .unwrap_err();
@@ -336,6 +339,7 @@ fn trim(langs: &[&str]) -> Options {
         passes: vec![Pass::TrimHighlight],
         highlight_languages: langs.iter().map(|s| s.to_string()).collect(),
         apis: None,
+        snapshot: false,
     }
 }
 
@@ -353,6 +357,7 @@ fn pass_rewrites_reach_the_build_and_key_the_bundle() {
             root: &f.path("bundles"),
             build: &build,
             passes: options,
+            backend: Backend::SeaCodecache,
         }
         .run(&f.plan().unwrap(), &mut |_| {})
     };

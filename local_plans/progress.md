@@ -15,7 +15,7 @@ Live log for `README.md`'s plans. One row per plan; details under Deviations and
 | l7 staleness | done | df0685a | setup fingerprint in the executable, checked in the entry; check 1.9 ms in-process (median, live setup); recorded: `bench_results/2026-10-16_l7_staleness.json` (+4.1 ms startup median, inside noise); `verify` same |
 | l8 passes, trim highlight | done | b0f6bcc | passes run before esbuild (owner); `trim_highlight` keeps 39 of 191 languages; `main.mjs` −1.19 MB, executable −1.23 MB; startup RSS −4 MiB, startup time within noise (indicative; Pi 1.3.0 already loads 170 languages only after the first interactive render); `verify` same |
 | l9 fold providers | done | 22a109b | owner: option B, `trim_apis` stubs unused APIs, catalog kept; live keeps 5 of 10 APIs; `main.mjs` −3.31 MB, executable −3.80 MB; startup RSS −16.5 MiB, startup time within noise (indicative); `verify` same, `--list-models` as stock; fixed `import.meta.main` in executables |
-| l10 snapshot backend | planned | | O2 after step 1 |
+| l10 snapshot backend | done but recorded bench (owner: idle machine) | 407c9d1 | O2 = go; opt-in `[build] backend = "sea_snapshot"`; `verify` same on the live setup (both backends); startup 449 vs 646 ms against code cache (indicative, busy); big-write peak RSS +240 MiB (open); recorded 20-run bench pending |
 | l11 streaming JSON | planned | | O1 |
 
 ## Decisions
@@ -79,6 +79,12 @@ Decisions taken during passes, with who took them (owner or agent) and when.
 | l8 | `[build] passes` defaults to every pass (`["trim_highlight"]`); `passes = []` turns them off, an unknown name is a config error, a duplicate a build error. `[trim] highlight_languages` defaults to Pi's 21 startup languages plus the ones in `~/code`: armasm, css, diff, dockerfile, dts, erb, gradle, ini (also `toml`), makefile, markdown, plaintext, protobuf, scss, shell, sql, x86asm, xml (also html, svg), yaml, 39 in all (owner's option A: startup unchanged, only the set loaded after the first render shrinks). A name highlight.js does not register is an error that lists the ones it does | 2026-10-16, owner (list), agent (defaults on) |
 | l8 | `trim_highlight` cuts both of Pi 1.3.0's registration paths: `hljs.registerLanguage(...)` statements in highlight.js's `lib/index.js`, resolved from Pi's `dist/utils` as Node would (Pi imports it lazily, in interactive mode after the first render), and entries of `eagerLanguages` in Pi's `dist/utils/syntax-highlight.js`, together with their grammar imports (registered at startup). Either file in another shape fails the pass, naming the statement and the expected pattern. Every grammar import must be used exactly once, in `eagerLanguages` (oxc semantic reference count) | 2026-10-16, agent |
 | l9 | Option B: the pass trims *APIs*, not providers. The full catalog stays, so `/login`, `/model`, `--list-models` and `pi auth` are stock. Each dropped API's stream code is stubbed, and so is the static Bedrock import in pibake's entry. A request to a dropped API fails with one line naming `[trim] apis`. `trim_models` is not built. Options A (catalog out too) and C (skip l9) were declined | 2026-10-17, owner |
+| l10 | O2 = go: the full plan (`snapshot_safety` pass, opt-in `sea_snapshot` backend, frozen-environment check, recorded bench), on step 1's findings | 2026-10-17, owner |
+| l10 | The snapshot executable's root is the absolute path `<cache>/pibake/<hash>` fixed at build time (`$XDG_CACHE_HOME` if absolute, else `~/.cache`, as the code-cache prologue picks it). `pibake build` extracts the shipped files there before the snapshot is built, so module code that reads its location at load gets a path that is right at launch. A launch re-extracts only if the directory is gone; `--version` needs no files. Lazy location objects could not work: module code turns `import.meta.url` into strings at load | 2026-10-17, agent |
+| l10 | Launch state is deferred, not re-evaluated: `snapshot_safety` rewrites each listed top-level statement, matched by exact text, to run through `globalThis.__pibake_reinit`. This runs on resume in snapshot builds, or at once otherwise, so a plain `node main.cjs` behaves as stock. There are three shapes: `const` becomes `let` and is assigned on resume; an object literal is filled in place, so importers that hold it see the contents; a whole statement is moved. A reference to a deferred `const` binding outside a function fails the pass, naming file and line. 11 sites in Pi 1.3.0: 4 `Intl.Segmenter`s, `PI_TIMING`, the OAuth callback host (2), `TOOLS_DIR`, and supports-color's argv flags and colour levels, plus chalk's levels | 2026-10-17, agent |
+| l10 | Generic, in the bundle rather than per site: `import()` → `require()` (esbuild `supported`); lazy modules (esbuild plugin in `build.mjs`: an object with one getter per export, names read from the real module at bundle time) for the builtins that fail a snapshot when loaded alone on Node 26 (`http`, `https`, `http2`, `tls`, `repl`, `sqlite`) and for `undici`; signal listeners deferred and replayed on resume; on resume, `process.chdir(".")` clears working-directory memos, and the result is checked against the real `process.cwd` | 2026-10-17, agent |
+| l10 | The gate is dynamic, not a static scan (step 1's evidence). `bundle/trace.cjs` evaluates the snapshot bundle as the build does, and attributes every load-time read or creation to a module. The kinds: env, cwd, argv, os, tty, time, random, timers, Intl, unsafe builtin loads, fs outside the root, extension locations. `snapshot_safety::ACCEPTED` lists 14 reads the snapshot may keep, each with a reason. Anything else fails the build, naming the module and its line in `main.cjs`. The tracer and the snapshot build both run with a cleared environment (`PATH` plus the root), so what can be kept is the build's empty environment | 2026-10-17, agent |
+| l10 | `snapshot_safety` is not listable in `[build] passes` (config error); `backend = "sea_snapshot"` adds it after the listed passes. `sea_codecache` stays the default, as the plan says | 2026-10-17, agent |
 
 ## Deviations
 
@@ -253,6 +259,117 @@ Per plan: where the work differed from the plan, and why.
   - `cargo fmt --check`, clippy and all tests pass, including every E2E test of l1–l9 (`PIBAKE_E2E=1`).
   - Test-side change: the fixture catalog first had a provider with no models at all, which pi-ai never has, so the pass left it out of the frozen map where the test expected it with no APIs. The fixture now gives every provider a `system-one` classifier model, as pi-ai's data has, so it is listed with no stream APIs.
 
+### l10
+
+- **Plan check against the code, Pi 1.3.0 and Node 26.11.1: holds.** `mainFormat: "module"` still cannot combine with `useSnapshot`, so the bundle must be CommonJS. `--build-sea` with `useSnapshot: true` works on Node 26.11.1. In a deserialized SEA, `process.argv` is `[exe, exe, ...args]` as in l6, so Pi's `argv.slice(2)` holds. Plain `node --snapshot-blob` gives `[node, ...args]`, so it needs a dummy first argument.
+- **Step 1 ran as a scratch prototype in `/tmp/pibake-l10`** (copy of l9's stage; `build_cjs.mjs` is `build.mjs` with `format: "cjs"`; `snap/snapify.py` holds the hand patches; `snap/trace*.js` are the tracers). Nothing is in the repo. Pi ran only through the harness or with a `mktemp` `HOME`.
+- **Frozen state was found by tracing, not by a static pass (deviation).** The plan proposed an oxc pass that flags `process.env`/`process.cwd()`/`Date` at module top level. A static scan cannot tell which esbuild `__esm` inits run at build time. It also misses reads made inside functions that top-level code calls (`getBinDir()`, chalk's `supportsColor()`), and it flags function bodies that never run. Instead, the module-evaluation phase alone (main swapped out) ran under preloads that log the following, each with its bundle location:
+  - every `process.env` get/has/keys, `process.cwd`, `process.argv`;
+  - `os.homedir`/`userInfo`/`tmpdir`/`hostname`;
+  - sync fs reads, `stdout`/`stderr` `isTTY`/`columns`/`rows`;
+  - `Date.now`/`new Date()`, `Math.random`, crypto randomness;
+  - `process.on`, timers, and the first load of each builtin.
+
+  It ran once on a pipe and once under a pty (`script`, `TERM=xterm-256color`).
+- **esbuild CJS output: no errors.** No top-level `await` anywhere in the graph. Same 8 warnings as the ESM bundle.
+- **Snapshot build blockers** (each found by `node --build-snapshot` failing, fixed by hand, rerun):
+  1. **`import()` is "Not supported" in snapshot scripts.** pi-ai's `env-api-keys.js` imports `node:fs`/`os`/`path` through `import()` at load. Fixed with esbuild `supported: { "dynamic-import": false }`, which turns every remaining `import()` into `require()`. That covers jiti's native import, pi-web-access's glimpse and pi-ai's variable-specifier loaders. Node 26's `require(esm)` covers ESM without top-level `await`.
+  2. **17 signal handlers at load.** `signal-exit` v3 (through `proper-lockfile`, imported by Pi's `settings-manager.js`) leaves 17 `onsignal` handles. Fixed by deferring `process.on('SIG*')` during the build and replaying the calls in the deserialize main.
+  3. **`node:http` at load.** The http_parser and http2 bindings cannot be serialized. Two importers: Pi's `core/http-dispatcher.js` (`import * as undici`; Pi's own undici loads http, http2, net, tls, zlib, dns) and pi-ai's `auth/oauth/callback-server.js` (`import ... from "node:http"`). Fixed with lazy namespace proxies.
+  4. **`Intl.Segmenter` at load** (pi-tui's `graphemeSegmenter`/`wordSegmenter`, 2 more). These are ICU `Foreign` handles. Fixed with lazy proxies.
+
+  Probed alone in a snapshot: `createHash`, `MessageChannel`, `Intl.Collator`, non-UTF-8 `TextDecoder`, `SharedArrayBuffer` and `WebAssembly.Memory` also fail. Loading any builtin used here works.
+- **Frozen at build time** (silent, wrong at runtime):
+  1. **graceful-fs memoizes `process.cwd()` at load.** `verify` showed the system prompt's `<cwd>` as the build directory. `process.chdir(".")` in the deserialize main resets it.
+  2. **Pi's `config.js` reads its package dir and `package.json` at load,** which fixes `VERSION` and `startupPackageJsonPath` to the build-time root. `tools-manager.js` has `TOOLS_DIR = getBinDir()`, which fixes `PI_CODING_AGENT_DIR`/`homedir()` at build time.
+  3. **Every rewritten `import.meta.url`/`__dirname` evaluated at load** (`__pibake_at`, `__pibake_live`), plus `createRequire(...)` at load (Pi's extension loader, the prologue's `require`), are fixed to the build-time root and agent dir. The SEA root is `~/.cache/pibake/<hash>`, which depends on the runtime `HOME`. So either these become lazy, or the root becomes a build-time absolute path.
+  4. **chalk's colour level** (supports-color: TTY, `TERM`, `COLORTERM`, `CI`, `FORCE_COLOR`, `--color` in argv). The build has no TTY, so the result is no colour.
+  5. **Smaller load-time reads:**
+     - Pi's `keybindings.js` WSL detection;
+     - `timings.js` `PI_TIMING`;
+     - the OAuth `CALLBACK_HOST` (`PI_OAUTH_CALLBACK_HOST`, anthropic and openai-chatgpt);
+     - the default locale of the `Intl.Segmenter`s.
+  6. **A captured `process.argv` is the build's.** Checked in a minimal snapshot: a captured `process.env` stays live, and `Math.random` (reseeded), `crypto`, `Date` and `TZ` are live.
+
+  Harmless: brace-expansion's `Math.random()` placeholders, minimatch/which platform checks.
+- **Also needed in a CJS bundle, snapshot or not:** `import.meta.resolve` becomes `{}.resolve` (TypeError) at two sites. One is Pi's extension loader `resolveWorkspaceOrImport` (jiti fallback aliases); the other is unpdf's PDF fonts in pi-web-access. `verify` does not reach either.
+- **Where startup goes today** (instrumented copy of the l9-style SEA, real setup through `pibake bench`, load ≈ 1.5–2, indicative):
+  - process start → prologue: ≈ 105 ms;
+  - module evaluation: ≈ 300 ms;
+  - entry → RPC ready: ≈ 215 ms. Extension module init is only ≈ 12 ms of this, because the baked extensions are lazy `__esm` inits.
+
+  CPU profile of the evaluation window (`--cpu-prof`, 2 runs, ≈ 274 ms):
+  - ≈ 70 ms is lazy compilation of esbuild's `__esm`/`__commonJS` init functions, charged to `__init`/`__require`. These are not in the SEA code cache, which holds only eagerly compiled code.
+  - pi-coding-agent 42, typebox 41 (schema building), pi-ai 39, pi-tui 19, marked 11, GC 11, highlight.js 8 ms.
+- **Prototype numbers** (SEA with `useSnapshot`, CJS bundle with the hand patches, stage-rooted prologue; indicative, load ≈ 1.6–1.9):
+  - **Build:** snapshot blob 56 MB, executable 118 MB (vs 98 MB), `--build-sea` 4 s.
+  - **`verify --pi <snapshot exe> --against pi`:** same, apart from the docs paths. The prototype's root is the stage, not the extracted cache that `verify`'s normalizer expects. Before the cwd fix, `<cwd>` also differed.
+  - **`pibake bench --runs 4`, snapshot vs code-cache SEA (same bundle content).** Medians [IQR]:
+    - startup **339 [325–398] vs 541 [525–605] ms**;
+    - startup CPU 482 vs 695 ms;
+    - startup RSS 194 vs 185 MiB;
+    - big write 55.2 vs 54.7 s wall, 56.3 vs 56.4 s CPU;
+    - big-write peak RSS **714 vs 522 MiB** (unexplained).
+  - **In-process marks:** the deserialized main starts at ≈ 106 ms (vs 367 ms to the entry). Entry → ready is 239 vs 180 ms: code `main` runs was never compiled at build time, so with no code cache it compiles lazily.
+  - **Without extensions** (`mktemp` `HOME`, 20 interleaved rounds): ready 223 vs 414 ms.
+- **A cheaper lever, found on the way.** Wrapping esbuild's module init functions in parentheses makes V8 compile them eagerly (the PIFE heuristic), so they land in the SEA code cache:
+  - executable +7 MB;
+  - module evaluation −40 to −80 ms, ready −40 to −70 ms (indicative, noisy at this load);
+  - none of the snapshot's constraints.
+
+  V8's `//# allFunctionsCalledOnLoad` hint does nothing here: Node does not pass the compile-hints option.
+- **Steps 2–4: how they were built** (design in Decisions):
+  - `src/passes/snapshot_safety.rs`: the sites, the pass and the gate's table.
+  - `src/bundle/prologue_snapshot.cjs`: root, deferral, `__pibake_resume`.
+  - `src/bundle/trace.cjs`: the tracer.
+  - `src/bundle/extract.js`: extraction, now shared by both prologues.
+  - `bundle.rs`: a CJS flavour with its own entry; `run` waits for the resume, and the tracer only evaluates.
+  - `sea.rs`: extraction to the root, gate, `useSnapshot`.
+  - `snapshot.rs`: `verify` also normalises the real cache's Pi package.
+- **Deviation: snapshot executables are not byte-reproducible.** 10–12 bytes differ between builds, even with `--predictable --random-seed=1 --hash-seed=1`; l6's byte-identical rebuild holds only for `sea_codecache`. The snapshot is built without `--random-seed`.
+- **Deviation: `import.meta.resolve` is `undefined` in the CJS bundle.** There are two sites:
+  - Pi's `resolveWorkspaceOrImport` builds jiti aliases, which are unused when `PI_BUNDLED_NODE` is set.
+  - unpdf resolves `pdfjs-dist` inside a `try` and falls back. It fails the same way in the code-cache executable, which does not ship `pdfjs-dist`.
+- **Deviation: the plan's frozen-environment check is narrower.** Pi 1.3.0's system prompt has no date. "Terminal size" has no load-time reader left: the gate would name one.
+- **Process note:** `/tmp` (tmpfs, per-user quota) filled up during a build (`EDQUOT`, os error 122). E2E runs now use `TMPDIR=target/e2e-tmp`. Only l10's own scratch was deleted.
+- **Completion, on the live setup** (scratch project `/tmp/pibake-l10`, l9's stage):
+  - **Build:** `pibake build` with `backend = "sea_snapshot"` takes ≈ 5 s with the bundle cached. The executable is 131 MB (code cache: 98 MB); the snapshot keeps the 14 accepted reads.
+  - **`verify --pi <exe> --against pi`: same** (13 tools, 82 commands, 295-line prompt), as is the code-cache build of the same code.
+  - **`--help` output is byte-identical to stock `pi`:**
+    - with `FORCE_COLOR` unset, 0, 1 and 3;
+    - under a pty with `TERM=dumb` and with `TERM=xterm-256color`.
+  - **Bench, indicative** (`--runs 4`, load 1–2.4, against l9's code-cache executable). Medians [IQR]:
+    - startup **449 [395–494] vs 646 [578–720] ms**;
+    - startup CPU 600 vs 824 ms;
+    - startup RSS 209 vs 186 MiB;
+    - big write 56.3 vs 58.0 s wall;
+    - big-write peak RSS **766 vs 526 MiB**.
+- **Tests:**
+  - **Unit:**
+    - the gate (accepted wherever the package sits, unknown named once with its first line, lazy builtins only);
+    - each site shape's exact rewrite;
+    - reruns; reads at load, changed statements, non-`const` and non-object failing with file and line;
+    - the snapshot `Builder` with a stand-in node: extraction to the root, gate before the build, `useSnapshot` on `main.cjs`, an unhandled finding leaves the old output, an unmarked root is refused;
+    - config (`backend`, `snapshot_safety` not listable).
+  - **`tests/snapshot_safety.rs`, on fixture files in Pi 1.3.0's shapes:**
+    - all 11 sites rewritten and reported;
+    - off for code cache, a fixed point on its own output;
+    - packages resolved as Pi sees them;
+    - a changed Pi, a read at load and a missing package each failing loudly.
+  - **Hegel property (30 cases, `node`, E2E):** random top-level `const`s reading the environment. Deferred, evaluated at once, they equal the original. Deferred, then resumed under another environment, they equal the original under that one. A mutation that assigns at load instead of on resume fails it.
+  - **`PIBAKE_E2E=1` `e2e_build_a_fixture_setup_as_a_snapshot`:**
+    - built with `XDG_CACHE_HOME` in the test dir; `--version` without `node`;
+    - 8 concurrent launches extract nothing into their home, and a removed root comes back;
+    - `verify` same with the stage hidden, including the extension that loads through jiti;
+    - `--help` byte-identical to stock under 3 colour environments and 3 pty terminals (bold present under xterm);
+    - `PI_TIMING=1` prints timings, unset does not;
+    - an edited extension prints the staleness line.
+  - **Mutation checks:**
+    - dropping the chalk sites fails the gate (supports-color's `TF_BUILD` read);
+    - with the gate also blind to supports-color, the `FORCE_COLOR=3` comparison fails.
+  - **Suite:** `cargo fmt --check`, clippy and every test pass, including all E2E tests of l1–l10.
+- **Step 5 not done:** the recorded 20-run bench of `sea_codecache` vs `sea_snapshot` vs stock needs an idle machine (owner).
+
 ## Found
 
 Bugs or debts found during a pass and kept out of its diff.
@@ -301,3 +418,11 @@ Bugs or debts found during a pass and kept out of its diff.
 - **l9: option A stays open.** The catalog (981 KB of JSON, evaluated at startup through compat's `providers/all.js`) and the 42 provider factories are untouched. Per the plan check, they cost about 49 ms of CPU self time in a profile and 175 ms in a plain-node micro-bundle. Trimming them changes `/login`, `/model` and `--list-models`, which is why the owner declined it for now.
 - **l9: the frozen check reads only the agent dir.** Project `.pi/settings.json` (which overrides the global one) and provider-less `--model` patterns are not checked at startup. A request through a dropped API still fails with the stub's line.
 - **l9: the extension literal scan is over-inclusive.** Any quoted API id in an extension's own sources keeps that API: `pi-web-access` keeps azure-openai-responses and openai-codex-responses only by comparing `model.api` against them. `[trim] apis` overrides the derivation when that matters.
+- **l10: the snapshot's big-write peak RSS is +190–240 MiB** (766 vs 526 MiB at 4 runs; 783 vs 463 MiB in one run each with `--max-semi-space-size=16` on both, which trims both but keeps the gap). The young generation is smaller after deserialisation (5 vs 16 MiB at `--help`), but that is not the main cause. Old-generation sizing after deserialising a larger live heap is the next suspect. This matters for daily use; owner call before `sea_snapshot` becomes the default.
+- **l10: the snapshot keeps the bundle source as a 41 MB two-byte string on the heap** (`large_object_space`; the code-cache SEA holds it outside the heap). That is +24 MiB startup RSS. 37 lines with non-ASCII characters (comments that esbuild keeps, and regex literals) make the whole source two-byte. A one-byte source would halve it; that needs a careful ASCII rewrite of regex literals and comments.
+- **l10: deserialised code has no code cache.** Code that only `main` runs compiles lazily after the resume (entry → ready 239 vs 180 ms in step 1's prototype). Compiling it at build time could cut this, for example with an eager-compile hint on functions known to run at startup.
+- **l10 → l8/l9: an eager-compile pass for `sea_codecache`.** Wrapping esbuild's module init functions in parentheses puts them into the SEA code cache. Step 1 measured −40 to −80 ms (indicative) at +7 MB, with no snapshot constraints. It is small and low-risk.
+- **l10: a snapshot `--version` deserialises the snapshot first** (≈ 100 ms; the code-cache prologue answers before evaluating anything).
+- **l10: a snapshot executable is tied to its builder's cache path.** It re-extracts into that path when it is gone; a user who cannot write there cannot run it. This is fine for local mode.
+- **l10: scratch use of `/tmp`.** `/tmp` is a quota'd tmpfs, and `/tmp/pibake-l5` … `/tmp/pibake-l10` (earlier passes' scratch projects) hold ≈ 4 GB of it. They can go once nobody needs them; this pass removed only its own large files.
+

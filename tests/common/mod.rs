@@ -322,3 +322,59 @@ pub fn no_setup(dir: &Path) -> pibake::passes::Setup {
         extension_dirs: vec![],
     }
 }
+
+/// Every file `snapshot_safety` rewrites, in Pi 1.3.0's shapes (each site's statement as Pi and
+/// its dependencies write it, used only inside functions), with each package's `package.json`.
+pub fn write_snapshot_stage(stage: &Path) {
+    let pi = format!("node_modules/{}", pibake::lock::PI_PACKAGE);
+    let files = [
+        (
+            format!("{pi}/dist/core/timings.js"),
+            "const ENABLED = process.env.PI_TIMING === \"1\";\nexport function time() {\n    if (!ENABLED)\n        return;\n}\n",
+        ),
+        (
+            format!("{pi}/dist/utils/tools-manager.js"),
+            "import { APP_NAME, getBinDir } from \"../config.js\";\nconst TOOLS_DIR = getBinDir();\nexport function toolPath(name) {\n    return `${TOOLS_DIR}/${name}`;\n}\n",
+        ),
+        (
+            format!("{pi}/dist/modes/interactive/components/easter-egg-3d.js"),
+            "const segmenter = new Intl.Segmenter();\nexport function cells(text) {\n    return [...segmenter.segment(text)].length;\n}\n",
+        ),
+        (
+            "node_modules/@earendil-works/pi-tui/dist/utils.js".into(),
+            "const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: \"grapheme\" });\nconst wordSegmenter = new Intl.Segmenter(undefined, { granularity: \"word\" });\nexport function getGraphemeSegmenter() {\n    return graphemeSegmenter;\n}\nexport function getWordSegmenter() {\n    return wordSegmenter;\n}\n",
+        ),
+        (
+            "node_modules/@earendil-works/pi-ai/dist/auth/oauth/anthropic.js".into(),
+            "import { getProviderEnvValue } from \"../../utils/provider-env.js\";\nconst CALLBACK_HOST = getProviderEnvValue(\"PI_OAUTH_CALLBACK_HOST\") || \"127.0.0.1\";\nexport function host() {\n    return CALLBACK_HOST;\n}\n",
+        ),
+        (
+            "node_modules/@earendil-works/pi-ai/dist/auth/oauth/openai-chatgpt.js".into(),
+            "import { getProviderEnvValue } from \"../../utils/provider-env.js\";\nconst CALLBACK_HOST = getProviderEnvValue(\"PI_OAUTH_CALLBACK_HOST\") || \"127.0.0.1\";\nexport function host() {\n    return CALLBACK_HOST;\n}\n",
+        ),
+        (
+            "node_modules/grok-mermaid/dist/width.js".into(),
+            "const segmenter = new Intl.Segmenter('en', { granularity: 'grapheme' });\nexport function width(s) {\n    for (const { segment } of segmenter.segment(s))\n        void segment;\n}\n",
+        ),
+        (
+            "node_modules/chalk/source/vendor/supports-color/index.js".into(),
+            "import process from 'node:process';\nimport tty from 'node:tty';\n\nfunction hasFlag(flag, argv = process.argv) {\n\treturn argv.includes(flag);\n}\n\nlet flagForceColor;\nif (\n\thasFlag('no-color')\n\t|| hasFlag('no-colors')\n\t|| hasFlag('color=false')\n\t|| hasFlag('color=never')\n) {\n\tflagForceColor = 0;\n} else if (\n\thasFlag('color')\n\t|| hasFlag('colors')\n\t|| hasFlag('color=true')\n\t|| hasFlag('color=always')\n) {\n\tflagForceColor = 1;\n}\n\nexport function createSupportsColor(stream) {\n\treturn flagForceColor ?? (stream.isTTY ? {level: 1} : false);\n}\n\nconst supportsColor = {\n\tstdout: createSupportsColor({isTTY: tty.isatty(1)}),\n\tstderr: createSupportsColor({isTTY: tty.isatty(2)}),\n};\n\nexport default supportsColor;\n",
+        ),
+        (
+            "node_modules/chalk/source/index.js".into(),
+            "import supportsColor from '#supports-color';\n\nconst {stdout: stdoutColor, stderr: stderrColor} = supportsColor;\n\nfunction createChalk(options) {\n\treturn {level: options?.level ?? (stdoutColor ? stdoutColor.level : 0)};\n}\n\nconst chalk = createChalk();\nexport const chalkStderr = createChalk({level: stderrColor ? stderrColor.level : 0});\n\nexport {\n\tstdoutColor as supportsColor,\n\tstderrColor as supportsColorStderr,\n};\n\nexport default chalk;\n",
+        ),
+    ];
+    for (rel, text) in &files {
+        write(&stage.join(rel), text);
+    }
+    for package in [
+        pi.as_str(),
+        "node_modules/@earendil-works/pi-tui",
+        "node_modules/@earendil-works/pi-ai",
+        "node_modules/grok-mermaid",
+        "node_modules/chalk",
+    ] {
+        write(&stage.join(package).join("package.json"), "{}");
+    }
+}

@@ -17,7 +17,19 @@ pub struct Config {
     pub dir: PathBuf,
     /// The executable's file name, in `target/pibake/bin/` and when installed.
     pub name: String,
+    pub backend: Backend,
     pub passes: passes::Options,
+}
+
+/// How `build` makes the executable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Backend {
+    /// An ES module main with V8's code cache.
+    #[default]
+    SeaCodecache,
+    /// A CommonJS main whose evaluated modules ship as a V8 startup snapshot.
+    SeaSnapshot,
 }
 
 #[derive(Deserialize, Default)]
@@ -35,6 +47,7 @@ struct RawConfig {
 #[serde(deny_unknown_fields)]
 struct RawBuild {
     name: Option<String>,
+    backend: Option<Backend>,
     passes: Option<Vec<Pass>>,
 }
 
@@ -75,11 +88,23 @@ impl Config {
         if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\0']) {
             bail!("[build] name must be a file name, not {name:?}");
         }
+        let backend = raw.build.backend.unwrap_or_default();
+        if raw
+            .build
+            .passes
+            .iter()
+            .flatten()
+            .any(|p| *p == Pass::SnapshotSafety)
+        {
+            bail!("[build] passes cannot list snapshot_safety; backend = \"sea_snapshot\" adds it");
+        }
         Ok(Self {
             agent_dir: paths::normalize(&config_dir.join(paths::expand_tilde(agent_dir, home))),
             dir: config_dir.to_path_buf(),
             name,
+            backend,
             passes: passes::Options {
+                snapshot: backend == Backend::SeaSnapshot,
                 passes: raw.build.passes.unwrap_or(passes::DEFAULT_PASSES.to_vec()),
                 highlight_languages: raw
                     .trim
@@ -157,6 +182,20 @@ mod tests {
         let err = parse("[build]\npasses = [\"trim_everything\"]").unwrap_err();
         assert!(format!("{err:#}").contains("trim_highlight"), "{err:#}");
         assert!(parse("[trim]\nlanguages = []").is_err());
+    }
+
+    #[test]
+    fn backend_defaults_to_code_cache_and_snapshot_adds_its_pass() {
+        let default = parse("").unwrap();
+        assert_eq!(default.backend, Backend::SeaCodecache);
+        assert!(!default.passes.snapshot);
+        let snapshot = parse("[build]\nbackend = \"sea_snapshot\"").unwrap();
+        assert_eq!(snapshot.backend, Backend::SeaSnapshot);
+        assert!(snapshot.passes.snapshot);
+        let err = parse("[build]\nbackend = \"bun\"").unwrap_err();
+        assert!(format!("{err:#}").contains("sea_snapshot"), "{err:#}");
+        let err = parse("[build]\npasses = [\"snapshot_safety\"]").unwrap_err();
+        assert!(format!("{err:#}").contains("adds it"), "{err:#}");
     }
 
     #[test]

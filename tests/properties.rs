@@ -574,6 +574,7 @@ fn trim_highlight_keeps_exactly_the_list_and_is_idempotent(tc: TestCase) {
         passes: vec![Pass::TrimHighlight],
         highlight_languages: keep.iter().map(|s| s.to_string()).collect(),
         apis: None,
+        snapshot: false,
     };
     let setup = common::no_setup(stage.path());
     let out = passes::run(stage.path(), &options, &setup).unwrap();
