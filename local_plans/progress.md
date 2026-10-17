@@ -15,7 +15,7 @@ Live log for `README.md`'s plans. One row per plan; details under Deviations and
 | l7 staleness | done | df0685a | setup fingerprint in the executable, checked in the entry; check 1.9 ms in-process (median, live setup); recorded: `bench_results/2026-10-16_l7_staleness.json` (+4.1 ms startup median, inside noise); `verify` same |
 | l8 passes, trim highlight | done | b0f6bcc | passes run before esbuild (owner); `trim_highlight` keeps 39 of 191 languages; `main.mjs` −1.19 MB, executable −1.23 MB; startup RSS −4 MiB, startup time within noise (indicative; Pi 1.3.0 already loads 170 languages only after the first interactive render); `verify` same |
 | l9 fold providers | done | 22a109b | owner: option B, `trim_apis` stubs unused APIs, catalog kept; live keeps 5 of 10 APIs; `main.mjs` −3.31 MB, executable −3.80 MB; startup RSS −16.5 MiB, startup time within noise (indicative); `verify` same, `--list-models` as stock; fixed `import.meta.main` in executables |
-| l10 snapshot backend | done but recorded bench (owner: idle machine) | 407c9d1 | O2 = go; opt-in `[build] backend = "sea_snapshot"`; `verify` same on the live setup (both backends); startup 449 vs 646 ms against code cache (indicative, busy); big-write peak RSS +240 MiB (open); recorded 20-run bench pending |
+| l10 snapshot backend | done | 159a4cc | O2 = go; opt-in `[build] backend = "sea_snapshot"`; `verify` same on the live setup (both backends); recorded: startup **299 vs 433 ms** against warm-cache code cache (2607 stock), big write 44.8 vs 46.4 s, big-write peak RSS 598 vs 448 MiB (stock 677; open) (`bench_results/2026-10-17_l10_snapshot.json`) |
 | l11 streaming JSON | planned | | O1 |
 
 ## Decisions
@@ -368,7 +368,25 @@ Per plan: where the work differed from the plan, and why.
     - dropping the chalk sites fails the gate (supports-color's `TF_BUILD` read);
     - with the gate also blind to supports-color, the `FORCE_COLOR=3` comparison fails.
   - **Suite:** `cargo fmt --check`, clippy and every test pass, including all E2E tests of l1–l10.
-- **Step 5 not done:** the recorded 20-run bench of `sea_codecache` vs `sea_snapshot` vs stock needs an idle machine (owner).
+- **Step 5, recorded bench** (owner: machine idle, 2026-10-17 10:03–10:54 JST; AC, platform profile and EPP `performance`, load 0.40 before, 1.2–2.0 during (the bench itself), CPU 54 °C at start, up to 98 °C): `bench_results/2026-10-17_l10_snapshot.json`, `dirty: false` at `159a4cc`.
+  - **Setup:** a fresh scratch project, `target/l10-bench/` (on disk; `/tmp` was cleared), with `agent_dir = "~/.pi/agent"` and a new `pibake lock`. Both executables are built from it, and both `verify` same.
+    - `pi-codecache`: SHA-256 `e4f4a4a8…`.
+    - `pi-snapshot`: SHA-256 `30040c25…`.
+  - **Command:** `pibake --config target/l10-bench/pibake.toml bench --runs 20 --record l10_snapshot --pi pi --pi "env XDG_CACHE_HOME=<warm cache> <pi-codecache>" --pi <pi-snapshot>`.
+  - **Deviation: the code-cache executable ran with a pre-warmed `XDG_CACHE_HOME`.** The snapshot executable reads its files from its fixed root in the real cache, so it never extracts under the harness. Without the warm cache, the code-cache executable would extract 14 MiB into each run's fresh `HOME` (l6's Found note). Warm is what daily use sees for both. l6/l7's recorded 484 ms included that extraction, so 433 ms is not a like-for-like regression check against them.
+  - **Medians [IQR], stock / code cache / snapshot:**
+    - startup **2607 [2596–2636] / 433 [430–435] / 299 [297–302] ms**: the snapshot is 31 % faster than the code cache and 8.7× faster than stock;
+    - startup CPU 4005 / 565 / 411 ms;
+    - startup peak RSS 366 / 191 / 221 MiB;
+    - big write 48.3 / 46.4 / 44.8 s wall, 50.8 / 47.8 / 45.8 s CPU;
+    - big-write peak RSS **677 / 448 / 598 MiB**.
+  - **Per-round pairs, snapshot − code cache:**
+    - startup −132 ms, faster in all 20 rounds (−148 to −125);
+    - CPU −155 ms;
+    - big write −1.4 s (−3.0 to +0.9);
+    - big-write peak RSS +149 MiB.
+  - **Stock reproduces its baseline** (2600 ms, 48.1 s), so this file compares with `2026-10-16_stock_baseline.json` and l6's.
+  - **The snapshot's numbers do not drift** across the run (first five rounds 298 ms, last five 305 ms), though the CPU reached 98 °C.
 
 ## Found
 
@@ -418,11 +436,11 @@ Bugs or debts found during a pass and kept out of its diff.
 - **l9: option A stays open.** The catalog (981 KB of JSON, evaluated at startup through compat's `providers/all.js`) and the 42 provider factories are untouched. Per the plan check, they cost about 49 ms of CPU self time in a profile and 175 ms in a plain-node micro-bundle. Trimming them changes `/login`, `/model` and `--list-models`, which is why the owner declined it for now.
 - **l9: the frozen check reads only the agent dir.** Project `.pi/settings.json` (which overrides the global one) and provider-less `--model` patterns are not checked at startup. A request through a dropped API still fails with the stub's line.
 - **l9: the extension literal scan is over-inclusive.** Any quoted API id in an extension's own sources keeps that API: `pi-web-access` keeps azure-openai-responses and openai-codex-responses only by comparing `model.api` against them. `[trim] apis` overrides the derivation when that matters.
-- **l10: the snapshot's big-write peak RSS is +190–240 MiB** (766 vs 526 MiB at 4 runs; 783 vs 463 MiB in one run each with `--max-semi-space-size=16` on both, which trims both but keeps the gap). The young generation is smaller after deserialisation (5 vs 16 MiB at `--help`), but that is not the main cause. Old-generation sizing after deserialising a larger live heap is the next suspect. This matters for daily use; owner call before `sea_snapshot` becomes the default.
+- **l10: the snapshot's big-write peak RSS is +150 MiB in the recorded bench** (598 vs 448 MiB median; 17 of 20 runs at 566–603 MiB, 3 at ≈ 800). It is still below stock's 677 MiB. The indicative runs on a busy machine had shown +190–240 MiB: 766 vs 526 MiB at 4 runs; 783 vs 463 MiB in one run each with `--max-semi-space-size=16` on both, which trims both but keeps the gap. The young generation is smaller after deserialisation (5 vs 16 MiB at `--help`), but that is not the main cause. Old-generation sizing after deserialising a larger live heap is the next suspect. Owner call before `sea_snapshot` becomes the default.
 - **l10: the snapshot keeps the bundle source as a 41 MB two-byte string on the heap** (`large_object_space`; the code-cache SEA holds it outside the heap). That is +24 MiB startup RSS. 37 lines with non-ASCII characters (comments that esbuild keeps, and regex literals) make the whole source two-byte. A one-byte source would halve it; that needs a careful ASCII rewrite of regex literals and comments.
 - **l10: deserialised code has no code cache.** Code that only `main` runs compiles lazily after the resume (entry → ready 239 vs 180 ms in step 1's prototype). Compiling it at build time could cut this, for example with an eager-compile hint on functions known to run at startup.
 - **l10 → l8/l9: an eager-compile pass for `sea_codecache`.** Wrapping esbuild's module init functions in parentheses puts them into the SEA code cache. Step 1 measured −40 to −80 ms (indicative) at +7 MB, with no snapshot constraints. It is small and low-risk.
 - **l10: a snapshot `--version` deserialises the snapshot first** (≈ 100 ms; the code-cache prologue answers before evaluating anything).
 - **l10: a snapshot executable is tied to its builder's cache path.** It re-extracts into that path when it is gone; a user who cannot write there cannot run it. This is fine for local mode.
-- **l10: scratch use of `/tmp`.** `/tmp` is a quota'd tmpfs, and `/tmp/pibake-l5` … `/tmp/pibake-l10` (earlier passes' scratch projects) hold ≈ 4 GB of it. They can go once nobody needs them; this pass removed only its own large files.
+- **l10: scratch use of `/tmp`.** `/tmp` is a quota'd tmpfs. On the owner's request, the earlier passes' scratch projects (`/tmp/pibake-l5` … `/tmp/pibake-l10`, ≈ 4.6 GB) were deleted after the l10 commit; only `/tmp/pibake_baseline.log` and `/tmp/pibake_cmp.txt` (4 KB each) remain. Scratch projects now go under `target/` (git-ignored), e.g. `target/l10-bench/`; E2E runs use `TMPDIR=target/e2e-tmp`.
 
