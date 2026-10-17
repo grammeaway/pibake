@@ -37,6 +37,8 @@ const located = {};
 // Files a pibake pass rewrote (src/passes.rs): read instead of the stage's copy.
 const overrides = new Map(Object.entries(config.overrides ?? {}));
 const overridden = new Set();
+// Rewrites of files another pass may have made unreachable (a provider trim_apis left out).
+const optional = new Set(config.optional ?? []);
 const fixes = [];
 const shimmed = new Set();
 const loaders = { ".ts": "ts", ".mts": "ts", ".cts": "ts", ".tsx": "tsx", ".jsx": "jsx" };
@@ -105,6 +107,8 @@ const plugin = {
 		if (config.lazy) lazyModules(build, config.lazy);
 		build.onResolve({ filter: /^pibake:staleness$/ }, () => ({ path: "staleness", namespace: "pibake-staleness" }));
 		build.onLoad({ filter: /.*/, namespace: "pibake-staleness" }, () => ({ contents: config.staleness, loader: "js" }));
+		build.onResolve({ filter: /^pibake:tool-json$/ }, () => ({ path: "tool-json", namespace: "pibake-tool-json" }));
+		build.onLoad({ filter: /.*/, namespace: "pibake-tool-json" }, () => ({ contents: config.tool_json, loader: "js" }));
 		build.onResolve({ filter: /^pibake:frozen$/ }, () => ({ path: "frozen", namespace: "pibake-frozen" }));
 		build.onLoad({ filter: /.*/, namespace: "pibake-frozen" }, () => ({ contents: config.frozen, loader: "js" }));
 		build.onResolve({ filter: /^pibake:baked$/ }, () => ({ path: "baked", namespace: "pibake-baked" }));
@@ -279,7 +283,7 @@ for (const id of ["jiti", "jiti/static"]) {
 
 // A rewrite esbuild never loaded means Pi stopped importing that file: the pass did nothing.
 for (const file of overrides.keys()) {
-	if (result.errors.length === 0 && !overridden.has(file)) {
+	if (result.errors.length === 0 && !overridden.has(file) && !optional.has(file)) {
 		result.errors.push({ text: `pibake: a pass rewrote ${file}, but the bundle never loads it` });
 	}
 }

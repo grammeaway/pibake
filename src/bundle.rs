@@ -33,6 +33,8 @@ const PROLOGUE_SNAPSHOT: &str = include_str!("bundle/prologue_snapshot.cjs");
 const EXTRACT: &str = include_str!("bundle/extract.js");
 /// `pibake:staleness`: the entry's check of the setup an executable was built from.
 pub const STALENESS: &str = include_str!("bundle/staleness.mjs");
+/// `pibake:tool-json`: what `incremental_tool_json` calls instead of per-delta `parseStreamingJson`.
+pub const TOOL_JSON: &str = include_str!("bundle/tool_json.mjs");
 /// `pibake:frozen`'s code: the entry's check of settings passes baked in; `frozen_module` adds
 /// the data.
 pub const FROZEN: &str = include_str!("bundle/frozen.mjs");
@@ -371,6 +373,8 @@ pub struct BuildConfig {
     pub staleness: String,
     /// The module `pibake:frozen`.
     pub frozen: String,
+    /// The module `pibake:tool-json`.
+    pub tool_json: String,
     pub baked: String,
     /// Absolute stage directory → agent-relative directory.
     pub owned: Vec<Owned>,
@@ -378,6 +382,8 @@ pub struct BuildConfig {
     pub write: bool,
     /// Absolute path → the text a pass rewrote it to; the bundle reads this instead.
     pub overrides: BTreeMap<String, String>,
+    /// Absolute paths of overrides the bundle may leave out.
+    pub optional: Vec<String>,
     /// esbuild's output format: `esm` or `cjs`.
     pub format: &'static str,
     /// Modules loaded on first use rather than at import (snapshot bundles).
@@ -688,7 +694,12 @@ impl Bundler<'_> {
                 )
             })
             .collect();
-        let passes_json = serde_json::to_string(&(self.passes, &overrides))?;
+        let optional: Vec<String> = rewritten
+            .optional
+            .iter()
+            .map(|rel| plan.stage.join(rel).to_string_lossy().into_owned())
+            .collect();
+        let passes_json = serde_json::to_string(&(self.passes, &overrides, &optional))?;
         let hash = stage::content_hash([
             ("pibake", env!("CARGO_PKG_VERSION").as_bytes()),
             ("stage", stage_path.as_bytes()),
@@ -701,6 +712,7 @@ impl Bundler<'_> {
             ("lazy", serde_json::to_string(&lazy)?.as_bytes()),
             ("staleness", STALENESS.as_bytes()),
             ("frozen", frozen.as_bytes()),
+            ("tool_json", TOOL_JSON.as_bytes()),
             ("baked", baked_all.as_bytes()),
             ("owned", owned_json.as_bytes()),
             ("passes", passes_json.as_bytes()),
@@ -715,11 +727,13 @@ impl Bundler<'_> {
                 prologue: prologue(flavor.prologue, &plan.stage),
                 staleness: STALENESS.to_owned(),
                 frozen: frozen.clone(),
+                tool_json: TOOL_JSON.to_owned(),
                 baked: baked_module(baked),
                 owned: owned.clone(),
                 outfile: dir.join(flavor.main),
                 write,
                 overrides: overrides.clone(),
+                optional: optional.clone(),
                 format: flavor.format,
                 lazy: lazy.clone(),
             };
@@ -740,6 +754,15 @@ impl Bundler<'_> {
                         "esbuild failed even without the failing extensions:\n{}",
                         render_errors(&result.errors)
                     );
+                }
+            }
+            if let Some(m) = &result.metafile {
+                for rel in rewritten
+                    .optional
+                    .iter()
+                    .filter(|r| !m.inputs.contains_key(*r))
+                {
+                    log(format!("left out of the bundle, as rewritten: {rel}"));
                 }
             }
             let mut report = report(&plan.baked, &failed, &result, plan.unbaked.clone());

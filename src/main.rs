@@ -49,13 +49,16 @@ enum Command {
         #[arg(long, default_value = "pi")]
         against: String,
     },
-    /// Measure startup and a streamed 200 KB write, interleaved across Pi commands
+    /// Measure startup and a streamed write (200 KiB by default), interleaved across Pi commands
     Bench {
         /// A Pi command to measure; repeat to compare
         #[arg(long = "pi", required = true)]
         pi: Vec<String>,
         #[arg(long, default_value_t = 10)]
         runs: usize,
+        /// Size of the streamed write, in KiB
+        #[arg(long, default_value_t = 200)]
+        big_write_kib: usize,
         /// Write the results to bench_results/<date>_<label>.json
         #[arg(long)]
         record: Option<String>,
@@ -246,9 +249,17 @@ fn main() -> Result<ExitCode> {
                 ours.system_prompt.lines().count()
             )?;
         }
-        Command::Bench { pi, runs, record } => {
+        Command::Bench {
+            pi,
+            runs,
+            big_write_kib,
+            record,
+        } => {
             if runs == 0 {
                 bail!("--runs must be at least 1");
+            }
+            if big_write_kib == 0 {
+                bail!("--big-write-kib must be at least 1");
             }
             let commands = pi
                 .iter()
@@ -257,13 +268,20 @@ fn main() -> Result<ExitCode> {
             let bench = Bench {
                 commands: &commands,
                 runs,
+                big_write_bytes: big_write_kib * 1024,
                 source: &config.agent_dir,
                 real_home: &home,
             };
             let results = bench.run(|step| eprintln!("bench: {step}"))?;
             write!(out, "{}", bench::render_table(&results))?;
             if let Some(label) = record {
-                let path = bench::record(Path::new("bench_results"), &label, runs, &results)?;
+                let path = bench::record(
+                    Path::new("bench_results"),
+                    &label,
+                    runs,
+                    bench.big_write_bytes,
+                    &results,
+                )?;
                 writeln!(out, "recorded: {}", path.display())?;
             }
         }

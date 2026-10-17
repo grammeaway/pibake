@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 
 pub const PROVIDER: &str = "pibake_fake";
 pub const BIG_WRITE_PATH: &str = "big_write.txt";
+/// The default size of the `big_write` file.
 pub const BIG_WRITE_BYTES: usize = 200 * 1024;
 /// Real providers stream tool arguments in small pieces; the per-chunk cost is what l11 targets.
 pub const DELTA_BYTES: usize = 20;
@@ -55,17 +56,17 @@ pub fn provider_entry(base_url: &str) -> Value {
     })
 }
 
-/// Deterministic ASCII text, exactly `BIG_WRITE_BYTES` long, with the characters JSON must escape.
-pub fn big_write_content() -> String {
-    let mut out = String::with_capacity(BIG_WRITE_BYTES + 128);
+/// Deterministic ASCII text, exactly `bytes` long, with the characters JSON must escape.
+pub fn big_write_content(bytes: usize) -> String {
+    let mut out = String::with_capacity(bytes + 128);
     let mut line = 0u32;
-    while out.len() < BIG_WRITE_BYTES {
+    while out.len() < bytes {
         out.push_str(&format!(
             "{line:06}: let path = \"C:\\\\tmp\\\\{line}\";\tlog(`{{\"n\": {line}}}`);\n"
         ));
         line += 1;
     }
-    out.truncate(BIG_WRITE_BYTES);
+    out.truncate(bytes);
     out
 }
 
@@ -164,11 +165,16 @@ pub struct FakeProvider {
 
 impl FakeProvider {
     pub fn start() -> Result<Self> {
+        Self::with_big_write(BIG_WRITE_BYTES)
+    }
+
+    /// As `start`, with a `big_write` file of `bytes`.
+    pub fn with_big_write(bytes: usize) -> Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").context("binding the fake provider")?;
         let port = listener.local_addr()?.port();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
-        let content: Arc<str> = big_write_content().into();
+        let content: Arc<str> = big_write_content(bytes).into();
         let accept_loop = {
             let (requests, stop) = (requests.clone(), stop.clone());
             std::thread::spawn(move || {
@@ -356,18 +362,18 @@ mod tests {
 
     #[test]
     fn content_is_exact_size_and_needs_escaping() {
-        let content = big_write_content();
+        let content = big_write_content(BIG_WRITE_BYTES);
         assert_eq!(content.len(), BIG_WRITE_BYTES);
         assert!(content.is_ascii());
         for c in ['"', '\\', '\n', '\t'] {
             assert!(content.contains(c), "{c:?}");
         }
-        assert_eq!(content, big_write_content());
+        assert_eq!(content, big_write_content(BIG_WRITE_BYTES));
     }
 
     #[test]
     fn big_write_streams_the_whole_file_in_small_deltas() {
-        let content = big_write_content();
+        let content = big_write_content(BIG_WRITE_BYTES);
         let events = events(
             Script::BigWrite,
             &agent_request("big_write", "user"),

@@ -16,7 +16,7 @@ Live log for `README.md`'s plans. One row per plan; details under Deviations and
 | l8 passes, trim highlight | done | b0f6bcc | passes run before esbuild (owner); `trim_highlight` keeps 39 of 191 languages; `main.mjs` −1.19 MB, executable −1.23 MB; startup RSS −4 MiB, startup time within noise (indicative; Pi 1.3.0 already loads 170 languages only after the first interactive render); `verify` same |
 | l9 fold providers | done | 22a109b | owner: option B, `trim_apis` stubs unused APIs, catalog kept; live keeps 5 of 10 APIs; `main.mjs` −3.31 MB, executable −3.80 MB; startup RSS −16.5 MiB, startup time within noise (indicative); `verify` same, `--list-models` as stock; fixed `import.meta.main` in executables |
 | l10 snapshot backend | done | 159a4cc | O2 = go; opt-in `[build] backend = "sea_snapshot"`; `verify` same on the live setup (both backends); recorded: startup **299 vs 433 ms** against warm-cache code cache (2607 stock), big write 44.8 vs 46.4 s, big-write peak RSS 598 vs 448 MiB (stock 677; open) (`bench_results/2026-10-17_l10_snapshot.json`) |
-| l11 streaming JSON | planned | | O1 |
+| l11 streaming JSON | done | 8f9de6c | O1 = pibake pass (owner); `incremental_tool_json` on by default; each streamed delta's `arguments` equal stock's (property test against the installed `parseStreamingJson`); `verify` same; recorded: big write **0.86 vs 46.3 s** wall, 1.12 vs 47.7 s CPU, peak RSS 232 vs 449 MiB, pass on vs off (stock 48.5 s); startup unchanged (`bench_results/2026-10-17_l11_streaming_json.json`); size curve in `2026-10-17_l11_curve_*k.json` |
 
 ## Decisions
 
@@ -84,6 +84,11 @@ Decisions taken during passes, with who took them (owner or agent) and when.
 | l10 | Launch state is deferred, not re-evaluated: `snapshot_safety` rewrites each listed top-level statement, matched by exact text, to run through `globalThis.__pibake_reinit`. This runs on resume in snapshot builds, or at once otherwise, so a plain `node main.cjs` behaves as stock. There are three shapes: `const` becomes `let` and is assigned on resume; an object literal is filled in place, so importers that hold it see the contents; a whole statement is moved. A reference to a deferred `const` binding outside a function fails the pass, naming file and line. 11 sites in Pi 1.3.0: 4 `Intl.Segmenter`s, `PI_TIMING`, the OAuth callback host (2), `TOOLS_DIR`, and supports-color's argv flags and colour levels, plus chalk's levels | 2026-10-17, agent |
 | l10 | Generic, in the bundle rather than per site: `import()` → `require()` (esbuild `supported`); lazy modules (esbuild plugin in `build.mjs`: an object with one getter per export, names read from the real module at bundle time) for the builtins that fail a snapshot when loaded alone on Node 26 (`http`, `https`, `http2`, `tls`, `repl`, `sqlite`) and for `undici`; signal listeners deferred and replayed on resume; on resume, `process.chdir(".")` clears working-directory memos, and the result is checked against the real `process.cwd` | 2026-10-17, agent |
 | l10 | The gate is dynamic, not a static scan (step 1's evidence). `bundle/trace.cjs` evaluates the snapshot bundle as the build does, and attributes every load-time read or creation to a module. The kinds: env, cwd, argv, os, tty, time, random, timers, Intl, unsafe builtin loads, fs outside the root, extension locations. `snapshot_safety::ACCEPTED` lists 14 reads the snapshot may keep, each with a reason. Anything else fails the build, naming the module and its line in `main.cjs`. The tracer and the snapshot build both run with a cleared environment (`PATH` plus the root), so what can be kept is the build's empty environment | 2026-10-17, agent |
+| l11 | O1 = pibake: a pass `incremental_tool_json`, delivered in this saga, not an upstream PR | 2026-10-17, owner |
+| l11 | The pass rewrites each per-delta `parseStreamingJson(<buffer>)` call in pi-ai 1.3.0's six stream files (7 sites; `openai-responses-shared.js` also re-parses on `function_call_arguments.done`, which replaces the buffer) to `__pibake_streamToolJson(parseStreamingJson, <block>, <buffer>, <delta>)`, matched by exact text per site. A changed site, a missing file, or any other `parseStreamingJson(` call in `dist/api/` fails the pass, naming it. The import is prefixed to the file's first line, so the sourcemap's lines stay aligned. End-of-block `parseToolCallArguments` is untouched. pi-agent-core's `proxy.js` also calls `parseStreamingJson` but is not used by the coding agent; left alone | 2026-10-17, agent |
+| l11 | The runtime is an esbuild virtual module `pibake:tool-json` (`src/bundle/tool_json.mjs`, `include_str!`, part of the bundle hash), as l7's `pibake:staleness`. It takes stock's parser as an argument, keeps state per tool-call object in a `WeakMap`, and lexes only the new delta. Its fast path covers only text inside an open string value: it rebuilds a fresh copy of the last stock result with that string swapped. Everything else calls stock. A self-check against stock when the fast path starts; non-strict JSON, raw control characters, `__proto__` keys, a non-object root, or a failed self-check send the call to stock for good | 2026-10-17, agent |
+| l11 | The rewrites are *optional* for `build.mjs`'s "a pass rewrote X, but the bundle never loads it" check, since `trim_apis` drops some of the providers they touch. `bundle` logs `left out of the bundle, as rewritten: <file>` for each instead (on the live setup: bedrock-converse-stream, mistral-conversations, pi-messages) | 2026-10-17, agent |
+| l11 | `bench --big-write-kib <n>` (default 200, the old fixed size); the recorded JSON carries `big_write_bytes` | 2026-10-17, agent |
 | l10 | `snapshot_safety` is not listable in `[build] passes` (config error); `backend = "sea_snapshot"` adds it after the listed passes. `sea_codecache` stays the default, as the plan says | 2026-10-17, agent |
 
 ## Deviations
@@ -388,6 +393,38 @@ Per plan: where the work differed from the plan, and why.
   - **Stock reproduces its baseline** (2600 ms, 48.1 s), so this file compares with `2026-10-16_stock_baseline.json` and l6's.
   - **The snapshot's numbers do not drift** across the run (first five rounds 298 ms, last five 305 ms), though the CPU reached 98 °C.
 
+### l11
+
+- **Plan check against the code and Pi 1.3.0: holds,** with two additions to the plan's site list: a 7th site in `openai-responses-shared.js` (the `.done` event replaces the buffer, so it is rewritten with no delta and the parser rescans), and `pi-messages.js` keys its buffer by `contentIndex` in a `Map` (the parser keys on the content object). RPC's json events strip `partial`, so tool arguments are not serialised per delta; interactive mode passes `arguments` to `updateArgs`.
+- **Profile first (the l2 → l11 Found note).** One big write under the plain-node bundle with `--cpu-prof` (indicative, load 0.4): `parseStreamingJson` is 40.9 s of 47.9 s CPU, plus most of 5.8 s GC (`parseJsonWithRepair` self 17.3 s, `repairJson` 12.2 s, partial-json's `parseStr` 9.4 s). The `toolcall_delta` event work and RPC are negligible. Stock alone in a micro-bench: 25/50/100 KB → 0.68/2.6/10.4 s, quadratic.
+- **Stronger invariant than planned (deviation).** The plan allows intermediate `arguments` to lag by one delta and asks for "prefix-consistent" intermediates. Each delta's result equals stock's instead (deep equality, thrown errors included), since that is what the property test can check against stock directly.
+- **Property tests** (`tests/tool_json.rs`, E2E-gated, Hegel): a persistent `node` driver loads the installed Pi's `json-parse.js` and compares the incremental parser to it.
+  - `e2e_every_delta_equals_stock`: random JSON (escapes, surrogates, whitespace, plus damage insertions) cut at random UTF-16 offsets, with random no-delta rescans; equal to stock at every delta.
+  - `e2e_a_streamed_string_calls_stock_once`: an object whose last value is a long string calls stock once for the whole string.
+  - `e2e_a_big_write_calls_stock_a_handful_of_times`: the bench's 200 KB write in 20-byte deltas calls stock ≤ 4 times, final result equal. Stock on every prefix would take most of a minute (Hegel's `TooSlow` health check failed it), so this one compares only the final result; the other two compare every delta. A planted bug (dropping the `trimEnd` partial-json applies) fails the suite.
+  - The driver escapes request lines to ASCII: `readline` splits on U+2028/U+2029, which crashed it on the first such string.
+  - A throwaway fuzz before that (3000 cases × 2 seeds, ~100k deltas) found no mismatch.
+- **Integration tests** (`tests/incremental_tool_json.rs`): a fixture pi-ai with each provider's 1.3.0 lines; every site rewritten, nothing else changed; an unknown caller, a changed site and a missing file each fail the pass by name.
+- **Suite:** `cargo test` and every E2E test (`PIBAKE_E2E=1`, `TMPDIR=target/e2e-tmp`) pass.
+- **`verify` same** on the live setup for both executables (`target/l11/on`: default passes, SHA-256 `b5b6b283…`; `target/l11/off`: `passes = ["trim_highlight", "trim_apis"]`, `6a911df8…`; one lock, warm `XDG_CACHE_HOME` as in l10). The bundle has 4 rewritten sites (the kept APIs).
+- **Bench (deviation: no `--runs 10` indicative step and no owner-confirmed idle machine).** The parser's own micro-bench had already shown the shape (200 KB: 15 ms vs ~42 s), so the 20-run bench was the first full one. It ran 2026-10-17 13:25–13:59 JST: AC, platform profile and EPP `performance`, load 0.8 before, 1.3–1.8 during, CPU 57 °C at start, up to 93 °C. `dirty: true` at `8f9de6c` (this pass's uncommitted work). Treat it as near-recorded; rerun on an idle machine if a clean record is wanted.
+  - **Command:** `pibake --config target/l11/on/pibake.toml bench --runs 20 --record l11_streaming_json --pi pi --pi "env XDG_CACHE_HOME=<warm> <pi-l11-off>" --pi "env XDG_CACHE_HOME=<warm> <pi-l11-on>"`.
+  - **Medians [IQR], stock / off / on:**
+    - big write **48.5 [47.9–49.0] s / 46.3 [45.5–46.6] s / 0.86 [0.85–0.88] s** wall; 51.1 / 47.7 / 1.12 s CPU;
+    - big-write peak RSS 689 / 449 / **232** MiB;
+    - startup 2604 / 435 / 433 ms; startup CPU 3995 / 566 / 565 ms; startup RSS 366 / 188 / 187 MiB (no startup effect).
+  - Every run's written file matched byte for byte (the bench's check).
+- **Curve (deviation: 3 runs per size, not 20),** big write medians, stock / off / on:
+
+  | KB | wall s | CPU s | peak RSS MiB |
+  |---|---|---|---|
+  | 50 | 5.51 / 3.48 / 0.64 | 7.11 / 3.83 / 0.81 | 482 / 311 / 217 |
+  | 100 | 14.0 / 12.0 / 0.74 | 16.1 / 12.7 / 0.95 | 630 / 421 / 227 |
+  | 200 | 48.1 / 45.8 / 0.87 | 50.6 / 47.1 / 1.13 | 685 / 442 / 231 |
+  | 400 | 194.5 / 191.0 / 1.19 | 199.5 / 195.3 / 1.53 | 697 / 458 / 282 |
+
+  With the pass, CPU grows by ~0.1–0.15 s per extra 50 KB over a ~0.7 s fixed cost (process start and the session): linear. Without it, it roughly quadruples per doubling past 100 KB. The 400 KB run was interrupted once (owner away) and rerun 15:53–16:19 JST at load 1.3–1.5.
+
 ## Found
 
 Bugs or debts found during a pass and kept out of its diff.
@@ -398,7 +435,7 @@ Bugs or debts found during a pass and kept out of its diff.
 - **l1 → l2: skills outside the agent dir.** Pi also loads skills from `~/.agents/skills` (and project `.agents/skills` up to the git root). `verify` runs must control `HOME` to compare like with like.
 - **l1 → l7: state keys inside `settings.json`.** `lastChangelogVersion` (and others Pi writes) change without the setup changing. Staleness hashing must ignore them; the inventory does not split keys yet. *Settled in l7: only `packages` is compared.*
 - **Shortcuts in code** (`shortcut:` comments): `file://` URLs not percent-decoded; git URLs split textually without WHATWG normalisation, `%` rejected; legacy global npm root not consulted; ignore files and `readdir` order not ported.
-- **l2 → l11: the big write is slow.** 200 KB in 20-byte deltas takes about 54 s of CPU on stock Pi, almost all of it without extensions too (`-ne`: 52 s). That fits verdict #7, but l11 should profile whether `parseStreamingJson` is all of it or whether per-delta event work (`toolcall_delta` carries `partial: output`) adds to it. It also makes a 20-run bench take about 20 minutes per command.
+- **l2 → l11: the big write is slow.** *Settled in l11: `parseStreamingJson` is ~85 % of the CPU plus most of the GC; the event work is negligible.* 200 KB in 20-byte deltas takes about 54 s of CPU on stock Pi, almost all of it without extensions too (`-ne`: 52 s). That fits verdict #7, but l11 should profile whether `parseStreamingJson` is all of it or whether per-delta event work (`toolcall_delta` carries `partial: output`) adds to it. It also makes a 20-run bench take about 20 minutes per command.
 - **l2 → l5: extensions cost ~2.6 s of startup** (indicative: 3.2 s with them, 0.55 s with `-ne`).
 - **l2 → l5: command paths.** `get_commands` reports `sourceInfo.path` and `baseDir` of each extension command (e.g. `<agent_dir>/extensions/init.ts`). A bundle will report something else. l5 decides whether the bundle keeps these paths or `verify` compares baked extension commands without them. *Settled in l5: Pi's own pipeline decides (see Decisions).*
 - **l2: side traffic seen under the harness.** `pi-observational-memory` makes its own model calls after each turn, on the current model. `pi-observational-memory` and `@grammeaway/pi-cook` emit `extension_error` "ctx is stale" on `agent_settled` in `--mode rpc --no-session` runs (upstream, harmless to `verify`). Pi creates `auth.json` and `models-store.json` in an agent dir that lacks them.
@@ -443,4 +480,6 @@ Bugs or debts found during a pass and kept out of its diff.
 - **l10: a snapshot `--version` deserialises the snapshot first** (≈ 100 ms; the code-cache prologue answers before evaluating anything).
 - **l10: a snapshot executable is tied to its builder's cache path.** It re-extracts into that path when it is gone; a user who cannot write there cannot run it. This is fine for local mode.
 - **l10: scratch use of `/tmp`.** `/tmp` is a quota'd tmpfs. On the owner's request, the earlier passes' scratch projects (`/tmp/pibake-l5` … `/tmp/pibake-l10`, ≈ 4.6 GB) were deleted after the l10 commit; only `/tmp/pibake_baseline.log` and `/tmp/pibake_cmp.txt` (4 KB each) remain. Scratch projects now go under `target/` (git-ignored), e.g. `target/l10-bench/`; E2E runs use `TMPDIR=target/e2e-tmp`.
-
+- **l11: the fast path covers only string values.** A tool call made of many short strings, numbers or nested structure calls stock on most deltas and stays quadratic, as stock (only long string values, as `write`/`edit` content, gain). Input stock has to repair (raw control characters, bad escapes) or that partial-json misreads (`[ ]` with inner whitespace) sends the call to stock to its end (`shortcut:` in `tool_json.mjs`).
+- **l11 → next: the TUI redraw.** The bench runs in RPC mode, where tool arguments are not rendered. Interactive mode calls `updateArgs` per delta; the plan's non-goal (incremental redraw) needs a pty metric (l2 step 6) to measure.
+- **l11: upstream.** The fix is generic to pi-ai; an upstream PR would give stock Pi the same win. O1 chose the pass; the parser in `tool_json.mjs` is self-contained if that changes.

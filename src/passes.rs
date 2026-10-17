@@ -8,6 +8,7 @@
 //! A pass that bakes a setting into the build records it as `Frozen`; the bundle's entry checks
 //! the live setup against it at startup (`bundle/frozen.mjs`).
 
+mod incremental_tool_json;
 pub mod snapshot_safety;
 mod trim_apis;
 mod trim_highlight;
@@ -33,6 +34,8 @@ pub enum Pass {
     TrimHighlight,
     /// Stubs pi-ai's stream APIs outside `[trim] apis` (default: derived from the setup).
     TrimApis,
+    /// Parses streamed tool-call arguments incrementally instead of re-parsing each delta.
+    IncrementalToolJson,
     /// Defers module code that reads launch state; added by `backend = "sea_snapshot"`.
     SnapshotSafety,
 }
@@ -42,12 +45,17 @@ impl Pass {
         match self {
             Pass::TrimHighlight => "trim_highlight",
             Pass::TrimApis => "trim_apis",
+            Pass::IncrementalToolJson => "incremental_tool_json",
             Pass::SnapshotSafety => "snapshot_safety",
         }
     }
 }
 
-pub const DEFAULT_PASSES: [Pass; 2] = [Pass::TrimHighlight, Pass::TrimApis];
+pub const DEFAULT_PASSES: [Pass; 3] = [
+    Pass::TrimHighlight,
+    Pass::TrimApis,
+    Pass::IncrementalToolJson,
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Options {
@@ -115,6 +123,8 @@ pub struct Output {
     pub overrides: BTreeMap<String, String>,
     pub reports: Vec<PassReport>,
     pub frozen: Vec<Frozen>,
+    /// Rewritten files the bundle may leave out, as another pass made them unreachable.
+    pub optional: Vec<String>,
 }
 
 /// Runs `options.passes` in order over the stage's sources; each sees its predecessors' output.
@@ -130,6 +140,7 @@ pub fn run(stage: &Path, options: &Options, setup: &Setup) -> Result<Output> {
     }
     let mut reports = vec![];
     let mut frozen = vec![];
+    let mut optional = vec![];
     let snapshot = options.snapshot.then_some(Pass::SnapshotSafety);
     for pass in options.passes.iter().chain(&snapshot) {
         let (changes, notes) = match pass {
@@ -143,6 +154,12 @@ pub fn run(stage: &Path, options: &Options, setup: &Setup) -> Result<Output> {
                     .context("pass trim_apis")?;
                 frozen.push(out.frozen);
                 (out.changes, out.notes)
+            }
+            Pass::IncrementalToolJson => {
+                let out = incremental_tool_json::run(&mut sources)
+                    .context("pass incremental_tool_json")?;
+                optional.extend(out.optional);
+                (out.changes, vec![])
             }
             Pass::SnapshotSafety => (
                 snapshot_safety::run(&mut sources).context("pass snapshot_safety")?,
@@ -159,6 +176,7 @@ pub fn run(stage: &Path, options: &Options, setup: &Setup) -> Result<Output> {
         overrides: sources.changed,
         reports,
         frozen,
+        optional,
     })
 }
 

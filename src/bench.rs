@@ -76,6 +76,7 @@ pub struct Series {
 pub struct Bench<'a> {
     pub commands: &'a [PiCommand],
     pub runs: usize,
+    pub big_write_bytes: usize,
     pub source: &'a Path,
     pub real_home: &'a Path,
 }
@@ -83,8 +84,8 @@ pub struct Bench<'a> {
 impl Bench<'_> {
     /// One discarded warm-up round, then `runs` rounds. Each round rotates which command goes first.
     pub fn run(&self, mut progress: impl FnMut(&str)) -> Result<Vec<CommandResult>> {
-        let provider = FakeProvider::start()?;
-        let content = fake_provider::big_write_content();
+        let provider = FakeProvider::with_big_write(self.big_write_bytes)?;
+        let content = fake_provider::big_write_content(self.big_write_bytes);
         let mut samples: Vec<BTreeMap<&'static str, Vec<f64>>> =
             vec![BTreeMap::new(); self.commands.len()];
         for round in 0..=self.runs {
@@ -276,7 +277,13 @@ pub fn render_table(results: &[CommandResult]) -> String {
 }
 
 /// Writes `<dir>/<date>_<label>.json`; refuses to overwrite an earlier record.
-pub fn record(dir: &Path, label: &str, runs: usize, results: &[CommandResult]) -> Result<PathBuf> {
+pub fn record(
+    dir: &Path,
+    label: &str,
+    runs: usize,
+    big_write_bytes: usize,
+    results: &[CommandResult],
+) -> Result<PathBuf> {
     if label.is_empty()
         || !label
             .chars()
@@ -303,7 +310,7 @@ pub fn record(dir: &Path, label: &str, runs: usize, results: &[CommandResult]) -
         "node_version": Command::new("node").arg("--version").output().ok()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()),
         "runs": runs,
-        "big_write_bytes": fake_provider::BIG_WRITE_BYTES,
+        "big_write_bytes": big_write_bytes,
         "delta_bytes": fake_provider::DELTA_BYTES,
         "results": results,
     });
@@ -357,6 +364,7 @@ mod tests {
         let bench = Bench {
             commands: &[],
             runs: 1,
+            big_write_bytes: fake_provider::BIG_WRITE_BYTES,
             source: &fixture,
             real_home: dir.path(),
         };
@@ -427,7 +435,7 @@ mod tests {
     fn record_writes_once_per_label_and_day() {
         let dir = tempfile::tempdir().unwrap();
         let results = [result("pi", &[1.0])];
-        let path = record(dir.path(), "baseline", 1, &results).unwrap();
+        let path = record(dir.path(), "baseline", 1, 100, &results).unwrap();
         let json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(
@@ -435,7 +443,8 @@ mod tests {
             json!([1.0])
         );
         assert_eq!(json["label"], "baseline");
-        assert!(record(dir.path(), "baseline", 1, &results).is_err());
-        assert!(record(dir.path(), "../x", 1, &results).is_err());
+        assert_eq!(json["big_write_bytes"], 100);
+        assert!(record(dir.path(), "baseline", 1, 100, &results).is_err());
+        assert!(record(dir.path(), "../x", 1, 100, &results).is_err());
     }
 }
