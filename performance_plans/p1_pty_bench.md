@@ -54,7 +54,7 @@ Pi has the hooks a harness needs:
 - [x] A unit test of the frame scanner on captured bytes, with markers split across reads and a DA1 query mid-stream. A Hegel property test also checks that splitting the stream at arbitrary points changes nothing.
 - [x] `PIBAKE_E2E=1` test: the bench runs interactive startup on the fixture setup with stock Pi and a built executable, and the readiness check holds. **Deviation:** it asserts `first_paint_ms <= ready_ms`, not `<`. Pi's first render races the instant DA1 reply; when the render loses, the first frame is `renderNow`'s own (about half the runs; `progress.md`).
 - [x] A deliberate break (no DA1 reply) shows as ~90 ms more `ready_ms`, and nothing else changes (by hand, reverted).
-- [ ] Recorded bench on an idle machine in `bench_results/`.
+- [x] Recorded bench on an idle machine in `bench_results/` (`2026-10-17_p1_interactive.json`; pass-off builds from the p3 lock, so this is the pre-p3 baseline).
 - [x] `cargo fmt --check`, clippy and every test green, E2E included.
 
 ## Non-goals

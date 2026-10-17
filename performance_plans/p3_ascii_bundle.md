@@ -37,9 +37,9 @@ It is listed in `[build] passes` (default on), so it can be turned off like the 
 
 ## Completion
 
-- [ ] The rewrite and its tests are green; `verify` same on the live setup, both backends.
-- [ ] A recorded bench in `bench_results/`.
-- [ ] `cargo fmt --check`, clippy and every test green, E2E included.
+- [x] The rewrite and its tests are green; `verify` same on the live setup, both backends.
+- [x] A recorded bench in `bench_results/` (`2026-10-17_p3_ascii.json`). **Deviation:** code-cache startup instructions +1.4 %, not within 1 % (`progress.md` → p3).
+- [x] `cargo fmt --check`, clippy and every test green, E2E included.
 
 ## Non-goals
 

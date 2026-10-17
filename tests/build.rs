@@ -18,7 +18,7 @@ fn run_bare(bin: &Path, home: &Path, args: &[&str]) -> std::process::Output {
 }
 
 /// A setup with an extension that reads its location, one with an `import.meta.main` self-check,
-/// and one esbuild cannot bundle (it loads through jiti); built as `pi-test`, keeping only the fake
+/// one with non-ASCII regex literals, and one esbuild cannot bundle (it loads through jiti); built as `pi-test`, keeping only the fake
 /// provider's API. `build` adds to `[build]`.
 fn fixture_setup(root: &Path, build: &str) -> (PathBuf, PathBuf) {
     let agent = root.join("agent");
@@ -31,6 +31,11 @@ fn fixture_setup(root: &Path, build: &str) -> (PathBuf, PathBuf) {
     write(
         &agent.join("extensions/self_check.ts"),
         "if ((import.meta as any).main) console.error(\"self-check ran\");\nexport default function () {}\n",
+    );
+    // `ascii_bundle` escapes what esbuild leaves as written; `verify` compares the results.
+    write(
+        &agent.join("extensions/non_ascii.js"),
+        "// Comments – and regex literals keep non-ASCII text.\nconst dashes = /^[-–—]+$/u;\nconst link = /^[#🔗]$/;\nexport default function (pi) {\n\tpi.registerCommand(\"non-ascii\", { description: `${dashes.test(\"–—\")} ${link.test(\"🔗\")} ${link.test(\"\\ud83d\")}`, handler: async () => {} });\n}\n",
     );
     // esbuild cannot resolve its import, so it loads through jiti inside the executable.
     write(
@@ -77,6 +82,7 @@ fn e2e_build_a_fixture_setup() {
         .unwrap()
         .path();
     let main = fs::read_to_string(launcher.with_file_name("main.mjs")).unwrap();
+    assert!(main.is_ascii());
     assert_eq!(
         main.matches(stage_dir.to_str().unwrap()).count(),
         1,
@@ -330,7 +336,9 @@ fn e2e_build_a_fixture_setup_as_a_snapshot() {
         stdout.contains(&format!("built {}", bin.display())),
         "{stdout}"
     );
-    assert!(bundled_launcher(&stdout).ends_with("main.cjs"), "{stdout}");
+    let launcher = bundled_launcher(&stdout);
+    assert!(launcher.ends_with("main.cjs"), "{stdout}");
+    assert!(fs::read_to_string(launcher).unwrap().is_ascii());
     assert!(stdout.contains(" 1 failed\n"), "{stdout}");
     let extracted: Vec<_> = fs::read_dir(cache.join("pibake"))
         .unwrap()

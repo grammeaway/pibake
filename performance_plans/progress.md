@@ -6,9 +6,9 @@ Live log for `README.md`'s plans: status, decisions, and the probe round's findi
 
 | Plan | Status | Notes |
 |---|---|---|
-| p1 pty bench | steps 1–4 done (uncommitted) | `first_paint_ms`, `ready_ms`, `interactive_cpu_ms`, `interactive_peak_rss_mib`; `--big-write-kib 0` skips the big write. Step 4's breakdown is under Probe round; step 5 (recorded bench) waits for an idle machine |
-| p2 perf probes | done (uncommitted) | `build --profiling`, `bench --perf-stat` (`*_minstr`), README Profiling section; breakdown under Probe round |
-| p3 ASCII bundle | planned | revised by the probe round: the target is pure ASCII, not ≤ U+00FF |
+| p1 pty bench | done (`6cd7677`; recording later) | `first_paint_ms`, `ready_ms`, `interactive_cpu_ms`, `interactive_peak_rss_mib`; `--big-write-kib 0` skips the big write. Step 4's breakdown is under Probe round. Recorded ready: stock **2663 ms**, warm code cache **494**, snapshot **374**; interactive peak RSS 377 / 192 / 222 MiB (`bench_results/2026-10-17_p1_interactive.json`). A first attempt was discarded: the CPU was stuck at 800 MHz after a suspend |
+| p2 perf probes | done (`6cd7677`) | `build --profiling`, `bench --perf-stat` (`*_minstr`), README Profiling section; breakdown under Probe round |
+| p3 ASCII bundle | done | `ascii_bundle` pass, default on; `verify` same on the live setup for both backends. Recorded: peak RSS −13 MiB (code cache), −52 MiB (snapshot); code-cache startup instructions +1.4 % (deviation, below) (`bench_results/2026-10-17_p3_ascii.json`) |
 | p4 trained code cache | planned | the probe round's headline |
 | p5 lazy HTTP dispatcher | planned | |
 | p6 lazy TUI regexes | planned | |
@@ -22,6 +22,8 @@ Live log for `README.md`'s plans: status, decisions, and the probe round's findi
 | p1 | `Screen` parses escape sequences byte by byte, so a sequence split across reads needs no carried tail (the plan said "a short tail") | 2026-10-17, agent |
 | p1 | Readiness checks all text drawn up to ready for the model id, not only the final frame: Pi redraws changed lines only, so the last frame often lacks the footer | 2026-10-17, agent |
 | p2 | Profiling flags per backend: code cache gets `--perf-basic-prof --interpreted-frames-native-stack`; the snapshot only `--perf-basic-prof`, since a snapshot built with both segfaults at launch (Node 26.11.1) | 2026-10-17, agent |
+| p3 | `ascii_bundle` runs in `Bundler::run` on the final bundle, not in `passes::run`, so it is listed in `[build] passes` but skipped there. Its report's file is bundle-relative (`main.mjs`, `main.cjs`) | 2026-10-17, agent |
+| p3 | A non-ASCII character after `\` in a regex (an identity escape, non-`u` only) is written as one escape in place of both, since `\` before the escape would make it a literal `\u` | 2026-10-17, agent |
 | p2 | `--perf-stat` counts `instructions:u` only, as `startup_minstr`, `interactive_minstr`, `big_write_minstr` (millions). It wraps the harness command in `perf stat -x, -o <harness>/perf_stat.csv`; `wait4` then reaps perf, whose own CPU (a few ms) lands in the time metrics | 2026-10-17, agent |
 
 ## Probe round (2026-10-17)
@@ -127,6 +129,26 @@ Indicative, load ~1. Feeds the README's native-code verdicts, p7 and p8.
 - **Transcript frame cost:** 400 cached `Markdown` messages (17,600 lines) in a `Container`, `render(120)` with caches warm: 0.19 ms per frame (20 and 100 messages: 0.03 ms). `doRender`'s post-processing works on the visible rows only (`tui-alt-screen.js`).
 - **Subprocesses at interactive startup:** a `--require` hook logging every `child_process` call. Setup: `pi-baked` (live setup's baked extensions), a throwaway agent directory, `PI_OFFLINE=1`, `PI_STARTUP_BENCHMARK=1`, a pty from `script`. Only `spawnSync fd --version` (6.4 ms) and `spawnSync rg --version` (3.3 ms) ran, both from `ensureTool`. Under plain `node` with 150 MiB of ballast: `rg` 8.8 ms, `fd` 8.2 ms, a missing `fdfind` 5.3 ms.
 - **Pi-Bolt against Pi v1.3.0:** a sub-agent diffed `packages/{ai,agent,tui,coding-agent}/src` and catalogued 13 Pi-level performance changes. They are summarised in the README's verdicts and candidates. 1.3.0 already has `Markdown.cachedTokens`, a `Box` line cache and incremental write highlighting while streaming, so Pi-Bolt's numbers, taken against 1.1.0 and 1.2.0, overstate what is left.
+
+## p3: ASCII bundle (2026-10-17)
+
+**Recorded** on an idle machine (owner): `bench --runs 20 --perf-stat --record p3_ascii`, live setup, one lock, pass on and off per backend (`target/p3/`, not committed). The code-cache executables ran without a warm cache, so every run includes extraction, the same for on and off. The live bundle: 235 comments and 30 regex literals escaped, +2.3 KB, 0.3 s in the pass.
+
+| | code cache on | off | snapshot on | off |
+|---|---|---|---|---|
+| startup peak RSS | **175.2 MiB** | 188.3 | **159.4** | 211.1 |
+| interactive peak RSS | **185.9** | 197.5 | **173.0** | 221.8 |
+| big write peak RSS | **219.3** | 233.1 | **210.5** | 254.5 |
+| startup_minstr | 2954 | 2912 | **1814** | 1917 |
+| interactive_minstr | 3260 | 3222 | **2347** | 2392 |
+| big_write_minstr | **5933** | 6181 | **4808** | 4921 |
+| RPC startup | 455 ms | 462 | **297** | 320 |
+| ready | 509 ms | 518 | **362** | 386 |
+
+- **Memory as planned on the code cache (−13 MiB, plan −12), and well beyond on the snapshot (−52, plan −20).** The snapshot also runs 5 % fewer startup instructions and starts 23 ms sooner, since its heap no longer holds a 41 MiB two-byte string to deserialise.
+- The big write runs 4 % fewer instructions on the code cache (−2 % on the snapshot).
+- **Deviation: code-cache startup instructions rise 1.4 %** (plan: within 1 %), interactive 1.2 %; times do not rise (−7 and −9 ms). Profiled with official-node builds of the same lock (`perf record -e instructions:u`, `--help`): V8 reads an external one-byte source through a buffered stream that copies each chunk to UTF-16 (`CopyChars<unsigned char, unsigned short>`, +11 M), where it reads a two-byte one in place. On the official build the net is −0.4 % on `--help`; on Arch's build +0.6 %. The cost is per lazily compiled function, so p4's trained cache should remove most of it.
+- An empty `HOME` makes the code-cache executable fail at launch: its prologue extracts to the relative `.cache/pibake/…`, and `createRequire` rejects the relative path. Stock Pi starts. Found by accident while profiling; not fixed here.
 
 ## Found
 

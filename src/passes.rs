@@ -1,4 +1,5 @@
-//! Passes: Rust rewrites of the few module sources they target, made before esbuild runs.
+//! Passes: Rust rewrites of the few module sources they target, made before esbuild runs
+//! (`ascii_bundle` alone rewrites esbuild's output).
 //!
 //! The bundle reads a rewritten file instead of the stage's (`bundle/build.mjs`), so esbuild's
 //! own tree shaking drops whatever a rewrite stops importing. Passes on esbuild's output could
@@ -8,6 +9,7 @@
 //! A pass that bakes a setting into the build records it as `Frozen`; the bundle's entry checks
 //! the live setup against it at startup (`bundle/frozen.mjs`).
 
+pub mod ascii_bundle;
 mod incremental_tool_json;
 pub mod snapshot_safety;
 mod trim_apis;
@@ -38,6 +40,9 @@ pub enum Pass {
     IncrementalToolJson,
     /// Defers module code that reads launch state; added by `backend = "sea_snapshot"`.
     SnapshotSafety,
+    /// Escapes the bundle's comments and regex literals to ASCII, so Node holds it as one byte
+    /// per character instead of two.
+    AsciiBundle,
 }
 
 impl Pass {
@@ -47,14 +52,16 @@ impl Pass {
             Pass::TrimApis => "trim_apis",
             Pass::IncrementalToolJson => "incremental_tool_json",
             Pass::SnapshotSafety => "snapshot_safety",
+            Pass::AsciiBundle => "ascii_bundle",
         }
     }
 }
 
-pub const DEFAULT_PASSES: [Pass; 3] = [
+pub const DEFAULT_PASSES: [Pass; 4] = [
     Pass::TrimHighlight,
     Pass::TrimApis,
     Pass::IncrementalToolJson,
+    Pass::AsciiBundle,
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -165,6 +172,8 @@ pub fn run(stage: &Path, options: &Options, setup: &Setup) -> Result<Output> {
                 snapshot_safety::run(&mut sources).context("pass snapshot_safety")?,
                 vec![],
             ),
+            // Runs on esbuild's output, in `bundle.rs`.
+            Pass::AsciiBundle => continue,
         };
         reports.push(PassReport {
             pass: *pass,

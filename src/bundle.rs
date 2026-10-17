@@ -12,12 +12,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
+use oxc::span::SourceType;
 use serde::{Deserialize, Serialize};
 
 use crate::config::Backend;
 use crate::inventory::Inventory;
 use crate::lock::PI_PACKAGE;
-use crate::passes::{self, PassReport, snapshot_safety};
+use crate::passes::{self, Pass, PassReport, snapshot_safety};
 use crate::paths;
 use crate::stage::{self, Outcome};
 
@@ -767,6 +768,11 @@ impl Bundler<'_> {
             }
             let mut report = report(&plan.baked, &failed, &result, plan.unbaked.clone());
             report.passes = rewritten.reports.clone();
+            if self.passes.passes.contains(&Pass::AsciiBundle) {
+                report
+                    .passes
+                    .push(ascii_bundle(&dir.join(flavor.main), &flavor)?);
+            }
             if self.backend == Backend::SeaCodecache {
                 fs::write(dir.join(LAUNCHER), LAUNCHER_TEXT)?;
             }
@@ -820,6 +826,33 @@ impl Bundler<'_> {
         }
         Ok(failed)
     }
+}
+
+fn ascii_bundle(main: &Path, flavor: &Flavor) -> Result<PassReport> {
+    let source_type = match flavor.format {
+        "cjs" => SourceType::cjs(),
+        _ => SourceType::mjs(),
+    };
+    let text = fs::read_to_string(main).with_context(|| format!("reading {}", main.display()))?;
+    let mut changes = vec![];
+    if let Some(e) =
+        passes::ascii_bundle::run(&text, source_type, flavor.main).context("pass ascii_bundle")?
+    {
+        fs::write(main, &e.text)?;
+        changes.push(passes::Change {
+            file: flavor.main.to_owned(),
+            what: format!(
+                "escaped {} comments and {} regex literals to ASCII",
+                e.comments, e.regexes
+            ),
+            bytes_removed: 0,
+        });
+    }
+    Ok(PassReport {
+        pass: Pass::AsciiBundle,
+        changes,
+        notes: vec![],
+    })
 }
 
 /// `pibake:frozen`: its check, and what the passes froze.
