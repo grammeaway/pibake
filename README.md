@@ -17,6 +17,12 @@ Two uses, one tool:
 
 Pi itself is not forked. pibake builds released Pi packages through Pi's own entry point, so the behaviour is Pi's.
 
+## Install
+
+Linux only for now (x86_64 and aarch64; see [Roadmap](#roadmap)). Download a static binary from [Releases](https://github.com/grammeaway/pibake/releases) and put `pibake` on your `PATH`, or build from source with `cargo install --path .`.
+
+pibake drives the tools Pi already uses, so it needs `node` (25.5 or newer), `npm` and `git` on `PATH`.
+
 ## The flow
 
 Your config stays in Pi's own formats. `settings.json`, packages, extensions, skills, `models.json` and `AGENTS.md` mean what Pi's docs say they mean. pibake adds two files:
@@ -86,3 +92,33 @@ Every optimization is measured against stock Pi by `pibake bench`, and kept only
 - A Pi fork, or a reimplementation of Pi in another language.
 - A config format of its own for anything Pi already configures.
 - Making the model faster. That is the provider's.
+
+## Roadmap
+
+- **macOS** (x86_64, aarch64): pibake itself should build there, but is untested. The executables it builds need ad-hoc signing (`codesign --sign -`) after `--build-sea` before macOS will run them.
+- **Windows** (x86_64, aarch64): needs the Unix-only parts ported: process groups and `wait4` in the harness and bench, symlinks in staging and bundling, and file modes.
+- **Repo mode and `pibake init`:** a version-controlled agent directory built in CI, as described above.
+
+## Acknowledgements
+
+pibake is glue around other people's open source work. It builds on:
+
+| Project | Role in pibake | Source | License |
+|---|---|---|---|
+| [Pi](https://pi.dev) | The coding agent being built; baked into every executable | [earendil-works/pi](https://github.com/earendil-works/pi) | MIT |
+| [Node.js](https://nodejs.org) | Runtime, and single executable applications; embedded in every executable, V8 included | [nodejs/node](https://github.com/nodejs/node) | MIT, plus bundled dependencies' licenses |
+| [npm](https://www.npmjs.com) | Resolves and installs the lock | [npm/cli](https://github.com/npm/cli) | Artistic-2.0 |
+| [esbuild](https://esbuild.github.io) | Bundles Pi and the extensions | [evanw/esbuild](https://github.com/evanw/esbuild) | MIT |
+| [oxc](https://oxc.rs) | Parses and analyses the sources the passes rewrite | [oxc-project/oxc](https://github.com/oxc-project/oxc) | MIT |
+| [jiti](https://github.com/unjs/jiti) | Pi's extension loader; the bundle answers it with baked code, and anything not baked still loads through it | [unjs/jiti](https://github.com/unjs/jiti) | MIT |
+| [highlight.js](https://highlightjs.org) | Pi's syntax highlighter, trimmed by `trim_highlight` | [highlightjs/highlight.js](https://github.com/highlightjs/highlight.js) | BSD-3-Clause |
+| [Git](https://git-scm.com) | Pins and fetches git packages (run as a command, not shipped) | [git/git](https://github.com/git/git) | GPL-2.0 |
+| [Hegel](https://github.com/hegeldev/hegel-rust) | Property-based tests | [hegeldev/hegel-rust](https://github.com/hegeldev/hegel-rust) | MIT |
+
+Rust crates: [anyhow](https://github.com/dtolnay/anyhow), [clap](https://github.com/clap-rs/clap), [libc](https://github.com/rust-lang/libc), [serde](https://github.com/serde-rs/serde) and [serde_json](https://github.com/serde-rs/json), [sha2](https://github.com/RustCrypto/hashes), [tempfile](https://github.com/Stebalien/tempfile) and [toml](https://github.com/toml-rs/toml), all MIT OR Apache-2.0. `Cargo.lock` lists the full dependency tree.
+
+An executable built by pibake contains Node.js, Pi and your packages, each under its own license. Check those licenses before you share the executable.
+
+## License
+
+Licensed under either of [Apache License 2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at your option.

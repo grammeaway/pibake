@@ -2,6 +2,10 @@
 name = "pibake"
 version = "0.1.0"
 edition = "2024"
+description = "cargo build --release for your Pi setup: one pinned, optimized executable from a Pi agent directory."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/grammeaway/pibake"
+readme = "README.md"
 
 [dependencies]
 anyhow = "1.0.104"
