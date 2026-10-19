@@ -4,6 +4,10 @@
 //! `sea_codecache`: `main.mjs` is the SEA's main, with V8's code cache; its prologue
 //! (`bundle/prologue.mjs`) extracts the files at launch.
 //!
+//! `sea_trained`: the bundle's `loader.cjs` is the SEA's main. It compiles `main.cjs`, carried
+//! as an asset, with the code cache `train` made at build time, another asset. Before the output
+//! is replaced, the new executable checks that V8 accepts that cache.
+//!
 //! `sea_snapshot`: `main.cjs` runs at build time and the SEA carries the resulting V8 startup
 //! snapshot. Module code reads its location while the snapshot is built, so the files are
 //! extracted at build time to the path the executable then always uses; a launch re-extracts them
@@ -27,6 +31,8 @@ use crate::passes::snapshot_safety;
 use crate::stage;
 
 const TRACE: &str = include_str!("bundle/trace.cjs");
+/// The trained loader's exit status under `PIBAKE_CACHE_CHECK=1` when V8 rejected the cache.
+const CACHE_REJECTED: i32 = 3;
 /// Marks a complete extraction; the prologues use the same name.
 const EXTRACTED: &str = ".pibake-extracted";
 
@@ -121,6 +127,31 @@ pub type Node<'a> = &'a dyn Fn(&[&std::ffi::OsStr], Env) -> Result<()>;
 /// The only environment variables a `node` run gets, besides `PATH`; `None` inherits pibake's.
 pub type Env<'a> = Option<&'a [(&'a str, &'a std::ffi::OsStr)]>;
 
+/// Checks that a `sea_trained` executable's code cache is accepted; the stand-in point for tests.
+pub type Check<'a> = &'a dyn Fn(&Path) -> Result<()>;
+
+/// Runs the executable with only `PIBAKE_CACHE_CHECK=1`: its loader compiles the bundle with the
+/// trained cache, and exits.
+pub fn check_code_cache(exe: &Path) -> Result<()> {
+    let out = Command::new(exe)
+        .env_clear()
+        .env("PIBAKE_CACHE_CHECK", "1")
+        .output()
+        .with_context(|| format!("running {}", exe.display()))?;
+    match out.status.code() {
+        Some(0) => Ok(()),
+        Some(CACHE_REJECTED) => bail!(
+            "V8 rejected the trained code cache: it was made for another bundle, Node or V8 flags"
+        ),
+        _ => bail!(
+            "checking the code cache: {} exited with {}:\n{}",
+            exe.display(),
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+    }
+}
+
 pub fn run_node(args: &[&std::ffi::OsStr], env: Env) -> Result<()> {
     let mut cmd = Command::new("node");
     cmd.args(args);
@@ -157,7 +188,10 @@ pub struct Builder<'a> {
     /// V8 flags given to both the build and the executable, so the code cache or snapshot is made
     /// under the flags it runs with; V8 rejects a code cache made under other flags.
     pub v8_flags: &'a [&'a str],
+    /// `sea_trained`: the code cache `train` made for this bundle under `v8_flags`.
+    pub code_cache: Option<&'a Path>,
     pub node: Node<'a>,
+    pub check: Check<'a>,
 }
 
 /// `pibake build --profiling`: `perf`'s JIT symbol map, and with the code cache, interpreted JS
@@ -165,7 +199,9 @@ pub struct Builder<'a> {
 /// (Node 26.11.1).
 pub fn profiling_flags(backend: Backend) -> &'static [&'static str] {
     match backend {
-        Backend::SeaCodecache => &["--perf-basic-prof", "--interpreted-frames-native-stack"],
+        Backend::SeaCodecache | Backend::SeaTrained => {
+            &["--perf-basic-prof", "--interpreted-frames-native-stack"]
+        }
         Backend::SeaSnapshot => &["--perf-basic-prof"],
     }
 }
@@ -206,7 +242,15 @@ impl Builder<'_> {
         for (rel, path) in &files {
             assets.insert(format!("files/{rel}"), json!(path));
         }
-        let main = self.bundle.join(bundle::main_file(self.backend));
+        let main = self.bundle.join(bundle::sea_main(self.backend));
+        if self.backend == Backend::SeaTrained {
+            let cache = self
+                .code_cache
+                .context("a sea_trained build needs its trained code cache")?;
+            let bundle = self.bundle.join(bundle::main_file(self.backend));
+            assets.insert("bundle.cjs".into(), json!(bundle));
+            assets.insert("cache.bin".into(), json!(cache));
+        }
         let mut config = json!({
             "main": main,
             "output": &*tmp,
@@ -220,8 +264,10 @@ impl Builder<'_> {
         let config_path = work.path().join("sea.json");
         let mut kept = vec![];
         match self.backend {
-            Backend::SeaCodecache => {
-                config["mainFormat"] = json!("module");
+            Backend::SeaCodecache | Backend::SeaTrained => {
+                if self.backend == Backend::SeaCodecache {
+                    config["mainFormat"] = json!("module");
+                }
                 config["useCodeCache"] = json!(true);
                 fs::File::create(&config_path)?.write_all(&serde_json::to_vec_pretty(&config)?)?;
                 // A fixed seed makes the code cache, and so the executable, the same bytes every
@@ -231,6 +277,13 @@ impl Builder<'_> {
                     .chain(["--build-sea".as_ref(), config_path.as_os_str()])
                     .collect();
                 (self.node)(&args, None)?;
+                if self.backend == Backend::SeaTrained {
+                    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))?;
+                    let cache = self.code_cache.unwrap_or(Path::new(""));
+                    (self.check)(&tmp).with_context(|| {
+                        format!("checking {}; delete it to train again", cache.display())
+                    })?;
+                }
             }
             Backend::SeaSnapshot => {
                 let root = self.cache.join(&hash);
@@ -319,6 +372,10 @@ pub fn install(from: &Path, to: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn no_check(_: &Path) -> Result<()> {
+        unreachable!("only sea_trained checks its code cache")
+    }
 
     fn touch(root: &Path, rel: &str) {
         let path = root.join(rel);
@@ -417,7 +474,9 @@ mod tests {
             setup: &json!({ "pi": "fingerprint" }),
             output: &output,
             v8_flags: &[],
+            code_cache: None,
             node: &node,
+            check: &no_check,
         }
         .run()
         .unwrap();
@@ -466,7 +525,9 @@ mod tests {
             setup: &json!(null),
             output: &output,
             v8_flags: &["--perf-basic-prof"],
+            code_cache: None,
             node: &node,
+            check: &no_check,
         }
         .run()
         .unwrap();
@@ -476,6 +537,63 @@ mod tests {
             ["--random-seed=1", "--perf-basic-prof", "--build-sea"]
         );
         assert_eq!(exec_argv, json!(["--perf-basic-prof"]));
+    }
+
+    fn trained_build(output: &Path, check: Check) -> Result<serde_json::Value> {
+        let dir = staged_with_workers();
+        let seen = std::cell::RefCell::new(json!(null));
+        let node = |args: &[&std::ffi::OsStr], _: Env| -> Result<()> {
+            let config: serde_json::Value =
+                serde_json::from_slice(&fs::read(args.last().unwrap())?)?;
+            fs::write(config["output"].as_str().unwrap(), "new")?;
+            *seen.borrow_mut() = config;
+            Ok(())
+        };
+        Builder {
+            stage: dir.path(),
+            bundle: Path::new("/b"),
+            backend: Backend::SeaTrained,
+            cache: Path::new("/unused"),
+            version: "v",
+            setup: &json!(null),
+            output,
+            v8_flags: &[],
+            code_cache: Some(Path::new("/t/cache.bin")),
+            node: &node,
+            check,
+        }
+        .run()?;
+        Ok(seen.into_inner())
+    }
+
+    #[test]
+    fn a_trained_build_ships_the_bundle_and_its_cache_and_checks_the_cache() {
+        let out = tempfile::tempdir().unwrap();
+        let output = out.path().join("pi");
+        let checked = std::cell::RefCell::new(vec![]);
+        let config = trained_build(&output, &|exe| {
+            checked.borrow_mut().push(fs::read_to_string(exe)?);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(checked.into_inner(), ["new"]);
+        assert_eq!(fs::read_to_string(&output).unwrap(), "new");
+        assert_eq!(config["main"], "/b/loader.cjs");
+        assert_eq!(config["mainFormat"], json!(null));
+        assert_eq!(config["useCodeCache"], true);
+        assert_eq!(config["assets"]["bundle.cjs"], "/b/main.cjs");
+        assert_eq!(config["assets"]["cache.bin"], "/t/cache.bin");
+    }
+
+    #[test]
+    fn a_rejected_trained_cache_keeps_the_old_output() {
+        let out = tempfile::tempdir().unwrap();
+        let output = out.path().join("pi");
+        fs::write(&output, "old").unwrap();
+        let err = trained_build(&output, &|_| bail!("rejected")).unwrap_err();
+        assert!(format!("{err:#}").contains("/t/cache.bin"), "{err:#}");
+        assert_eq!(fs::read_to_string(&output).unwrap(), "old");
+        assert_eq!(fs::read_dir(out.path()).unwrap().count(), 1);
     }
 
     #[test]
@@ -493,7 +611,9 @@ mod tests {
             setup: &json!(null),
             output: &output,
             v8_flags: &[],
+            code_cache: None,
             node: &|_, _| bail!("node broke"),
+            check: &no_check,
         }
         .run()
         .unwrap_err();
@@ -516,7 +636,9 @@ mod tests {
             setup: &json!(null),
             output: &output,
             v8_flags: &[],
+            code_cache: None,
             node: &|_, _| bail!("node broke"),
+            check: &no_check,
         }
         .run()
         .unwrap_err();
@@ -581,7 +703,9 @@ mod tests {
             setup: &serde_json::Value::Null,
             output,
             v8_flags: &[],
+            code_cache: None,
             node,
+            check: &no_check,
         }
     }
 

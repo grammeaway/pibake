@@ -272,6 +272,7 @@ const result = await esbuild.build({
 	// would otherwise be, and run every `if (import.meta.main)` self-check.
 	define: { PI_BUNDLED_NODE: "true", "import.meta.main": "false" },
 	banner: { js: config.prologue },
+	footer: config.footer ? { js: config.footer } : undefined,
 	plugins: [plugin],
 }).catch((e) => ({ errors: e.errors ?? [{ text: String(e) }], warnings: e.warnings ?? [], metafile: null }));
 // Without the stand-in the bundle would still work, transpiling every extension from disk.

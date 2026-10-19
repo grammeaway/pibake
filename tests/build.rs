@@ -478,3 +478,75 @@ fn e2e_build_a_fixture_setup_as_a_snapshot() {
         "pi-test: built from an older setup (extensions/located.js edited); run pibake install\n"
     );
 }
+
+/// The fixture setup as a `sea_trained` executable: its code cache is trained once per bundle,
+/// so a rebuild is byte for byte; the executable runs without `node` and matches stock Pi; and a
+/// cache V8 rejects fails the build, keeping the old executable.
+#[test]
+fn e2e_build_a_fixture_setup_trained() {
+    if !e2e_enabled() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (_, project) = fixture_setup(root.path(), "backend = \"sea_trained\"\n");
+    let cache = root.path().join("cache");
+    let env = [("XDG_CACHE_HOME", cache.as_os_str())];
+    let stdout = pibake_with(&project, &["build"], &env, true);
+    let bin = project.join("target/pibake/bin/pi-test");
+    assert!(
+        stdout.contains(&format!("built {}", bin.display())),
+        "{stdout}"
+    );
+    assert!(bundled_launcher(&stdout).ends_with("pi.cjs"), "{stdout}");
+    let trained = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("trained code cache: "))
+        .unwrap_or_else(|| panic!("no training in:\n{stdout}"));
+    let trained = PathBuf::from(trained);
+    assert!(fs::metadata(&trained).unwrap().len() > 0);
+
+    let home = root.path().join("home");
+    let version = run_bare(&bin, &home, &["--version"]);
+    assert!(String::from_utf8_lossy(&version.stdout).contains(" (pibake "));
+    let checked = Command::new(&bin)
+        .env_clear()
+        .env("PIBAKE_CACHE_CHECK", "1")
+        .status()
+        .unwrap();
+    assert_eq!(checked.code(), Some(0));
+    let verify = pibake_with(
+        &project,
+        &["verify", "--pi", bin.to_str().unwrap(), "--against", "pi"],
+        &env,
+        true,
+    );
+    assert!(verify.starts_with("same: "), "{verify}");
+
+    let built = fs::read(&bin).unwrap();
+    let again = pibake_with(&project, &["build"], &env, true);
+    assert!(
+        again.contains(&format!(
+            "trained code cache up to date: {}",
+            trained.display()
+        )),
+        "{again}"
+    );
+    assert!(fs::read(&bin).unwrap() == built, "the rebuild differs");
+
+    let mut broken = fs::read(&trained).unwrap();
+    broken[..8].copy_from_slice(b"XXXXXXXX");
+    fs::write(&trained, broken).unwrap();
+    let failed = Command::new(env!("CARGO_BIN_EXE_pibake"))
+        .arg("build")
+        .envs(env)
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(!failed.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("V8 rejected the trained code cache"),
+        "{stderr}"
+    );
+    assert!(fs::read(&bin).unwrap() == built);
+}

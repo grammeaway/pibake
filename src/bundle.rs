@@ -1,5 +1,6 @@
-//! `pibake bundle`: Pi and every extension entry point of the stage in one file: an ES module, or
-//! for the `sea_snapshot` backend a CommonJS script that defers launch state to its resume.
+//! `pibake bundle`: Pi and every extension entry point of the stage in one file: an ES module; for
+//! the `sea_snapshot` backend a CommonJS script that defers launch state to its resume; for
+//! `sea_trained` CommonJS wrapped in one function expression, which a loader compiles and calls.
 //!
 //! Pi's own extension loader still decides what loads, from where and in what order. The bundle
 //! only answers its jiti imports for the baked entry points (see `bundle/build.mjs`), so filters,
@@ -30,6 +31,18 @@ pub const REPORT: &str = "report.json";
 const BUILD_SCRIPT: &str = include_str!("bundle/build.mjs");
 const PROLOGUE: &str = include_str!("bundle/prologue.mjs");
 const PROLOGUE_SNAPSHOT: &str = include_str!("bundle/prologue_snapshot.cjs");
+const PROLOGUE_TRAINED: &str = include_str!("bundle/prologue_trained.cjs");
+/// `sea_trained`'s plain-`node` launcher.
+const LAUNCHER_TRAINED: &str = include_str!("bundle/pi.cjs");
+/// `sea_trained`'s executable main, in the bundle so its path, which the executable embeds, is
+/// stable.
+const LOADER: (&str, &str) = ("loader.cjs", include_str!("bundle/loader_trained.cjs"));
+/// Around a `sea_trained` bundle: the module wrapper as a function expression, so a loader can
+/// compile the bundle text as it is, with a code cache, without a 20 MB concatenation.
+const WRAPPER: (&str, &str) = (
+    "(function (exports, require, module, __filename, __dirname) {\n",
+    "\n})",
+);
 /// Both prologues' extraction of an executable's files, spliced in at `// pibake:extract`.
 const EXTRACT: &str = include_str!("bundle/extract.js");
 /// `pibake:staleness`: the entry's check of the setup an executable was built from.
@@ -271,6 +284,10 @@ struct Flavor {
     main: &'static str,
     entry: &'static str,
     prologue: &'static str,
+    /// What `node` runs, and its text, if not `main`.
+    launcher: Option<(&'static str, &'static str)>,
+    /// The executable's main, and its text, if not `main`; it runs `main` wrapped in `WRAPPER`.
+    loader: Option<(&'static str, &'static str)>,
 }
 
 fn flavor(backend: Backend) -> Flavor {
@@ -280,12 +297,24 @@ fn flavor(backend: Backend) -> Flavor {
             main: "main.mjs",
             entry: ENTRY,
             prologue: PROLOGUE,
+            launcher: Some((LAUNCHER, LAUNCHER_TEXT)),
+            loader: None,
         },
         Backend::SeaSnapshot => Flavor {
             format: "cjs",
             main: "main.cjs",
             entry: ENTRY_SNAPSHOT,
             prologue: PROLOGUE_SNAPSHOT,
+            launcher: None,
+            loader: None,
+        },
+        Backend::SeaTrained => Flavor {
+            format: "cjs",
+            main: "main.cjs",
+            entry: ENTRY,
+            prologue: PROLOGUE_TRAINED,
+            launcher: Some(("pi.cjs", LAUNCHER_TRAINED)),
+            loader: Some(LOADER),
         },
     }
 }
@@ -295,19 +324,31 @@ pub fn main_file(backend: Backend) -> &'static str {
     flavor(backend).main
 }
 
-/// What `node` runs: the launcher of an ES module bundle, or a CommonJS bundle itself.
-pub fn launcher(backend: Backend) -> &'static str {
-    match backend {
-        Backend::SeaCodecache => LAUNCHER,
-        Backend::SeaSnapshot => main_file(backend),
-    }
+/// The executable's main: a loader of the main file, or the main file itself.
+pub fn sea_main(backend: Backend) -> &'static str {
+    let flavor = flavor(backend);
+    flavor.loader.map_or(flavor.main, |(name, _)| name)
 }
 
-fn prologue(text: &str, stage: &Path) -> String {
-    text.replace("// pibake:extract\n", EXTRACT).replace(
-        r#""__PIBAKE_STAGE__""#,
-        &js_string(&stage.to_string_lossy()),
-    )
+/// What `node` runs: a launcher, or a snapshot's CommonJS bundle itself.
+pub fn launcher(backend: Backend) -> &'static str {
+    let flavor = flavor(backend);
+    flavor.launcher.map_or(flavor.main, |(name, _)| name)
+}
+
+fn prologue(flavor: &Flavor, stage: &Path) -> String {
+    let text = flavor
+        .prologue
+        .replace("// pibake:extract\n", EXTRACT)
+        .replace(
+            r#""__PIBAKE_STAGE__""#,
+            &js_string(&stage.to_string_lossy()),
+        );
+    if flavor.loader.is_some() {
+        format!("{}{text}", WRAPPER.0)
+    } else {
+        text
+    }
 }
 
 fn js_string(s: &str) -> String {
@@ -370,6 +411,9 @@ pub struct BuildConfig {
     pub entry: String,
     /// The bundle's first code: where it is (the stage, or extracted files in an executable).
     pub prologue: String,
+    /// The bundle's last code, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub footer: Option<&'static str>,
     /// The module `pibake:staleness`.
     pub staleness: String,
     /// The module `pibake:frozen`.
@@ -707,8 +751,13 @@ impl Bundler<'_> {
             ("build.mjs", BUILD_SCRIPT.as_bytes()),
             ("format", flavor.format.as_bytes()),
             ("entry", flavor.entry.as_bytes()),
-            ("launcher", LAUNCHER_TEXT.as_bytes()),
+            (
+                "launcher",
+                flavor.launcher.map_or("", |(_, t)| t).as_bytes(),
+            ),
             ("prologue", flavor.prologue.as_bytes()),
+            ("loader", flavor.loader.map_or("", |(_, t)| t).as_bytes()),
+            ("wrapper", [WRAPPER.0, WRAPPER.1].concat().as_bytes()),
             ("extract", EXTRACT.as_bytes()),
             ("lazy", serde_json::to_string(&lazy)?.as_bytes()),
             ("staleness", STALENESS.as_bytes()),
@@ -725,7 +774,8 @@ impl Bundler<'_> {
                 stage: plan.stage.clone(),
                 pi_dir: pi_dir.clone(),
                 entry: flavor.entry.to_owned(),
-                prologue: prologue(flavor.prologue, &plan.stage),
+                prologue: prologue(&flavor, &plan.stage),
+                footer: flavor.loader.map(|_| WRAPPER.1),
                 staleness: STALENESS.to_owned(),
                 frozen: frozen.clone(),
                 tool_json: TOOL_JSON.to_owned(),
@@ -773,8 +823,8 @@ impl Bundler<'_> {
                     .passes
                     .push(ascii_bundle(&dir.join(flavor.main), &flavor)?);
             }
-            if self.backend == Backend::SeaCodecache {
-                fs::write(dir.join(LAUNCHER), LAUNCHER_TEXT)?;
+            for (name, text) in flavor.launcher.into_iter().chain(flavor.loader) {
+                fs::write(dir.join(name), text)?;
             }
             fs::write(dir.join("entry.mjs"), flavor.entry)?;
             fs::write(dir.join("baked.mjs"), baked_module(&kept))?;

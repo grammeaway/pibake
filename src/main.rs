@@ -5,9 +5,10 @@ use std::process::ExitCode;
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use pibake::bench::{self, Bench};
+use pibake::config::{Backend, Config};
 use pibake::fake_provider::FakeProvider;
 use pibake::harness::PiCommand;
-use pibake::{bundle, config::Config, inventory, lock, paths, sea, snapshot, stage, staleness};
+use pibake::{bundle, inventory, lock, paths, sea, snapshot, stage, staleness, train};
 
 #[derive(Parser)]
 #[command(version, about = "Build a Pi agent directory into one executable")]
@@ -172,6 +173,29 @@ fn run_build(
         (config.name.clone(), &[][..])
     };
     let output = config.dir.join(sea::BIN_ROOT).join(name);
+    let code_cache = if config.backend == Backend::SeaTrained {
+        let trainer = train::Trainer {
+            root: &config.dir.join(train::TRAIN_ROOT),
+            bundle: &bundle_dir,
+            node_version: &host.node_version,
+            v8_flags,
+            source: &config.agent_dir,
+            real_home: home,
+        };
+        eprintln!("build: training the code cache");
+        Some(match trainer.run(&mut |step| eprintln!("{step}"))? {
+            stage::Outcome::Cached(cache) => {
+                writeln!(out, "trained code cache up to date: {}", cache.display())?;
+                cache
+            }
+            stage::Outcome::Built(cache) => {
+                writeln!(out, "trained code cache: {}", cache.display())?;
+                cache
+            }
+        })
+    } else {
+        None
+    };
     eprintln!("build: node --build-sea");
     let kept = sea::Builder {
         stage: &stage_dir,
@@ -182,7 +206,9 @@ fn run_build(
         setup: &setup,
         output: &output,
         v8_flags,
+        code_cache: code_cache.as_deref(),
         node: &sea::run_node,
+        check: &sea::check_code_cache,
     }
     .run()?;
     for k in kept {

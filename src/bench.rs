@@ -210,7 +210,7 @@ impl Bench<'_> {
     }
 
     /// Time from spawn until the `get_state` response, plus the whole process's usage.
-    fn startup(
+    pub(crate) fn startup(
         &self,
         pi: &PiCommand,
         provider: &FakeProvider,
@@ -263,7 +263,7 @@ impl Bench<'_> {
     /// Interactive startup in a pty, run to its end by `PI_STARTUP_BENCHMARK=1`: time from spawn to
     /// the first frame and to the last one before teardown (`init()`'s closing `renderNow()`), plus
     /// the whole process's usage. Fails unless a frame came and the screen showed the fake model.
-    fn interactive(
+    pub(crate) fn interactive(
         &self,
         pi: &PiCommand,
         provider: &FakeProvider,
@@ -310,7 +310,7 @@ impl Bench<'_> {
     }
 
     /// `-p` with the `big_write` script; checks the written file.
-    fn big_write(
+    pub(crate) fn big_write(
         &self,
         pi: &PiCommand,
         provider: &FakeProvider,

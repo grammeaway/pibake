@@ -49,10 +49,10 @@ A third backend, `sea_trained`. It becomes the default only after step 6's owner
 
 ## Completion
 
-- [ ] `backend = "sea_trained"` builds, passes `verify`, and its acceptance check, on the live setup and the fixture.
-- [ ] A rebuild with an unchanged bundle reuses the training and is byte-identical.
-- [ ] Recorded bench in `bench_results/`.
-- [ ] `cargo fmt --check`, clippy and every test green, E2E included.
+- [x] `backend = "sea_trained"` builds, passes `verify`, and its acceptance check, on the live setup and the fixture.
+- [x] A rebuild with an unchanged bundle reuses the training and is byte-identical.
+- [x] Recorded bench in `bench_results/` (`2026-10-18_p4_trained.json`). **Deviation:** peak RSS +9 MiB against `sea_codecache`, and `sea_snapshot` leads on every startup metric (`progress.md` → p4).
+- [x] `cargo fmt --check`, clippy and every test green, E2E included.
 
 ## Non-goals
 

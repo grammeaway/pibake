@@ -150,6 +150,30 @@ Indicative, load ~1. Feeds the README's native-code verdicts, p7 and p8.
 - **Deviation: code-cache startup instructions rise 1.4 %** (plan: within 1 %), interactive 1.2 %; times do not rise (−7 and −9 ms). Profiled with official-node builds of the same lock (`perf record -e instructions:u`, `--help`): V8 reads an external one-byte source through a buffered stream that copies each chunk to UTF-16 (`CopyChars<unsigned char, unsigned short>`, +11 M), where it reads a two-byte one in place. On the official build the net is −0.4 % on `--help`; on Arch's build +0.6 %. The cost is per lazily compiled function, so p4's trained cache should remove most of it.
 - An empty `HOME` makes the code-cache executable fail at launch: its prologue extracts to the relative `.cache/pibake/…`, and `createRequire` rejects the relative path. Stock Pi starts. Found by accident while profiling; not fixed here.
 
+## p4: trained code cache (2026-10-18)
+
+**Recorded** on an idle machine (owner): `bench --runs 20 --perf-stat --big-write-kib 200 --record p4_trained`, live setup, one lock (`target/p4/`, not committed). `untrained` is the `sea_trained` executable with a cache made right after compiling, as `--build-sea` does: step 1's parity check. Training (three runs) takes ~10 s of a build; the cache grows from 2.5 to 7.6 MB.
+
+| | stock | `sea_codecache` | `sea_snapshot` | untrained | `sea_trained` |
+|---|---|---|---|---|---|
+| RPC startup | 2618 ms | 461 | **291** | 452 | 343 |
+| ready | 2692 ms | 512 | **360** | 508 | 385 |
+| startup_minstr | 20379 | 2955 | **1813** | 2867 | 2369 |
+| interactive_minstr | 20751 | 3260 | **2349** | 3169 | 2594 |
+| big write | 47493 ms | 886 | **735** | 878 | 738 |
+| big_write_minstr | 537390 | 5937 | **4815** | 5813 | 5189 |
+| startup peak RSS | 364.7 MiB | 169.3 | **160.6** | 169.8 | 178.2 |
+| interactive peak RSS | 378.1 | 179.6 | **174.2** | 180.4 | 187.8 |
+| big write peak RSS | 697.2 | 215.8 | **212.4** | 216.1 | 228.6 |
+
+- **The training works as planned.** Against `sea_codecache`: startup_minstr −20 % (plan −20), ready −25 % (plan −25), RPC startup −26 %, big write −17 %. Untrained is at parity (−3 % instructions), so the gain is the training's.
+- **Deviation: memory rises 8–13 MiB** (plan: 170 against 181 MiB, from the pre-p3 probe). Untrained is at parity, so it scales with the cache: V8 materialises every function in it at launch, used by this launch or not, and the 7.6 MB asset's pages are touched.
+- **The snapshot now leads on every startup metric and on memory**: against `sea_trained`, −15 % RPC startup, −7 % ready, −23 % startup instructions, −18 MiB. The probe ranked trained ahead on ready (368 against 386 ms); p3 has since cut the snapshot's memory by 52 MiB and its startup by 23 ms. The big write is a tie.
+- **Coverage (step 4):** chaining a `--help` run onto the trained cache adds 27 KB (+0.4 %); three more runs under `PI_TIMING=1` add 11 KB (+0.1 %). Training keeps the three runs.
+- **Rebuilds are byte-identical** once the loader lives in the bundle directory: the executable embeds its main's path, and a temporary directory differed per build.
+- O4 (owner): training runs extensions at build time only behind the opt-in `backend = "sea_trained"`, never by default.
+- O3 (owner, on these numbers): `sea_codecache` stays the default; `sea_snapshot` and `sea_trained` stay as opt-ins.
+
 ## Found
 
 - **Two caches never meet.** A runtime-flag mismatch silently drops the code cache (V8's flag hash). Users who set `NODE_OPTIONS` with a V8 flag get the slow path with no message. p4's loader can see `cachedDataRejected`.

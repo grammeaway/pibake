@@ -41,7 +41,7 @@ On the default backend:
 **Why this order:**
 
 - p3 comes first: it is small, it helps both existing backends, and p4's memory numbers assume it.
-- p4 is the largest lever and changes the default backend, so p5 and p6 are measured on top of it.
+- p4 is the largest lever; p5 and p6 are measured on top of the default `sea_codecache` and on `sea_trained` (O3, O4: `progress.md` → p4).
 - p5 and p6 don't depend on each other.
 - p7 and p8 are about a session, not startup, and are independent of p3 to p6. p8 needs p7's `long_answer` number.
 
@@ -51,8 +51,6 @@ p1 and p2 are implemented but not committed; their recorded bench (p1 step 5) ca
 
 | # | Call | Needed by |
 |---|---|---|
-| O3 | After p4's recorded bench: make `sea_trained` the default, and whether `sea_snapshot` stays (opt-in, with its build-time rules and +40 MiB) or goes | p4 step 6 |
-| O4 | p4's training runs the setup's extensions (their load and `session_start`) at build time, in the harness's throwaway home, offline, as `verify` and `bench` already do. OK for `build`? | p4 step 2 |
 | O5 | p5 and the pi-tui part of p6: pibake passes, or upstream PRs to Pi that stock Pi benefits from too (as O1 for l11) | p5 step 2, p6 step 1 |
 | O6 | p8: a pibake pass, or an upstream PR to pi-tui | p8 step 2 |
 
