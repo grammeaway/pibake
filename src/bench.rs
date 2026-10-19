@@ -12,12 +12,21 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use serde_json::json;
 
-use crate::fake_provider::{self, BIG_WRITE_PATH, FakeProvider, PROVIDER, Script};
+use crate::fake_provider::{
+    self, BIG_WRITE_PATH, DONE_TEXT, FakeProvider, LONG_ANSWER_END, PROVIDER, SESSION_FILE,
+    SESSION_FILE_BYTES, SESSION_TURN_END, Script, UNEXPECTED_TEXT,
+};
 use crate::harness::{Harness, PiCommand};
 use crate::process::{self, Supervised, Usage};
 
 const TIMEOUT: Duration = Duration::from_secs(300);
 const BIG_WRITE_PROMPT: &str = "Write the file.";
+const LONG_ANSWER_PROMPT: &str = "Answer at length.";
+const BIG_OUTPUT_PROMPT: &str = "Print the numbers.";
+const SESSION_PROMPT: &str = "Read the file, then answer.";
+const SESSION_TURNS: usize = 40;
+/// Exits Pi from an empty editor.
+const CTRL_D: &[u8] = b"\x04";
 /// A VT220's answer to DA1, as a real terminal gives it within a millisecond; without it, Pi
 /// waits 100 ms for its colour query.
 const DA1_REPLY: &[u8] = b"\x1b[?62c";
@@ -26,22 +35,96 @@ const DA1_REPLY: &[u8] = b"\x1b[?62c";
 const PERF_STAT_FILE: &str = "perf_stat.csv";
 const PERF_STAT_EVENT: &str = "instructions:u";
 
-/// `*_minstr`: millions of user-space instructions, with `--perf-stat`.
-pub const METRICS: [&str; 13] = [
-    "startup_ms",
-    "startup_cpu_ms",
-    "startup_peak_rss_mib",
-    "startup_minstr",
-    "first_paint_ms",
-    "ready_ms",
-    "interactive_cpu_ms",
-    "interactive_peak_rss_mib",
-    "interactive_minstr",
-    "big_write_wall_ms",
-    "big_write_cpu_ms",
-    "big_write_peak_rss_mib",
-    "big_write_minstr",
-];
+/// What `bench` measures; each run checks its own end state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+#[value(rename_all = "snake_case")]
+pub enum Scenario {
+    /// RPC startup, until the `get_state` response.
+    Startup,
+    /// Interactive startup in a pty, run to its end by `PI_STARTUP_BENCHMARK=1`.
+    Interactive,
+    /// `-p`: a streamed write of `--big-write-kib`.
+    BigWrite,
+    /// pty: a 20 KiB Markdown answer, paced.
+    LongAnswer,
+    /// pty: the `big_write` turn in the TUI.
+    TuiWrite,
+    /// pty: a `bash` call printing 8 MiB.
+    BigOutput,
+    /// RPC, session kept: 40 turns, each reading a 16 KiB file and answering 2 KiB.
+    LongSession,
+}
+
+impl Scenario {
+    pub const ALL: [Scenario; 7] = [
+        Scenario::Startup,
+        Scenario::Interactive,
+        Scenario::BigWrite,
+        Scenario::LongAnswer,
+        Scenario::TuiWrite,
+        Scenario::BigOutput,
+        Scenario::LongSession,
+    ];
+
+    /// `*_minstr`: millions of user-space instructions, with `--perf-stat`.
+    pub fn metrics(self) -> &'static [&'static str] {
+        match self {
+            Scenario::Startup => &[
+                "startup_ms",
+                "startup_cpu_ms",
+                "startup_peak_rss_mib",
+                "startup_minstr",
+            ],
+            Scenario::Interactive => &[
+                "first_paint_ms",
+                "ready_ms",
+                "interactive_cpu_ms",
+                "interactive_peak_rss_mib",
+                "interactive_minstr",
+            ],
+            Scenario::BigWrite => &[
+                "big_write_wall_ms",
+                "big_write_cpu_ms",
+                "big_write_peak_rss_mib",
+                "big_write_minstr",
+            ],
+            Scenario::LongAnswer => &[
+                "long_answer_cpu_ms",
+                "long_answer_peak_rss_mib",
+                "long_answer_minstr",
+            ],
+            Scenario::TuiWrite => &[
+                "tui_write_cpu_ms",
+                "tui_write_peak_rss_mib",
+                "tui_write_minstr",
+            ],
+            Scenario::BigOutput => &[
+                "big_output_cpu_ms",
+                "big_output_peak_rss_mib",
+                "big_output_minstr",
+            ],
+            Scenario::LongSession => &[
+                "session_early_turn_cpu_ms",
+                "session_late_turn_cpu_ms",
+                "session_end_rss_mib",
+                "session_peak_rss_mib",
+                "session_minstr",
+            ],
+        }
+    }
+
+    fn writes(self) -> bool {
+        matches!(self, Scenario::BigWrite | Scenario::TuiWrite)
+    }
+}
+
+/// Every metric, in table order.
+pub fn metrics() -> impl Iterator<Item = &'static str> {
+    Scenario::ALL
+        .into_iter()
+        .flat_map(|s| s.metrics().iter().copied())
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Summary {
@@ -93,6 +176,8 @@ pub struct Series {
 pub struct Bench<'a> {
     pub commands: &'a [PiCommand],
     pub runs: usize,
+    pub scenarios: &'a [Scenario],
+    /// 0 skips both writes.
     pub big_write_bytes: usize,
     pub source: &'a Path,
     pub real_home: &'a Path,
@@ -101,9 +186,10 @@ pub struct Bench<'a> {
 }
 
 impl Bench<'_> {
-    /// One discarded warm-up round, then `runs` rounds. Each round rotates which command goes first.
+    /// One discarded warm-up round, then `runs` rounds. Each round runs the scenarios in turn, and
+    /// rotates which command goes first.
     pub fn run(&self, mut progress: impl FnMut(&str)) -> Result<Vec<CommandResult>> {
-        let provider = FakeProvider::with_big_write(self.big_write_bytes)?;
+        let provider = FakeProvider::unrecorded(self.big_write_bytes)?;
         let content = fake_provider::big_write_content(self.big_write_bytes);
         let mut samples: Vec<BTreeMap<&'static str, Vec<f64>>> =
             vec![BTreeMap::new(); self.commands.len()];
@@ -116,41 +202,25 @@ impl Bench<'_> {
             let order: Vec<usize> = (0..self.commands.len())
                 .map(|i| (i + round) % self.commands.len())
                 .collect();
-            let mut record = |i: usize, name: &'static str, value: Option<f64>| {
-                if let (true, Some(value)) = (round > 0, value) {
-                    samples[i].entry(name).or_default().push(value);
+            for &scenario in self.scenarios {
+                if scenario.writes() && self.big_write_bytes == 0 {
+                    continue;
                 }
-            };
-            for &i in &order {
-                let (ready, usage, minstr) = self.startup(&self.commands[i], &provider)?;
-                record(i, "startup_ms", ms(ready));
-                record(i, "startup_cpu_ms", ms(usage.cpu()));
-                record(i, "startup_peak_rss_mib", mib(usage.max_rss_kib));
-                record(i, "startup_minstr", minstr);
-            }
-            for &i in &order {
-                let (first_paint, ready, usage, minstr) =
-                    self.interactive(&self.commands[i], &provider)?;
-                record(i, "first_paint_ms", ms(first_paint));
-                record(i, "ready_ms", ms(ready));
-                record(i, "interactive_cpu_ms", ms(usage.cpu()));
-                record(i, "interactive_peak_rss_mib", mib(usage.max_rss_kib));
-                record(i, "interactive_minstr", minstr);
-            }
-            for &i in order.iter().filter(|_| self.big_write_bytes > 0) {
-                let (usage, minstr) = self.big_write(&self.commands[i], &provider, &content)?;
-                record(i, "big_write_wall_ms", ms(usage.wall));
-                record(i, "big_write_cpu_ms", ms(usage.cpu()));
-                record(i, "big_write_peak_rss_mib", mib(usage.max_rss_kib));
-                record(i, "big_write_minstr", minstr);
+                for &i in &order {
+                    let values = self.measure(scenario, &self.commands[i], &provider, &content)?;
+                    for (name, value) in scenario.metrics().iter().zip(values) {
+                        if let (true, Some(value)) = (round > 0, value) {
+                            samples[i].entry(name).or_default().push(value);
+                        }
+                    }
+                }
             }
         }
         self.commands
             .iter()
             .zip(samples)
             .map(|(pi, mut by_metric)| {
-                let metrics = METRICS
-                    .into_iter()
+                let metrics = metrics()
                     .map(|m| {
                         let samples = by_metric.remove(m).unwrap_or_default();
                         (
@@ -169,6 +239,60 @@ impl Bench<'_> {
                 })
             })
             .collect()
+    }
+
+    /// One run of `scenario`: a value per `scenario.metrics()`, in order.
+    fn measure(
+        &self,
+        scenario: Scenario,
+        pi: &PiCommand,
+        provider: &FakeProvider,
+        content: &str,
+    ) -> Result<Vec<Option<f64>>> {
+        Ok(match scenario {
+            Scenario::Startup => {
+                let (ready, usage, minstr) = self.startup(pi, provider)?;
+                vec![ms(ready), ms(usage.cpu()), mib(usage.max_rss_kib), minstr]
+            }
+            Scenario::Interactive => {
+                let (first_paint, ready, usage, minstr) = self.interactive(pi, provider)?;
+                vec![
+                    ms(first_paint),
+                    ms(ready),
+                    ms(usage.cpu()),
+                    mib(usage.max_rss_kib),
+                    minstr,
+                ]
+            }
+            Scenario::BigWrite => {
+                let (usage, minstr) = self.big_write(pi, provider, content)?;
+                vec![
+                    ms(usage.wall),
+                    ms(usage.cpu()),
+                    mib(usage.max_rss_kib),
+                    minstr,
+                ]
+            }
+            Scenario::LongAnswer | Scenario::TuiWrite | Scenario::BigOutput => {
+                let (usage, minstr) =
+                    self.tui_turn(pi, provider, scenario, |harness| match scenario {
+                        Scenario::TuiWrite => check_written(harness, content),
+                        _ => Ok(()),
+                    })?;
+                vec![ms(usage.cpu()), mib(usage.max_rss_kib), minstr]
+            }
+            Scenario::LongSession => {
+                let session = self.long_session(pi, provider)?;
+                let (early, late) = turn_medians(&session.turn_cpu);
+                vec![
+                    early,
+                    late,
+                    mib(session.end_rss_kib),
+                    mib(session.peak_rss_kib),
+                    session.minstr,
+                ]
+            }
+        })
     }
 
     fn harness(&self, provider: &FakeProvider) -> Result<Harness> {
@@ -260,6 +384,35 @@ impl Bench<'_> {
         })
     }
 
+    /// `pi` in a 120x40 pty with `args`. With `until`, the reader quits Pi with Ctrl+D once the
+    /// screen shows that text or the fake provider's unexpected reply. Fails unless Pi exits 0.
+    fn pty_run(
+        &self,
+        harness: &Harness,
+        pi: &PiCommand,
+        log: &str,
+        args: &[&str],
+        until: Option<&'static str>,
+    ) -> Result<(Screen, Usage, Option<f64>)> {
+        let (master, tty) = process::openpty(120, 40)?;
+        let mut cmd = self.command(harness, pi, log)?;
+        cmd.args(args).env("TERM", "xterm-256color");
+        if until.is_none() {
+            cmd.env("PI_STARTUP_BENCHMARK", "1");
+        }
+        let run = Supervised::spawn_in_pty(cmd, tty, TIMEOUT)?;
+        let started = run.started;
+        let reader = std::thread::spawn(move || read_screen(master, started, until));
+        let (status, usage) = run.wait()?;
+        let screen = reader
+            .join()
+            .map_err(|_| anyhow!("the pty reader panicked"))??;
+        if !status.success() {
+            bail!("exited with {status}");
+        }
+        Ok((screen, usage, self.minstr(harness)?))
+    }
+
     /// Interactive startup in a pty, run to its end by `PI_STARTUP_BENCHMARK=1`: time from spawn to
     /// the first frame and to the last one before teardown (`init()`'s closing `renderNow()`), plus
     /// the whole process's usage. Fails unless a frame came and the screen showed the fake model.
@@ -272,37 +425,164 @@ impl Bench<'_> {
         let log = "interactive.log";
         let model = Script::Hello.model_id();
         let run = || -> Result<(Duration, Duration, Usage, Option<f64>)> {
-            let (master, tty) = process::openpty(120, 40)?;
-            let mut cmd = self.command(&harness, pi, log)?;
-            cmd.args(["--no-session", "--provider", PROVIDER, "--model", model])
-                .env("PI_STARTUP_BENCHMARK", "1")
-                .env("TERM", "xterm-256color");
-            let run = Supervised::spawn_in_pty(cmd, tty, TIMEOUT)?;
-            let started = run.started;
-            let reader = std::thread::spawn(move || read_screen(master, started));
-            let (status, usage) = run.wait()?;
-            let screen = reader
-                .join()
-                .map_err(|_| anyhow!("the pty reader panicked"))??;
-            if !status.success() {
-                bail!("exited with {status}");
-            }
+            let args = ["--no-session", "--provider", PROVIDER, "--model", model];
+            let (screen, usage, minstr) = self.pty_run(&harness, pi, log, &args, None)?;
             let (Some(&first_paint), Some(&ready)) = (screen.frames.first(), screen.frames.last())
             else {
                 bail!("no frame drawn");
             };
-            if !screen
-                .text
-                .windows(model.len())
-                .any(|w| w == model.as_bytes())
-            {
+            if screen.find(model).is_none() {
                 bail!("the screen never showed the model `{model}`");
             }
-            Ok((first_paint, ready, usage, self.minstr(&harness)?))
+            Ok((first_paint, ready, usage, minstr))
         };
         run().with_context(|| {
             format!(
                 "interactive startup of `{}`, stderr:\n{}",
+                pi.label,
+                harness.log_tail(log)
+            )
+        })
+    }
+
+    /// One prompt in the TUI, quit as a user would once its closing text is on screen; the
+    /// whole process's usage. `check` then looks at what the turn left in the harness.
+    pub(crate) fn tui_turn(
+        &self,
+        pi: &PiCommand,
+        provider: &FakeProvider,
+        scenario: Scenario,
+        check: impl FnOnce(&Harness) -> Result<()>,
+    ) -> Result<(Usage, Option<f64>)> {
+        let (script, prompt, end) = match scenario {
+            Scenario::LongAnswer => (Script::LongAnswer, LONG_ANSWER_PROMPT, LONG_ANSWER_END),
+            Scenario::TuiWrite => (Script::BigWrite, BIG_WRITE_PROMPT, DONE_TEXT),
+            Scenario::BigOutput => (Script::BigOutput, BIG_OUTPUT_PROMPT, DONE_TEXT),
+            _ => bail!("{scenario:?} is not a TUI turn"),
+        };
+        let harness = self.harness(provider)?;
+        let log = format!("{}.log", script.model_id());
+        let run = || -> Result<(Usage, Option<f64>)> {
+            let args = [
+                "--no-session",
+                "--provider",
+                PROVIDER,
+                "--model",
+                script.model_id(),
+                prompt,
+            ];
+            let (screen, usage, minstr) = self.pty_run(&harness, pi, &log, &args, Some(end))?;
+            if let Some(at) = screen.find(UNEXPECTED_TEXT) {
+                let reply = &screen.text[at..screen.text.len().min(at + 80)];
+                bail!(
+                    "the fake provider got an unexpected request: {}",
+                    String::from_utf8_lossy(reply)
+                );
+            }
+            if screen.find(end).is_none() {
+                bail!("the screen never showed `{end}`");
+            }
+            check(&harness)?;
+            Ok((usage, minstr))
+        };
+        run().with_context(|| {
+            format!(
+                "{scenario:?} of `{}`, stderr:\n{}",
+                pi.label,
+                harness.log_tail(&log)
+            )
+        })
+    }
+
+    /// `SESSION_TURNS` prompts over RPC, the session kept in the harness. Each turn's CPU is the
+    /// Pi process's, from sending the prompt to `agent_settled`; each must end in the scripted
+    /// answer.
+    pub(crate) fn long_session(&self, pi: &PiCommand, provider: &FakeProvider) -> Result<Session> {
+        let harness = self.harness(provider)?;
+        let log = "long_session.log";
+        let file = harness.cwd.join(SESSION_FILE);
+        std::fs::write(
+            &file,
+            fake_provider::session_file_content(SESSION_FILE_BYTES),
+        )
+        .with_context(|| format!("writing {}", file.display()))?;
+        let run = || -> Result<Session> {
+            let mut cmd = self.command(&harness, pi, log)?;
+            cmd.args(["--mode", "rpc", "--provider", PROVIDER])
+                .args(["--model", Script::LongSession.model_id()])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped());
+            let mut run = Supervised::spawn(cmd, TIMEOUT)?;
+            let mut stdin = run.child.stdin.take().context("no stdin")?;
+            let mut lines = BufReader::new(run.child.stdout.take().context("no stdout")?).lines();
+            let mut next = || -> Result<serde_json::Value> {
+                let line = lines.next().context("Pi exited mid-session")??;
+                serde_json::from_str(&line).with_context(|| format!("not JSON: {line}"))
+            };
+            writeln!(
+                stdin,
+                "{}",
+                json!({ "id": "pibake_state", "type": "get_state" })
+            )?;
+            while next()?["id"] != "pibake_state" {}
+            let pid = process::busiest_in_tree(run.child.id())?;
+            let mut turn_cpu = Vec::with_capacity(SESSION_TURNS);
+            // An extension may compact between turns (pi-observational-memory does, after
+            // `agent_settled`); Pi rejects a prompt meanwhile, so it is sent again afterwards.
+            let mut compacting = false;
+            for turn in 1..=SESSION_TURNS {
+                let id = format!("turn_{turn}");
+                let prompt = json!({ "id": id, "type": "prompt", "message": SESSION_PROMPT });
+                let before = process::cpu_time(pid)?;
+                writeln!(stdin, "{prompt}")?;
+                let (mut answered, mut settled, mut rejected) = (false, false, false);
+                while !settled || compacting || rejected {
+                    let event = next()?;
+                    match event["type"].as_str() {
+                        Some("compaction_start") => compacting = true,
+                        Some("compaction_end") => {
+                            compacting = false;
+                            if rejected {
+                                writeln!(stdin, "{prompt}")?;
+                                rejected = false;
+                            }
+                        }
+                        Some("response") if event["id"] == id && event["success"] != true => {
+                            if !compacting {
+                                bail!("turn {turn}: {event}");
+                            }
+                            rejected = true;
+                        }
+                        Some("message_end") if event["message"]["role"] == "assistant" => {
+                            answered |= fake_provider::content_text(&event["message"])
+                                .contains(SESSION_TURN_END);
+                        }
+                        Some("agent_settled") => settled = true,
+                        _ => {}
+                    }
+                }
+                turn_cpu.push(process::cpu_time(pid)? - before);
+                if !answered {
+                    bail!("turn {turn} settled without the scripted answer");
+                }
+            }
+            let (end_rss_kib, peak_rss_kib) = process::memory_kib(pid)?;
+            drop(stdin);
+            while next().is_ok() {}
+            let (status, _) = run.wait()?;
+            if !status.success() {
+                bail!("exited with {status}");
+            }
+            Ok(Session {
+                turn_cpu,
+                end_rss_kib,
+                peak_rss_kib,
+                minstr: self.minstr(&harness)?,
+            })
+        };
+        run().with_context(|| {
+            format!(
+                "long session of `{}`, stderr:\n{}",
                 pi.label,
                 harness.log_tail(log)
             )
@@ -326,17 +606,7 @@ impl Bench<'_> {
             if !status.success() {
                 bail!("exited with {status}");
             }
-            let path = harness.cwd.join(BIG_WRITE_PATH);
-            let written =
-                std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-            if written != content.as_bytes() {
-                bail!(
-                    "{} differs from the scripted content ({} bytes vs {})",
-                    path.display(),
-                    written.len(),
-                    content.len()
-                );
-            }
+            check_written(&harness, content)?;
             Ok((usage, self.minstr(&harness)?))
         };
         run().with_context(|| {
@@ -360,11 +630,53 @@ impl Bench<'_> {
     }
 }
 
-/// Drains the pty until nothing holds its terminal side any more, answering DA1 queries.
-fn read_screen(mut master: File, started: Instant) -> std::io::Result<Screen> {
+#[derive(Debug)]
+pub(crate) struct Session {
+    turn_cpu: Vec<Duration>,
+    /// `VmRSS` and `VmHWM` after the last turn.
+    end_rss_kib: u64,
+    peak_rss_kib: u64,
+    minstr: Option<f64>,
+}
+
+fn check_written(harness: &Harness, content: &str) -> Result<()> {
+    let path = harness.cwd.join(BIG_WRITE_PATH);
+    let written = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    if written != content.as_bytes() {
+        bail!(
+            "{} differs from the scripted content ({} bytes vs {})",
+            path.display(),
+            written.len(),
+            content.len()
+        );
+    }
+    Ok(())
+}
+
+/// The medians of turns 2-6 and 36-40 (1-based), in ms: early against late is the growth.
+fn turn_medians(turn_cpu: &[Duration]) -> (Option<f64>, Option<f64>) {
+    let median = |turns: std::ops::RangeInclusive<usize>| {
+        let ms: Vec<f64> = turns
+            .filter_map(|t| turn_cpu.get(t - 1))
+            .map(|d| d.as_secs_f64() * 1000.0)
+            .collect();
+        Summary::of(&ms).map(|s| s.median)
+    };
+    (median(2..=6), median(36..=40))
+}
+
+/// Drains the pty until nothing holds its terminal side any more, answering DA1 queries. With
+/// `until`, sends Ctrl+D once, when the drawn text first shows it or `UNEXPECTED_TEXT`.
+fn read_screen(
+    mut master: File,
+    started: Instant,
+    until: Option<&'static str>,
+) -> std::io::Result<Screen> {
     let mut reply = master.try_clone()?;
     let mut screen = Screen::default();
     let mut buf = [0; 64 * 1024];
+    let mut watch = until.map(|u| [u, UNEXPECTED_TEXT]);
+    let mut scanned: usize = 0;
     loop {
         let n = match master.read(&mut buf) {
             Ok(0) => break,
@@ -376,6 +688,16 @@ fn read_screen(mut master: File, started: Instant) -> std::io::Result<Screen> {
         };
         for _ in 0..screen.feed(&buf[..n], started.elapsed()) {
             reply.write_all(DA1_REPLY)?;
+        }
+        if let Some(texts) = watch {
+            // Only the new text, plus enough before it for a marker split across reads.
+            let longest = texts.iter().map(|t| t.len()).max().unwrap_or(0);
+            let from = scanned.saturating_sub(longest);
+            if texts.iter().any(|t| screen.find_from(from, t).is_some()) {
+                reply.write_all(CTRL_D)?;
+                watch = None;
+            }
+            scanned = screen.text.len();
         }
     }
     Ok(screen)
@@ -410,6 +732,19 @@ enum State {
 }
 
 impl Screen {
+    /// Where `needle` first starts in the drawn text.
+    pub fn find(&self, needle: &str) -> Option<usize> {
+        self.find_from(0, needle)
+    }
+
+    fn find_from(&self, from: usize, needle: &str) -> Option<usize> {
+        self.text
+            .get(from..)?
+            .windows(needle.len())
+            .position(|w| w == needle.as_bytes())
+            .map(|i| from + i)
+    }
+
     /// Feeds bytes read at `at`; returns how many DA1 queries (`CSI c`) they completed.
     pub fn feed(&mut self, bytes: &[u8], at: Duration) -> usize {
         let mut queries = 0;
@@ -499,14 +834,18 @@ fn mib(kib: u64) -> Option<f64> {
     Some(kib as f64 / 1024.0)
 }
 
-/// Medians with the interquartile range, one column per command.
+/// Medians with the interquartile range, one column per command; metrics no command has are
+/// left out.
 pub fn render_table(results: &[CommandResult]) -> String {
     let mut rows = vec![
         std::iter::once("metric".to_string())
             .chain(results.iter().map(|r| r.command.clone()))
             .collect::<Vec<_>>(),
     ];
-    for metric in METRICS {
+    for metric in metrics() {
+        if results.iter().all(|r| r.metrics[metric].summary.is_none()) {
+            continue;
+        }
         let cells = results.iter().map(|r| match &r.metrics[metric].summary {
             Some(s) => format!("{:.1} [{:.1}–{:.1}]", s.median, s.p25, s.p75),
             None => "-".to_string(),
@@ -533,8 +872,7 @@ pub fn render_table(results: &[CommandResult]) -> String {
 pub fn record(
     dir: &Path,
     label: &str,
-    runs: usize,
-    big_write_bytes: usize,
+    bench: &Bench,
     results: &[CommandResult],
 ) -> Result<PathBuf> {
     if label.is_empty()
@@ -562,8 +900,9 @@ pub fn record(
         "dirty": git(&["status", "--porcelain", "--untracked-files=no"]).map(|s| !s.is_empty()),
         "node_version": Command::new("node").arg("--version").output().ok()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()),
-        "runs": runs,
-        "big_write_bytes": big_write_bytes,
+        "runs": bench.runs,
+        "scenarios": bench.scenarios,
+        "big_write_bytes": bench.big_write_bytes,
         "delta_bytes": fake_provider::DELTA_BYTES,
         "results": results,
     });
@@ -617,6 +956,7 @@ mod tests {
         let bench = Bench {
             commands: &[],
             runs: 1,
+            scenarios: &[],
             big_write_bytes: fake_provider::BIG_WRITE_BYTES,
             source: &fixture,
             perf_stat: false,
@@ -693,26 +1033,12 @@ mod tests {
 
     #[test]
     fn interactive_runs_need_a_frame_showing_the_model() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/agent_dir");
-        let bench = Bench {
-            commands: &[],
-            runs: 1,
-            big_write_bytes: 0,
-            source: &fixture,
-            perf_stat: false,
-            real_home: dir.path(),
-        };
+        let bench = test_bench(&fixture, dir.path());
         let provider = FakeProvider::start().unwrap();
-        let run = |name: &str, body: &str| {
-            let script = dir.path().join(name);
-            std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-            let pi = PiCommand::parse(&script.to_string_lossy()).unwrap();
-            bench.interactive(&pi, &provider)
-        };
-        let frame = |text: &str| format!("printf '\\033[?2026h{text}\\033[?2026l'");
+        let run =
+            |name: &str, body: &str| bench.interactive(&fake_pi(dir.path(), name, body), &provider);
         let (first_paint, ready, _, _) = run(
             "ok",
             &format!("{}; sleep 0.1; {}", frame("hi"), frame("hello")),
@@ -725,6 +1051,159 @@ mod tests {
         assert!(err("failing", &format!("{}; exit 3", frame("hello"))).contains("exit status: 3"));
     }
 
+    fn test_bench<'a>(fixture: &'a Path, home: &'a Path) -> Bench<'a> {
+        Bench {
+            commands: &[],
+            runs: 1,
+            scenarios: &[],
+            big_write_bytes: 0,
+            source: fixture,
+            perf_stat: false,
+            real_home: home,
+        }
+    }
+
+    /// A shell script standing in for Pi.
+    fn fake_pi(dir: &Path, name: &str, body: &str) -> PiCommand {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join(name);
+        std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        PiCommand::parse(&script.to_string_lossy()).unwrap()
+    }
+
+    fn frame(text: &str) -> String {
+        format!("printf '\\033[?2026h{text}\\033[?2026l'")
+    }
+
+    #[test]
+    fn tui_turns_quit_with_ctrl_d_once_the_closing_text_shows() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/agent_dir");
+        let bench = test_bench(&fixture, dir.path());
+        let provider = FakeProvider::start().unwrap();
+        let run = |name: &str, body: &str| {
+            let pi = fake_pi(dir.path(), name, body);
+            bench.tui_turn(&pi, &provider, Scenario::BigOutput, |_| Ok(()))
+        };
+        // The canonical-mode pty turns Ctrl+D on an empty line into EOF; `read` then fails.
+        let wait_for_eof = "while read -r line; do :; done";
+        run(
+            "ok",
+            &format!("{}; {wait_for_eof}", frame("pibake-fake-done")),
+        )
+        .unwrap();
+        let split = "printf '\\033[?2026hpibake-fa'; sleep 0.05; printf 'ke-done\\033[?2026l'";
+        run("split", &format!("{split}; {wait_for_eof}")).unwrap();
+        let err = |name: &str, body: &str| format!("{:#}", run(name, body).unwrap_err());
+        assert!(err("early_exit", &frame("pibake")).contains("never showed `pibake-fake-done`"));
+        assert!(
+            err(
+                "unexpected",
+                &format!(
+                    "{}; {wait_for_eof}",
+                    frame("pibake-fake-unexpected: the output lacks")
+                )
+            )
+            .contains("unexpected request: pibake-fake-unexpected: the output lacks")
+        );
+        assert!(
+            err("failing", &format!("{}; exit 3", frame("pibake-fake-done")))
+                .contains("exit status: 3")
+        );
+        let checked = bench.tui_turn(
+            &fake_pi(
+                dir.path(),
+                "checked",
+                &format!("{}; {wait_for_eof}", frame("pibake-fake-done")),
+            ),
+            &provider,
+            Scenario::TuiWrite,
+            |harness| check_written(harness, "x"),
+        );
+        assert!(format!("{:#}", checked.unwrap_err()).contains("big_write.txt"));
+    }
+
+    /// An RPC session in sh: answers `get_state`, then each prompt with `answer`; prompt 3 is
+    /// rejected once during a compaction and sent again after it.
+    fn rpc_session(answer: &str) -> String {
+        format!(
+            r#"read -r line
+echo '{{"id":"pibake_state","type":"response","success":true}}'
+i=0
+while read -r line; do
+  i=$((i+1))
+  if [ $i = 3 ]; then
+    echo '{{"type":"compaction_start"}}'
+    echo '{{"id":"turn_3","type":"response","success":false}}'
+    echo '{{"type":"compaction_end"}}'
+    read -r line
+  fi
+  echo '{{"id":"turn_'$i'","type":"response","success":true}}'
+  echo '{{"type":"message_end","message":{{"role":"assistant","content":[{{"type":"text","text":"{answer}"}}]}}}}'
+  echo '{{"type":"agent_settled"}}'
+done"#
+        )
+    }
+
+    #[test]
+    fn a_long_session_runs_every_turn_through_compactions() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/agent_dir");
+        let bench = test_bench(&fixture, dir.path());
+        let provider = FakeProvider::start().unwrap();
+        let ok = fake_pi(dir.path(), "ok", &rpc_session("text pibake-turn-end"));
+        let session = bench.long_session(&ok, &provider).unwrap();
+        assert_eq!(session.turn_cpu.len(), SESSION_TURNS);
+        assert!(session.peak_rss_kib >= session.end_rss_kib && session.end_rss_kib > 0);
+        let wrong = fake_pi(dir.path(), "wrong", &rpc_session("pibake-fake-unexpected"));
+        let err = format!("{:#}", bench.long_session(&wrong, &provider).unwrap_err());
+        assert!(
+            err.contains("turn 1 settled without the scripted answer"),
+            "{err}"
+        );
+        let short = fake_pi(
+            dir.path(),
+            "short",
+            "read -r line; echo '{\"id\":\"pibake_state\"}'; read -r line",
+        );
+        let err = format!("{:#}", bench.long_session(&short, &provider).unwrap_err());
+        assert!(err.contains("Pi exited mid-session"), "{err}");
+    }
+
+    #[test]
+    fn turn_medians_take_turns_2_to_6_and_36_to_40() {
+        let turns: Vec<Duration> = (1..=40).map(|t| Duration::from_millis(t * 10)).collect();
+        assert_eq!(turn_medians(&turns), (Some(40.0), Some(380.0)));
+        assert_eq!(turn_medians(&turns[..3]), (Some(25.0), None));
+        assert_eq!(turn_medians(&[]), (None, None));
+    }
+
+    #[test]
+    fn scenario_metrics_are_unique_and_named_for_the_cli() {
+        let all: Vec<&str> = metrics().collect();
+        let unique: std::collections::BTreeSet<&str> = all.iter().copied().collect();
+        assert_eq!(all.len(), unique.len());
+        use clap::ValueEnum;
+        let names: Vec<String> = Scenario::value_variants()
+            .iter()
+            .map(|s| s.to_possible_value().unwrap().get_name().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "startup",
+                "interactive",
+                "big_write",
+                "long_answer",
+                "tui_write",
+                "big_output",
+                "long_session"
+            ]
+        );
+        assert_eq!(serde_json::to_value(Scenario::ALL).unwrap(), json!(names));
+    }
+
     #[test]
     fn summary_quantiles() {
         assert_eq!(Summary::of(&[]), None);
@@ -735,8 +1214,7 @@ mod tests {
     }
 
     fn result(command: &str, startup: &[f64]) -> CommandResult {
-        let metrics = METRICS
-            .into_iter()
+        let metrics = metrics()
             .map(|m| {
                 let samples = if m == "startup_ms" {
                     startup.to_vec()
@@ -774,29 +1252,38 @@ mod tests {
     }
 
     #[test]
-    fn table_has_a_column_per_command() {
+    fn table_has_a_column_per_command_and_a_row_per_measured_metric() {
         let table = render_table(&[
             result("pi", &[100.0, 200.0, 300.0]),
             result("pi -ne", &[50.0]),
+            result("none", &[]),
         ]);
         let lines: Vec<&str> = table.lines().collect();
-        assert_eq!(lines.len(), 1 + METRICS.len());
+        // Only `startup_ms` has samples.
+        assert_eq!(lines.len(), 2, "{table}");
         assert!(
-            lines[0].starts_with("metric") && lines[0].ends_with("pi -ne"),
+            lines[0].starts_with("metric") && lines[0].ends_with("none"),
             "{table}"
         );
         assert!(
-            lines[1].contains("200.0 [150.0–250.0]") && lines[1].ends_with("50.0 [50.0–50.0]"),
+            lines[1].contains("200.0 [150.0–250.0]")
+                && lines[1].contains("50.0 [50.0–50.0]")
+                && lines[1].ends_with('-'),
             "{table}"
         );
-        assert!(lines[2].ends_with('-'), "{table}");
     }
 
     #[test]
     fn record_writes_once_per_label_and_day() {
         let dir = tempfile::tempdir().unwrap();
         let results = [result("pi", &[1.0])];
-        let path = record(dir.path(), "baseline", 1, 100, &results).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let bench = Bench {
+            big_write_bytes: 100,
+            scenarios: &[Scenario::Startup, Scenario::LongSession],
+            ..test_bench(Path::new("/unused"), home.path())
+        };
+        let path = record(dir.path(), "baseline", &bench, &results).unwrap();
         let json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(
@@ -805,7 +1292,8 @@ mod tests {
         );
         assert_eq!(json["label"], "baseline");
         assert_eq!(json["big_write_bytes"], 100);
-        assert!(record(dir.path(), "baseline", 1, 100, &results).is_err());
-        assert!(record(dir.path(), "../x", 1, 100, &results).is_err());
+        assert_eq!(json["scenarios"], json!(["startup", "long_session"]));
+        assert!(record(dir.path(), "baseline", &bench, &results).is_err());
+        assert!(record(dir.path(), "../x", &bench, &results).is_err());
     }
 }

@@ -62,12 +62,13 @@ impl Trainer<'_> {
             let bench = Bench {
                 commands: &[],
                 runs: 0,
+                scenarios: &[],
                 big_write_bytes: PRINT_TURN_BYTES,
                 source: self.source,
                 real_home: self.real_home,
                 perf_stat: false,
             };
-            let provider = FakeProvider::with_big_write(PRINT_TURN_BYTES)?;
+            let provider = FakeProvider::unrecorded(PRINT_TURN_BYTES)?;
             let content = fake_provider::big_write_content(PRINT_TURN_BYTES);
             let size = || -> Result<String> {
                 let len = fs::metadata(&cache)

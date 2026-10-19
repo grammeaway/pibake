@@ -12,8 +12,8 @@ Live log for `README.md`'s plans: status, decisions, and the probe round's findi
 | p4 trained code cache | done (`bf3a15a`) | opt-in `sea_trained`: −20 % startup instructions, −25 % ready against `sea_codecache`, +8–13 MiB; the snapshot still leads (O3: default unchanged) |
 | p5 lazy HTTP dispatcher | done | O5 = pibake pass (owner); `lazy_http_dispatcher` on by default; proxy and idle timeout as stock by E2E; `verify` same. Recorded on `sea_codecache`: startup_minstr −2.5 %, RPC startup −18 ms, ready −16 ms; less than planned (below) (`bench_results/2026-10-19_p5_lazy_http_dispatcher.json`) |
 | p6 lazy modules | done | `lazy_modules` on by default, not on the snapshot; 11 files, typebox dropped; `verify` same, markdown renders as stock by E2E. Recorded on `sea_codecache`: startup_minstr −15.4 %, RPC startup −45 ms, big write −37 ms; interactive ready +10 ms (below) (`bench_results/2026-10-19_p6_lazy_modules.json`) |
-| p7 session bench | planned | |
-| p8 incremental Markdown | planned | waits for O6 and p7 |
+| p7 session bench | done | `long_answer`, `tui_write`, `big_output`, `long_session` in `bench`, `--scenarios`; profiles and ranked list below and in the README. Recorded on `sea_codecache` against stock: `long_answer` 11.5 s against 14.5, `tui_write` 2.9 s against 51.6, `big_output` 0.97 s against 4.4, a late session turn ~24 ms on both, session end RSS 313 MiB against 484 (`bench_results/2026-10-19_p7_session.json`) |
+| p8 incremental Markdown | planned | waits for O6 |
 
 ## Decisions
 
@@ -30,6 +30,12 @@ Live log for `README.md`'s plans: status, decisions, and the probe round's findi
 | p6 | `lazy_modules` is skipped on `sea_snapshot`: a module evaluated after the resume misses `snapshot_safety`'s initialisers (interactive crashed on `utils.js`'s segmenters), and the snapshot holds these modules evaluated anyway | 2026-10-19, agent |
 | p6 | Exports no code reassigns become plain values on the stand-in once loaded; a getter cost ~25× per call | 2026-10-19, agent |
 | p6 | Keep all 11 files on by default, for −15 % startup instructions in RPC and print mode at +10 ms interactive ready on `sea_codecache` | 2026-10-19, owner |
+| p7 | A session turn ends at `agent_settled` with no compaction running, not at `agent_end` (the plan). `agent_settled` is Pi's "no more automatic work"; pi-observational-memory compacts after it (~98 k estimated tokens, turn ~20 on the live setup), and Pi rejects a prompt meanwhile. The bench sends it again after `compaction_end`; the compaction's CPU lands in that turn | 2026-10-19, agent |
+| p7 | Per-turn CPU is the process CPU clock (`clock_getcpuclockid`), not `/proc/<pid>/stat` (the plan): its 10 ms ticks are a third of a turn. The process is the busiest one in the command's tree, so Pi under `perf stat` or `perf record` | 2026-10-19, agent |
+| p7 | `session_end_rss_mib` and `session_peak_rss_mib` are the Pi process's `VmRSS` and `VmHWM` after the 40th turn; `wait4`'s peak read below `VmRSS` once (it covers the wrapper and is taken at exit) | 2026-10-19, agent |
+| p7 | The fake provider answers an extension's own model call with `pibake-fake-side`, and closes a turn with `pibake-fake-done` (was `Done.`), so a drawn side reply never ends a pty run. A reply after a tool checks the result (the `seq` output's last line, the read file's last line), else answers `pibake-fake-unexpected: …`, which fails the run | 2026-10-19, agent |
+| p7 | `bench`'s table leaves out metrics no command has (27 rows otherwise) | 2026-10-19, agent |
+| p7 | `bench` and `train` use an unrecorded fake provider. The first `p7_session` recording kept every request: pibake grew ~65 MiB per round from `long_session`'s contexts, and Pi, started by fork and exec, inherits the forking process's RSS in `ru_maxrss`. Its pty peak RSS samples rose 286 → 668 MiB from round 5 on; discarded and recorded again. pibake now stays at ~8 MiB, under any Pi's peak. Earlier recordings were unaffected (no growing scenario) | 2026-10-19, agent |
 | p2 | `--perf-stat` counts `instructions:u` only, as `startup_minstr`, `interactive_minstr`, `big_write_minstr` (millions). It wraps the harness command in `perf stat -x, -o <harness>/perf_stat.csv`; `wait4` then reaps perf, whose own CPU (a few ms) lands in the time metrics | 2026-10-17, agent |
 
 ## Probe round (2026-10-17)
@@ -236,6 +242,52 @@ Trace, side-effect review and implementation notes: `p6_lazy_modules.md` → Out
 
 - **Startup gains beyond the plan's estimate** (~10 % from the probe): −15.4 % startup instructions and −45 ms RPC startup on the default backend, −17.2 % and −43 ms on `sea_trained`, 3–6 MiB less memory. The big write gains as well (−7.5 % instructions), being a print-mode launch. Most of it is group B: A alone is −3.7 %.
 - **Deviation: interactive costs a little more**, as it loads all 11 anyway. Ready +10 ms on `sea_codecache` (spreads touch), +4 ms on `sea_trained` (within spread). `interactive_minstr` is bimodal in every variant (clusters near 3190 and 3235 M, ~40 M apart, on and off alike); like for like, the cost is ~+15 M (+0.5 %). Not attributed; candidates are the stand-ins' first-load work and the getter esbuild's `__toESM` keeps between an importer and a stand-in.
+
+## p7: session bench (2026-10-19)
+
+**Step 1, by hand** (stock and `pi-p6-on`, fixture and live setup):
+
+- Interactive mode submits a positional prompt at startup; Ctrl+D (`\x04`, legacy keys: the bench does not answer the keyboard protocol query) on the empty editor exits 0, also right after the closing text is drawn.
+- The closing texts are found in the text drawn across all frames (p1's lesson), also split across reads.
+- RPC 1.3.0: `prompt` answers `{"disposition":"started"}`; `message_end` carries the final assistant message; `agent_settled` ends the work. The session file goes to the harness agent directory.
+- **The live setup compacts mid-session.** pi-observational-memory triggers compaction after `agent_settled` once its estimate passes ~98 k tokens (turn 19–20). It is deferred if the next prompt wins the race, and otherwise rejects that prompt. See Decisions. Its own model calls and every other extension's take the side reply; no turn count broke.
+
+**Recorded** on an idle machine (owner): `target/p7/bench.sh`, `bench --runs 10 --perf-stat --scenarios long_answer,tui_write,big_output,long_session --record p7_session`, live setup, one lock (`target/p7/`, not committed). Medians [p25–p75]:
+
+| Metric | stock | `sea_codecache` |
+|---|---|---|
+| `long_answer_cpu_ms` | 14538 [14446–14587] | 11515 [11468–11542] |
+| `long_answer_peak_rss_mib` | 457 [456–459] | 267 [264–269] |
+| `long_answer_minstr` | 92649 | 77437 |
+| `tui_write_cpu_ms` | 51571 [51335–51744] | 2923 [2903–2936] |
+| `tui_write_peak_rss_mib` | 698 [631–727] | 318 [318–319] |
+| `tui_write_minstr` | 548118 | 16320 |
+| `big_output_cpu_ms` | 4413 [4359–4426] | 972 [961–979] |
+| `big_output_peak_rss_mib` | 420 [419–423] | 223 [222–230] |
+| `big_output_minstr` | 22231 | 4798 |
+| `session_early_turn_cpu_ms` | 35.9 [32.4–37.1] | 32.6 [32.0–35.1] |
+| `session_late_turn_cpu_ms` | 21.6 [19.7–22.6] | 24.3 [21.9–26.7] |
+| `session_end_rss_mib` | 484 [480–488] | 313 [303–318] |
+| `session_minstr` | 25067 | 7704 |
+
+- `long_answer` is p8's baseline: 11.5 s of CPU on the default backend for a 20 KiB answer, 85 % of stock's instructions. The backend helps it least: the cost is Pi's own render, not loading.
+- `tui_write` and `big_output` gain most from the default backend (l11's streaming JSON and startup); stock's `tui_write` is l11's quadratic parse.
+- Session turns cost the same on both; the backend's gain there is startup and memory.
+- Two earlier recordings were discarded: the first for the fake provider's growth (Decisions), the second was not saved, since `--record` does not overwrite.
+
+**Profiles** (step 4): `target/p7/profile.sh`, `perf record -F 999 -e cycles:u -g`, one run per scenario, live setup, one lock. Stock as `node --perf-basic-prof --interpreted-frames-native-stack cli.js`, the default backend as `build --profiling` (`pi-p7-profiling`). Plus `--cpu-prof` of stock for `long_session` and `long_answer`, from the first sample under the agent loop on (`target/p7/cpuprof.py`). Indicative: load 2–4, perf's own CPU included. Shares are of all samples (`perf`) or of non-idle samples after startup (`--cpu-prof`); "incl." is inclusive.
+
+| Scenario | stock | default backend |
+|---|---|---|
+| `long_answer` | `Markdown.render` 81 % incl. after startup: marked `lex` 26 %, highlight.js 18 %, `wrapTextWithAnsi` 20 %; the mermaid transformer (`applyMarkdownTransformers`) 13 %; the footer's `estimateTokens` 2 % | the same: `Markdown.render` 53 % incl. of the process, `wrapTextWithAnsi` 15 %, `lex` 10 %, highlight 7 %, `getContextUsage` 3 % |
+| `tui_write` | `parseStreamingJson` 80 % incl. (l11's target); jiti 3 %; the write call's render 2 % | `renderCall` → `formatWriteCall` per delta **44 %** incl.; startup ~11 %; the SSE parse 4 % |
+| `big_output` | jiti (extension transpiling at startup) 34 % | startup ~30 %; the TUI render ~5 %; the output accumulator (`append`, `handleData`) 2 % |
+| `long_session` | jiti ~30 %. After startup: the OpenAI SDK's body encoding (`FallbackEncoder`, `JSON.stringify` of the request) **11 %** self, tool declaration diff per turn (`declareToolChanges` → `getToolStateChanges`, `toToolDeclaration`, `declarationsEqual`) **11 %** incl., `structuredClone` (pi-btw's `context` handler) 4 %, the lone-surrogate regex 2 %, RPC `serializeJsonLine` 1.4 %, `estimateTokens` 0.9 % | startup ~17 %; `declareToolChanges` 5 % incl., `buildRequest` 4 % (`FallbackEncoder` 3.6 %), `structuredClone` 2.3 %, `transformContext` 2.2 % |
+
+- **`long_answer` is p8's.** The answer's own Markdown is ~80 % of its CPU after startup, on both. The mermaid transformer lexes the whole text again per render, and the footer re-estimates the context's tokens per frame; p8's plan covers neither.
+- **`tui_write` on the default backend is now the write call's render**, not the parse (l11): `formatWriteCall` formats the whole content so far per delta, so it is quadratic.
+- **`big_output` is cheap on 1.3.0**: 8 MiB of output costs less than startup. Pi-Bolt's bash-output fixes target 1.1.0 and 1.2.0.
+- **`long_session` turns do not grow over 40 turns**: late turns cost less than early ones (JIT warm-up), on the fixture with no compaction as well. Per turn, ~25–35 ms. **Memory does**: the default backend ends at ~300 MiB, stock at ~510 MiB, against ~170 MiB after startup, for 720 KiB of session content. A heap probe at exit (`target/probe/memprobe.cjs` through `NODE_OPTIONS`, default backend, live setup) against RPC startup: V8 heap 144 MiB against 44, of which new space 55 MiB reserved (14 used: the young generation grown to its cap, not live data), **large objects 34 MiB live** (0 at startup), old space 43 used (20); array buffers 16 MiB (0.2). Large objects that size, for 720 KiB of content, suggest strings of the whole context kept per turn. Not attributed further.
 
 ## Found
 

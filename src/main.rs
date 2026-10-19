@@ -4,7 +4,7 @@ use std::process::ExitCode;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
-use pibake::bench::{self, Bench};
+use pibake::bench::{self, Bench, Scenario};
 use pibake::config::{Backend, Config};
 use pibake::fake_provider::FakeProvider;
 use pibake::harness::PiCommand;
@@ -54,15 +54,18 @@ enum Command {
         #[arg(long, default_value = "pi")]
         against: String,
     },
-    /// Measure RPC and interactive startup, and a streamed write (200 KiB by default), interleaved
-    /// across Pi commands
+    /// Measure startup (RPC, interactive), a streamed write (200 KiB by default) and session
+    /// scenarios, interleaved across Pi commands
     Bench {
         /// A Pi command to measure; repeat to compare
         #[arg(long = "pi", required = true)]
         pi: Vec<String>,
         #[arg(long, default_value_t = 10)]
         runs: usize,
-        /// Size of the streamed write, in KiB; 0 skips it
+        /// The scenarios to run, comma-separated [default: all]
+        #[arg(long, value_enum, value_delimiter = ',')]
+        scenarios: Vec<Scenario>,
+        /// Size of the streamed write, in KiB, in `big_write` and `tui_write`; 0 skips both
         #[arg(long, default_value_t = 200)]
         big_write_kib: usize,
         /// Write the results to bench_results/<date>_<label>.json
@@ -301,6 +304,7 @@ fn main() -> Result<ExitCode> {
         Command::Bench {
             pi,
             runs,
+            scenarios,
             big_write_kib,
             record,
             perf_stat,
@@ -315,6 +319,11 @@ fn main() -> Result<ExitCode> {
             let bench = Bench {
                 commands: &commands,
                 runs,
+                scenarios: if scenarios.is_empty() {
+                    &Scenario::ALL
+                } else {
+                    &scenarios
+                },
                 big_write_bytes: big_write_kib * 1024,
                 source: &config.agent_dir,
                 real_home: &home,
@@ -323,13 +332,7 @@ fn main() -> Result<ExitCode> {
             let results = bench.run(|step| eprintln!("bench: {step}"))?;
             write!(out, "{}", bench::render_table(&results))?;
             if let Some(label) = record {
-                let path = bench::record(
-                    Path::new("bench_results"),
-                    &label,
-                    runs,
-                    bench.big_write_bytes,
-                    &results,
-                )?;
+                let path = bench::record(Path::new("bench_results"), &label, &bench, &results)?;
                 writeln!(out, "recorded: {}", path.display())?;
             }
         }

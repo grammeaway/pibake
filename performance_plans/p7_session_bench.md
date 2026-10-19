@@ -46,11 +46,11 @@
 
 ## Completion
 
-- [ ] The new metrics appear in `bench` output and recorded JSON for every command.
-- [ ] Unit and E2E tests green; a scenario that never reaches its end fails.
-- [ ] Per-scenario profiles logged in `progress.md`; the ranked list in the README.
-- [ ] Recorded bench in `bench_results/`.
-- [ ] `cargo fmt --check`, clippy and every test green, E2E included.
+- [x] The new metrics appear in `bench` output and recorded JSON for every command.
+- [x] Unit and E2E tests green; a scenario that never reaches its end fails.
+- [x] Per-scenario profiles logged in `progress.md`; the ranked list in the README.
+- [x] Recorded bench in `bench_results/`.
+- [x] `cargo fmt --check`, clippy and every test green, E2E included.
 
 ## Non-goals
 

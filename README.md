@@ -58,7 +58,7 @@ agent_dir = "."
 | `pibake bundle` | Stages, then bundles Pi and every extension into `target/pibake/bundle/<hash>/pi.mjs` (`node` runs it), with a per-extension compatibility report |
 | `pibake build` | Checks the lock for drift, bundles, then builds `target/pibake/bin/<name>` (`[build] name`, default `pi-baked`): one executable with Node inside. Content-hashed caches skip unchanged work. `--profiling` builds `<name>-profiling` for `perf` (see [Profiling](#profiling)) |
 | `pibake verify` | Diffs the binary's tools, commands and system prompt against stock Pi on the same setup |
-| `pibake bench` | RPC and interactive startup (first paint, ready), memory, and CPU, and a streamed large write (`--big-write-kib`, default 200; 0 skips it), against stock Pi. `--perf-stat` also counts each run's instructions |
+| `pibake bench` | Startup and session scenarios against stock Pi: RPC and interactive startup (first paint, ready), a streamed large write in print mode and in the TUI (`--big-write-kib`, default 200; 0 skips both), a long Markdown answer and 8 MiB of `bash` output in the TUI, and 40 RPC turns (CPU of early against late turns, memory at the end). `--scenarios` picks some (default: all). `--perf-stat` also counts each run's instructions |
 | `pibake install` | Builds, then copies the binary to `~/.local/bin/<name>` |
 | `pibake init` (planned) | Turns a live setup into a repo-mode directory, without credentials or state |
 
@@ -92,7 +92,7 @@ Every optimization is measured against stock Pi by `pibake bench`, and kept only
 
 `perf` (Linux) can see what `--cpu-prof` cannot: V8's compiler, deserialiser and GC, ICU, and Node's own C++. User-space events need no root at `perf_event_paranoid` 2.
 
-- **Count, don't time.** `pibake bench --perf-stat` runs each command under `perf stat` and records `startup_minstr`, `interactive_minstr` and `big_write_minstr` (millions of user-space instructions). On a laptop their spread is about ±0.3 %, against several percent for wall time, so small A/B effects show. Times then include `perf`'s own start, ~10 ms.
+- **Count, don't time.** `pibake bench --perf-stat` runs each command under `perf stat` and records `<scenario>_minstr` for each scenario, e.g. `startup_minstr` (millions of user-space instructions). On a laptop their spread is about ±0.3 %, against several percent for wall time, so small A/B effects show. Times then include `perf`'s own start, ~10 ms.
 - **Name JS frames with a profiling build.** `pibake build --profiling` writes `<name>-profiling`, built with `--perf-basic-prof` (and `--interpreted-frames-native-stack` on the code-cache backend) both at build time and in the executable. Passing those flags at runtime instead (`NODE_OPTIONS`) makes V8 reject the code cache, and you profile a cold start. The flags have costs of their own: map writing, and line-end computation over the 20 MB bundle. So read a profiling build for names, not for shares.
 
   ```bash
@@ -100,7 +100,7 @@ Every optimization is measured against stock Pi by `pibake bench`, and kept only
   perf report -i pi.data --no-children --sort dso,sym
   ```
 
-  To profile a bench run, wrap the command: `pibake bench --pi "perf record -e cycles:u -g -o /tmp/run.data -- <executable>"` (each run overwrites the file, so use `--runs 1` or a wrapper script that names files per run).
+  To profile a bench run, wrap the command: `pibake bench --pi "perf record -e cycles:u -g -o /tmp/run.data -- <executable>"` (each run overwrites the file, so use `--runs 1` or a wrapper script that names files per run). The session scenario reads its per-turn CPU from the busiest process under the command, which is Pi under a `perf` wrapper.
 - **Node's own symbols.** Distribution builds of `node` are usually stripped, and the executable keeps their build ID. Either fetch the debug file through debuginfod (Arch: `DEBUGINFOD_URLS=https://debuginfod.archlinux.org`, ~3 GB), or build with the official nodejs.org binary of the locked version first on `PATH`: it ships unstripped. It is a different build (static OpenSSL and ICU), so use it to find where time goes, and the usual build for the numbers.
 
 ## Not goals
