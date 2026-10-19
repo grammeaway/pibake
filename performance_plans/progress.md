@@ -9,8 +9,8 @@ Live log for `README.md`'s plans: status, decisions, and the probe round's findi
 | p1 pty bench | done (`6cd7677`; recording later) | `first_paint_ms`, `ready_ms`, `interactive_cpu_ms`, `interactive_peak_rss_mib`; `--big-write-kib 0` skips the big write. Step 4's breakdown is under Probe round. Recorded ready: stock **2663 ms**, warm code cache **494**, snapshot **374**; interactive peak RSS 377 / 192 / 222 MiB (`bench_results/2026-10-17_p1_interactive.json`). A first attempt was discarded: the CPU was stuck at 800 MHz after a suspend |
 | p2 perf probes | done (`6cd7677`) | `build --profiling`, `bench --perf-stat` (`*_minstr`), README Profiling section; breakdown under Probe round |
 | p3 ASCII bundle | done | `ascii_bundle` pass, default on; `verify` same on the live setup for both backends. Recorded: peak RSS −13 MiB (code cache), −52 MiB (snapshot); code-cache startup instructions +1.4 % (deviation, below) (`bench_results/2026-10-17_p3_ascii.json`) |
-| p4 trained code cache | planned | the probe round's headline |
-| p5 lazy HTTP dispatcher | planned | |
+| p4 trained code cache | done (`bf3a15a`) | opt-in `sea_trained`: −20 % startup instructions, −25 % ready against `sea_codecache`, +8–13 MiB; the snapshot still leads (O3: default unchanged) |
+| p5 lazy HTTP dispatcher | done | O5 = pibake pass (owner); `lazy_http_dispatcher` on by default; proxy and idle timeout as stock by E2E; `verify` same. Recorded on `sea_codecache`: startup_minstr −2.5 %, RPC startup −18 ms, ready −16 ms; less than planned (below) (`bench_results/2026-10-19_p5_lazy_http_dispatcher.json`) |
 | p6 lazy TUI regexes | planned | |
 | p7 session bench | planned | |
 | p8 incremental Markdown | planned | waits for O6 and p7 |
@@ -24,6 +24,9 @@ Live log for `README.md`'s plans: status, decisions, and the probe round's findi
 | p2 | Profiling flags per backend: code cache gets `--perf-basic-prof --interpreted-frames-native-stack`; the snapshot only `--perf-basic-prof`, since a snapshot built with both segfaults at launch (Node 26.11.1) | 2026-10-17, agent |
 | p3 | `ascii_bundle` runs in `Bundler::run` on the final bundle, not in `passes::run`, so it is listed in `[build] passes` but skipped there. Its report's file is bundle-relative (`main.mjs`, `main.cjs`) | 2026-10-17, agent |
 | p3 | A non-ASCII character after `\` in a regex (an identity escape, non-`u` only) is written as one escape in place of both, since `\` before the escape would make it a literal `\u` | 2026-10-17, agent |
+| p5 | O5 = pibake passes, not upstream PRs: the change is a startup optimisation, not a Pi bug, and Pi's maintainers are swamped. Applies to p6's pi-tui part too | 2026-10-19, owner |
+| p5 | undici is wrapped lazily on every backend while the pass is on; its first load materialises Pi's dispatcher, so a second undici copy (pi-ai's Gemini fetch) shares it as in stock | 2026-10-19, agent |
+| p5 | A global redefined with `Object.defineProperty` before the first use keeps its definition; stock's `install()` then skips, as `fetch` is no longer the original | 2026-10-19, agent |
 | p2 | `--perf-stat` counts `instructions:u` only, as `startup_minstr`, `interactive_minstr`, `big_write_minstr` (millions). It wraps the harness command in `perf stat -x, -o <harness>/perf_stat.csv`; `wait4` then reaps perf, whose own CPU (a few ms) lands in the time metrics | 2026-10-17, agent |
 
 ## Probe round (2026-10-17)
@@ -173,6 +176,42 @@ Indicative, load ~1. Feeds the README's native-code verdicts, p7 and p8.
 - **Rebuilds are byte-identical** once the loader lives in the bundle directory: the executable embeds its main's path, and a temporary directory differed per build.
 - O4 (owner): training runs extensions at build time only behind the opt-in `backend = "sea_trained"`, never by default.
 - O3 (owner, on these numbers): `sea_codecache` stays the default; `sea_snapshot` and `sea_trained` stay as opt-ins.
+
+## p5: lazy HTTP dispatcher (2026-10-19)
+
+**Step 1, the map** (live setup bundle, Pi 1.3.0, undici 8.10.2):
+
+| User | When | Covered by |
+|---|---|---|
+| Pi's `http-dispatcher.js`: undici import, `originalGlobalFetch` captured at module load | module init | unchanged: the capture runs before any getter exists |
+| `fetch`, `globalThis.fetch`, `WebSocket`, … read by provider SDKs, `fetchWithRetry`, the MCP client | first request | the read materialises, then returns the real value |
+| pi-web-access `installGlobalProxyFetch` (wraps `globalThis.fetch`) | a proxied search only | the read materialises, so it wraps undici's fetch as in stock |
+| A second undici, `node_modules/undici` (pi-ai's Gemini fetch, dynamic import) | first Gemini request | the lazy wrapper's load materialises: both copies share `Symbol.for("undici.globalDispatcher.*")` |
+| Proxy variables | read by `EnvHttpProxyAgent` when created | the last call's values are restored around the deferred call; `no_proxy` is read per request by undici |
+
+**Trace** (a logging build, live setup): RPC startup and offline interactive startup never materialise. Online interactive does, from `checkForNewPiVersion` in `InteractiveMode.run()`, after `init()` drew the ready frame. Print mode materialises on its request.
+
+**Tests:** `tests/lazy_http_dispatcher.rs`. The module's cases under `node`; a bundle against stock Pi on a print turn through a `CONNECT` proxy from `httpProxy` (same tunnels) and one cut by `httpIdleTimeoutMs: 1000` on a stalled stream (same output, `terminated`, 1–20 s). With `configure` removed from the module, the proxy test fails.
+
+**Recorded** on an idle machine (owner): `target/p5/bench.sh`, `bench --runs 10 --perf-stat --record p5_lazy_http_dispatcher`, live setup re-locked (Node 26.12.0 now, so not comparable to p4's table), one lock for all four (`target/p5/`, not committed).
+
+| | `sea_codecache` on | off | `sea_trained` on | off |
+|---|---|---|---|---|
+| RPC startup | **467.0 ms** | 484.7 | **355.0** | 360.2 |
+| ready | **522.2 ms** | 538.3 | **396.4** | 412.3 |
+| startup_minstr | **2882** | 2956 | **2328** | 2368 |
+| interactive_minstr | **3192** | 3260 | **2549** | 2587 |
+| big_write_minstr | 5956 | **5941** | **5170** | 5190 |
+| big write | 932.8 ms | 931.0 | 788.3 | 775.3 |
+| startup peak RSS | 171.7 MiB | 171.7 | 176.0 | 176.3 |
+| interactive peak RSS | **181.7** | 183.0 | 185.6 | 185.7 |
+| big write peak RSS | 218.3 | **216.0** | 232.9 | **228.3** |
+
+- **Startup gains as planned in kind, smaller in size:** −18 ms RPC startup and −16 ms ready on the default backend (plan −25), −75 M startup instructions (probe −200 M, on the trained SEA). On `sea_trained`: −5 ms, −16 ms ready, −40 M.
+- **Deviation: the gap to the probe is not attributed.** A hook at exit confirmed the dispatcher is still deferred and npm undici unevaluated after RPC startup. The probe returned early from `configureHttpDispatcher`, so its print turn used Node's built-in fetch and npm undici never ran, in training either; the trained caches here differ by only 25 KB (on 7.60 MB, off 7.62 MB), so that does not explain it on its own.
+- **Deviation: the big write.** Instructions +0.25 % on the code cache (−0.4 % trained), wall time within noise; peak RSS +2.3 MiB (code cache) and +4.6 MiB (trained): undici and the dispatcher are now created mid-session, on a larger heap. Logged, not chased: below the startup gain, and p7 profiles the session.
+- **Found:** Node's built-in undici (`internal/deps/undici/undici`) is still loaded at RPC startup, on and off. Pi's `http-dispatcher.js` reads `globalThis.fetch` at module load (`originalGlobalFetch`), which runs Node's lazy getter. A candidate, unmeasured.
+
 
 ## Found
 

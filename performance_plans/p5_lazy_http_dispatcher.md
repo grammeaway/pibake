@@ -44,9 +44,9 @@ Where this lives is the owner's call (O5): a pibake pass (`lazy_http_dispatcher`
 
 ## Completion
 
-- [ ] Proxy and timeout behaviour is stock's, by test.
-- [ ] `startup_minstr` and `interactive_minstr` drop, the big write does not regress.
-- [ ] `cargo fmt --check`, clippy and every test green, E2E included.
+- [x] Proxy and timeout behaviour is stock's, by test.
+- [x] `startup_minstr` and `interactive_minstr` drop (−2.5 %, −2.1 %); the big write's instructions are flat, its peak RSS +2–5 MiB (`progress.md` → p5).
+- [x] `cargo fmt --check`, clippy and every test green, E2E included.
 
 ## Non-goals
 

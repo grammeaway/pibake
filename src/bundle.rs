@@ -49,6 +49,8 @@ const EXTRACT: &str = include_str!("bundle/extract.js");
 pub const STALENESS: &str = include_str!("bundle/staleness.mjs");
 /// `pibake:tool-json`: what `incremental_tool_json` calls instead of per-delta `parseStreamingJson`.
 pub const TOOL_JSON: &str = include_str!("bundle/tool_json.mjs");
+/// `pibake:http-dispatcher`: where `lazy_http_dispatcher` defers Pi's `configureHttpDispatcher`.
+pub const HTTP_DISPATCHER: &str = include_str!("bundle/http_dispatcher.mjs");
 /// `pibake:frozen`'s code: the entry's check of settings passes baked in; `frozen_module` adds
 /// the data.
 pub const FROZEN: &str = include_str!("bundle/frozen.mjs");
@@ -420,6 +422,8 @@ pub struct BuildConfig {
     pub frozen: String,
     /// The module `pibake:tool-json`.
     pub tool_json: String,
+    /// The module `pibake:http-dispatcher`.
+    pub http_dispatcher: String,
     pub baked: String,
     /// Absolute stage directory → agent-relative directory.
     pub owned: Vec<Owned>,
@@ -431,7 +435,7 @@ pub struct BuildConfig {
     pub optional: Vec<String>,
     /// esbuild's output format: `esm` or `cjs`.
     pub format: &'static str,
-    /// Modules loaded on first use rather than at import (snapshot bundles).
+    /// Modules loaded on first use rather than at import.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lazy: Option<Lazy>,
 }
@@ -440,6 +444,8 @@ pub struct BuildConfig {
 pub struct Lazy {
     pub builtins: Vec<&'static str>,
     pub packages: Vec<&'static str>,
+    /// undici's first load makes the dispatcher `lazy_http_dispatcher` deferred.
+    pub http_dispatcher: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -697,10 +703,20 @@ impl Bundler<'_> {
         let pi_dir = plan.pi_dir();
         check_pi(&pi_dir)?;
         let flavor = flavor(self.backend);
-        let lazy = (self.backend == Backend::SeaSnapshot).then(|| Lazy {
-            builtins: snapshot_safety::LAZY_BUILTINS.to_vec(),
-            packages: snapshot_safety::LAZY_PACKAGES.to_vec(),
-        });
+        let http_dispatcher = self.passes.passes.contains(&Pass::LazyHttpDispatcher);
+        let lazy = if self.backend == Backend::SeaSnapshot {
+            Some(Lazy {
+                builtins: snapshot_safety::LAZY_BUILTINS.to_vec(),
+                packages: snapshot_safety::LAZY_PACKAGES.to_vec(),
+                http_dispatcher,
+            })
+        } else {
+            http_dispatcher.then(|| Lazy {
+                builtins: vec![],
+                packages: vec!["undici"],
+                http_dispatcher,
+            })
+        };
         let all: Vec<&Baked> = plan.baked.iter().collect();
         let owned: Vec<Owned> = plan
             .owned
@@ -763,6 +779,7 @@ impl Bundler<'_> {
             ("staleness", STALENESS.as_bytes()),
             ("frozen", frozen.as_bytes()),
             ("tool_json", TOOL_JSON.as_bytes()),
+            ("http_dispatcher", HTTP_DISPATCHER.as_bytes()),
             ("baked", baked_all.as_bytes()),
             ("owned", owned_json.as_bytes()),
             ("passes", passes_json.as_bytes()),
@@ -779,6 +796,7 @@ impl Bundler<'_> {
                 staleness: STALENESS.to_owned(),
                 frozen: frozen.clone(),
                 tool_json: TOOL_JSON.to_owned(),
+                http_dispatcher: HTTP_DISPATCHER.to_owned(),
                 baked: baked_module(baked),
                 owned: owned.clone(),
                 outfile: dir.join(flavor.main),

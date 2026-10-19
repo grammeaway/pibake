@@ -11,6 +11,7 @@
 
 pub mod ascii_bundle;
 mod incremental_tool_json;
+mod lazy_http_dispatcher;
 pub mod snapshot_safety;
 mod trim_apis;
 mod trim_highlight;
@@ -38,6 +39,8 @@ pub enum Pass {
     TrimApis,
     /// Parses streamed tool-call arguments incrementally instead of re-parsing each delta.
     IncrementalToolJson,
+    /// Makes Pi's HTTP dispatcher on first use instead of at startup, and loads undici then.
+    LazyHttpDispatcher,
     /// Defers module code that reads launch state; added by `backend = "sea_snapshot"`.
     SnapshotSafety,
     /// Escapes the bundle's comments and regex literals to ASCII, so Node holds it as one byte
@@ -51,16 +54,18 @@ impl Pass {
             Pass::TrimHighlight => "trim_highlight",
             Pass::TrimApis => "trim_apis",
             Pass::IncrementalToolJson => "incremental_tool_json",
+            Pass::LazyHttpDispatcher => "lazy_http_dispatcher",
             Pass::SnapshotSafety => "snapshot_safety",
             Pass::AsciiBundle => "ascii_bundle",
         }
     }
 }
 
-pub const DEFAULT_PASSES: [Pass; 4] = [
+pub const DEFAULT_PASSES: [Pass; 5] = [
     Pass::TrimHighlight,
     Pass::TrimApis,
     Pass::IncrementalToolJson,
+    Pass::LazyHttpDispatcher,
     Pass::AsciiBundle,
 ];
 
@@ -168,6 +173,10 @@ pub fn run(stage: &Path, options: &Options, setup: &Setup) -> Result<Output> {
                 optional.extend(out.optional);
                 (out.changes, vec![])
             }
+            Pass::LazyHttpDispatcher => (
+                lazy_http_dispatcher::run(&mut sources).context("pass lazy_http_dispatcher")?,
+                vec![],
+            ),
             Pass::SnapshotSafety => (
                 snapshot_safety::run(&mut sources).context("pass snapshot_safety")?,
                 vec![],

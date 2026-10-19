@@ -109,6 +109,8 @@ const plugin = {
 		build.onLoad({ filter: /.*/, namespace: "pibake-staleness" }, () => ({ contents: config.staleness, loader: "js" }));
 		build.onResolve({ filter: /^pibake:tool-json$/ }, () => ({ path: "tool-json", namespace: "pibake-tool-json" }));
 		build.onLoad({ filter: /.*/, namespace: "pibake-tool-json" }, () => ({ contents: config.tool_json, loader: "js" }));
+		build.onResolve({ filter: /^pibake:http-dispatcher$/ }, () => ({ path: "http-dispatcher", namespace: "pibake-http-dispatcher" }));
+		build.onLoad({ filter: /.*/, namespace: "pibake-http-dispatcher" }, () => ({ contents: config.http_dispatcher, loader: "js" }));
 		build.onResolve({ filter: /^pibake:frozen$/ }, () => ({ path: "frozen", namespace: "pibake-frozen" }));
 		build.onLoad({ filter: /.*/, namespace: "pibake-frozen" }, () => ({ contents: config.frozen, loader: "js" }));
 		build.onResolve({ filter: /^pibake:baked$/ }, () => ({ path: "baked", namespace: "pibake-baked" }));
@@ -202,9 +204,10 @@ const LOCATION_DEFINES = {
 };
 
 /**
- * Snapshot bundles: the listed builtins and packages are loaded on first use instead of at import,
- * since loading them creates native state a snapshot cannot hold. Each import gets an object with
- * a getter per export name, read from the real module in this process.
+ * The listed builtins and packages are loaded on first use instead of at import: in a snapshot,
+ * loading them creates native state it cannot hold; undici is not needed before the first
+ * request (`lazy_http_dispatcher`). Each import gets an object with a getter per export name, read
+ * from the real module in this process.
  */
 function lazyModules(build, lazy) {
 	const builtins = new Set(lazy.builtins);
@@ -217,17 +220,21 @@ function lazyModules(build, lazy) {
 		if (!packages.has(args.path)) return undefined;
 		const r = await build.resolve(args.path, { importer: args.importer, resolveDir: args.resolveDir, kind: args.kind, namespace: "pibake-lazy" });
 		if (r.errors.length) return undefined;
-		return { path: r.path, namespace: "pibake-lazy" };
+		// Stage-relative, so the stage's path stays out of the bundle's module names.
+		return { path: relative(config.stage, r.path), namespace: "pibake-lazy", pluginData: { name } };
 	});
 	build.onLoad({ filter: /.*/, namespace: "pibake-lazy" }, (args) => {
-		const real = createRequire(join(config.stage, "pibake.js"))(args.path);
+		const path = args.path.startsWith("node:") ? args.path : join(config.stage, args.path);
+		const real = createRequire(join(config.stage, "pibake.js"))(path);
 		const getters = Object.getOwnPropertyNames(real)
 			// esbuild's interop reads `__esModule` at import.
 			.map((n) => `\t${JSON.stringify(n)}: ${n === "__esModule" ? `{ value: ${real[n]} }` : `{ enumerable: true, get: () => load()[${JSON.stringify(n)}] }`},\n`)
 			.join("");
+		// Code that uses undici's own exports gets the dispatcher stock Pi would have made by then.
+		const first = lazy.http_dispatcher && args.pluginData?.name === "undici" ? `require("pibake:http-dispatcher").materializeHttpDispatcher(), ` : "";
 		return {
-			contents: `let real;\nconst load = () => (real ??= require(${JSON.stringify(args.path)}));\nmodule.exports = Object.defineProperties({}, {\n${getters}});\n`,
-			resolveDir: args.path.startsWith("node:") ? config.stage : dirname(args.path),
+			contents: `let real;\nconst load = () => (real ??= (${first}require(${JSON.stringify(path)})));\nmodule.exports = Object.defineProperties({}, {\n${getters}});\n`,
+			resolveDir: path.startsWith("node:") ? config.stage : dirname(path),
 			loader: "js",
 		};
 	});

@@ -51,7 +51,6 @@ p1 and p2 are implemented but not committed; their recorded bench (p1 step 5) ca
 
 | # | Call | Needed by |
 |---|---|---|
-| O5 | p5 and the pi-tui part of p6: pibake passes, or upstream PRs to Pi that stock Pi benefits from too (as O1 for l11) | p5 step 2, p6 step 1 |
 | O6 | p8: a pibake pass, or an upstream PR to pi-tui | p8 step 2 |
 
 ## Verdicts: Cloudflare memory posts (2026-10-17)
@@ -96,6 +95,7 @@ Each needs a measurement before it becomes a plan.
 - **`createAgentSessionRuntime` beyond extensions** (~80 ms): resource loading (`loadSkills`), the model catalog (`getModels`, `updateModelSnapshot`), typebox schema compile and clone. Profile on top of p4.
 - **Provider auth checks at startup** (`updateAvailableProviderCount`, `ModelRuntime.create`): l9 option A, declined for its `/login` and `/model` effects.
 - **Model catalog as a JSON string, parsed on first access** (DNS cache #3). Part of the item above; no behaviour change, unlike l9's declined option A.
+- **Node's built-in undici loaded at startup** by Pi's `originalGlobalFetch = globalThis.fetch` at module load (`progress.md` → p5). Unmeasured.
 - **`node::crypto::LoadCACertificates` at startup** (~1.5 % of the main thread).
 - **Managed-tool lookup at interactive startup:** `ensureTool("fd" / "rg")` runs before the key handlers and `renderNow()`. For a tool that is not in `~/.pi/agent/bin`, it calls `spawnSync(<tool>, ["--version"])` (`utils/tools-manager.js` `commandExists`). Measured 3–6 ms per tool on `pi-baked`, and up to ~10 ms each from a large process, plus `fdfind` when `fd` is missing. A `PATH` scan with `accessSync(X_OK)` gives the same answer for a missing binary. It is the only subprocess at startup on the live setup. A pass or an upstream PR, as O5.
 - **Session costs: p7 step 5 replaces these with a ranked list.** Until then, from Pi-Bolt's diff:
