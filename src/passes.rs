@@ -12,6 +12,7 @@
 pub mod ascii_bundle;
 mod incremental_tool_json;
 mod lazy_http_dispatcher;
+pub mod lazy_modules;
 pub mod snapshot_safety;
 mod trim_apis;
 mod trim_highlight;
@@ -41,6 +42,8 @@ pub enum Pass {
     IncrementalToolJson,
     /// Makes Pi's HTTP dispatcher on first use instead of at startup, and loads undici then.
     LazyHttpDispatcher,
+    /// Evaluates `lazy_modules::FILES` on first use instead of at startup; not on the snapshot.
+    LazyModules,
     /// Defers module code that reads launch state; added by `backend = "sea_snapshot"`.
     SnapshotSafety,
     /// Escapes the bundle's comments and regex literals to ASCII, so Node holds it as one byte
@@ -55,17 +58,19 @@ impl Pass {
             Pass::TrimApis => "trim_apis",
             Pass::IncrementalToolJson => "incremental_tool_json",
             Pass::LazyHttpDispatcher => "lazy_http_dispatcher",
+            Pass::LazyModules => "lazy_modules",
             Pass::SnapshotSafety => "snapshot_safety",
             Pass::AsciiBundle => "ascii_bundle",
         }
     }
 }
 
-pub const DEFAULT_PASSES: [Pass; 5] = [
+pub const DEFAULT_PASSES: [Pass; 6] = [
     Pass::TrimHighlight,
     Pass::TrimApis,
     Pass::IncrementalToolJson,
     Pass::LazyHttpDispatcher,
+    Pass::LazyModules,
     Pass::AsciiBundle,
 ];
 
@@ -137,6 +142,8 @@ pub struct Output {
     pub frozen: Vec<Frozen>,
     /// Rewritten files the bundle may leave out, as another pass made them unreachable.
     pub optional: Vec<String>,
+    /// Files the bundle evaluates on first use (`lazy_modules`).
+    pub lazy: Vec<lazy_modules::LazyFile>,
 }
 
 /// Runs `options.passes` in order over the stage's sources; each sees its predecessors' output.
@@ -153,6 +160,7 @@ pub fn run(stage: &Path, options: &Options, setup: &Setup) -> Result<Output> {
     let mut reports = vec![];
     let mut frozen = vec![];
     let mut optional = vec![];
+    let mut lazy = vec![];
     let snapshot = options.snapshot.then_some(Pass::SnapshotSafety);
     for pass in options.passes.iter().chain(&snapshot) {
         let (changes, notes) = match pass {
@@ -181,6 +189,16 @@ pub fn run(stage: &Path, options: &Options, setup: &Setup) -> Result<Output> {
                 snapshot_safety::run(&mut sources).context("pass snapshot_safety")?,
                 vec![],
             ),
+            Pass::LazyModules if options.snapshot => (
+                vec![],
+                vec!["skipped: the snapshot holds these modules evaluated, and one evaluated after the resume would miss snapshot_safety's initialisers".to_owned()],
+            ),
+            Pass::LazyModules => {
+                let (changes, files) =
+                    lazy_modules::run(&sources).context("pass lazy_modules")?;
+                lazy = files;
+                (changes, vec![])
+            }
             // Runs on esbuild's output, in `bundle.rs`.
             Pass::AsciiBundle => continue,
         };
@@ -195,6 +213,7 @@ pub fn run(stage: &Path, options: &Options, setup: &Setup) -> Result<Output> {
         reports,
         frozen,
         optional,
+        lazy,
     })
 }
 

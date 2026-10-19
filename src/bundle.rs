@@ -444,6 +444,7 @@ pub struct BuildConfig {
 pub struct Lazy {
     pub builtins: Vec<&'static str>,
     pub packages: Vec<&'static str>,
+    pub files: Vec<passes::lazy_modules::LazyFile>,
     /// undici's first load makes the dispatcher `lazy_http_dispatcher` deferred.
     pub http_dispatcher: bool,
 }
@@ -703,20 +704,6 @@ impl Bundler<'_> {
         let pi_dir = plan.pi_dir();
         check_pi(&pi_dir)?;
         let flavor = flavor(self.backend);
-        let http_dispatcher = self.passes.passes.contains(&Pass::LazyHttpDispatcher);
-        let lazy = if self.backend == Backend::SeaSnapshot {
-            Some(Lazy {
-                builtins: snapshot_safety::LAZY_BUILTINS.to_vec(),
-                packages: snapshot_safety::LAZY_PACKAGES.to_vec(),
-                http_dispatcher,
-            })
-        } else {
-            http_dispatcher.then(|| Lazy {
-                builtins: vec![],
-                packages: vec!["undici"],
-                http_dispatcher,
-            })
-        };
         let all: Vec<&Baked> = plan.baked.iter().collect();
         let owned: Vec<Owned> = plan
             .owned
@@ -734,6 +721,27 @@ impl Bundler<'_> {
             extension_dirs: plan.owned.iter().map(|o| o.stage.clone()).collect(),
         };
         let rewritten = passes::run(&plan.stage, self.passes, &setup)?;
+        let http_dispatcher = self.passes.passes.contains(&Pass::LazyHttpDispatcher);
+        let lazy = if self.backend == Backend::SeaSnapshot {
+            Some(Lazy {
+                builtins: snapshot_safety::LAZY_BUILTINS.to_vec(),
+                packages: snapshot_safety::LAZY_PACKAGES.to_vec(),
+                files: vec![],
+                http_dispatcher,
+            })
+        } else {
+            let files = rewritten.lazy.clone();
+            (http_dispatcher || !files.is_empty()).then(|| Lazy {
+                builtins: vec![],
+                packages: if http_dispatcher {
+                    vec!["undici"]
+                } else {
+                    vec![]
+                },
+                files,
+                http_dispatcher,
+            })
+        };
         for p in &rewritten.reports {
             log(format!(
                 "pass {}: {} files rewritten",

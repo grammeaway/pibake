@@ -11,7 +11,7 @@ Live log for `README.md`'s plans: status, decisions, and the probe round's findi
 | p3 ASCII bundle | done | `ascii_bundle` pass, default on; `verify` same on the live setup for both backends. Recorded: peak RSS −13 MiB (code cache), −52 MiB (snapshot); code-cache startup instructions +1.4 % (deviation, below) (`bench_results/2026-10-17_p3_ascii.json`) |
 | p4 trained code cache | done (`bf3a15a`) | opt-in `sea_trained`: −20 % startup instructions, −25 % ready against `sea_codecache`, +8–13 MiB; the snapshot still leads (O3: default unchanged) |
 | p5 lazy HTTP dispatcher | done | O5 = pibake pass (owner); `lazy_http_dispatcher` on by default; proxy and idle timeout as stock by E2E; `verify` same. Recorded on `sea_codecache`: startup_minstr −2.5 %, RPC startup −18 ms, ready −16 ms; less than planned (below) (`bench_results/2026-10-19_p5_lazy_http_dispatcher.json`) |
-| p6 lazy TUI regexes | planned | |
+| p6 lazy modules | done | `lazy_modules` on by default, not on the snapshot; 11 files, typebox dropped; `verify` same, markdown renders as stock by E2E. Recorded on `sea_codecache`: startup_minstr −15.4 %, RPC startup −45 ms, big write −37 ms; interactive ready +10 ms (below) (`bench_results/2026-10-19_p6_lazy_modules.json`) |
 | p7 session bench | planned | |
 | p8 incremental Markdown | planned | waits for O6 and p7 |
 
@@ -27,6 +27,9 @@ Live log for `README.md`'s plans: status, decisions, and the probe round's findi
 | p5 | O5 = pibake passes, not upstream PRs: the change is a startup optimisation, not a Pi bug, and Pi's maintainers are swamped. Applies to p6's pi-tui part too | 2026-10-19, owner |
 | p5 | undici is wrapped lazily on every backend while the pass is on; its first load materialises Pi's dispatcher, so a second undici copy (pi-ai's Gemini fetch) shares it as in stock | 2026-10-19, agent |
 | p5 | A global redefined with `Object.defineProperty` before the first use keeps its definition; stock's `install()` then skips, as `fetch` is no longer the original | 2026-10-19, agent |
+| p6 | `lazy_modules` is skipped on `sea_snapshot`: a module evaluated after the resume misses `snapshot_safety`'s initialisers (interactive crashed on `utils.js`'s segmenters), and the snapshot holds these modules evaluated anyway | 2026-10-19, agent |
+| p6 | Exports no code reassigns become plain values on the stand-in once loaded; a getter cost ~25× per call | 2026-10-19, agent |
+| p6 | Keep all 11 files on by default, for −15 % startup instructions in RPC and print mode at +10 ms interactive ready on `sea_codecache` | 2026-10-19, owner |
 | p2 | `--perf-stat` counts `instructions:u` only, as `startup_minstr`, `interactive_minstr`, `big_write_minstr` (millions). It wraps the harness command in `perf stat -x, -o <harness>/perf_stat.csv`; `wait4` then reaps perf, whose own CPU (a few ms) lands in the time metrics | 2026-10-17, agent |
 
 ## Probe round (2026-10-17)
@@ -212,6 +215,27 @@ Indicative, load ~1. Feeds the README's native-code verdicts, p7 and p8.
 - **Deviation: the big write.** Instructions +0.25 % on the code cache (−0.4 % trained), wall time within noise; peak RSS +2.3 MiB (code cache) and +4.6 MiB (trained): undici and the dispatcher are now created mid-session, on a larger heap. Logged, not chased: below the startup gain, and p7 profiles the session.
 - **Found:** Node's built-in undici (`internal/deps/undici/undici`) is still loaded at RPC startup, on and off. Pi's `http-dispatcher.js` reads `globalThis.fetch` at module load (`originalGlobalFetch`), which runs Node's lazy getter. A candidate, unmeasured.
 
+
+## p6: lazy modules (2026-10-19)
+
+Trace, side-effect review and implementation notes: `p6_lazy_modules.md` → Outcome.
+
+**Recorded** on an idle machine (owner, load 0.3–1.0): `target/p6/bench.sh`, `bench --runs 10 --perf-stat --record p6_lazy_modules`, live setup, one lock (`target/p6/`, not committed). `A` is marked, `markdown.js` and `mermaid.js` only.
+
+| | `sea_codecache` on | A | off | `sea_trained` on | off |
+|---|---|---|---|---|---|
+| RPC startup | **422.7 ms** | 456.9 | 467.3 | **317.7** | 361.1 |
+| ready | 532.5 ms | 527.9 | **522.6** | 402.3 | 398.7 |
+| startup_minstr | **2437** | 2774 | 2880 | **1925** | 2326 |
+| interactive_minstr | 3240 | 3210 | 3193 | 2556 | 2550 |
+| big_write_minstr | **5511** | 5852 | 5957 | **4779** | 5175 |
+| big write | **905.4 ms** | 928.6 | 942.4 | **749.5** | 799.9 |
+| startup peak RSS | **166.6 MiB** | 168.5 | 173.0 | **173.9** | 177.3 |
+| interactive peak RSS | **180.2** | 179.4 | 183.1 | **185.2** | 187.4 |
+| big write peak RSS | **213.5** | 215.5 | 218.7 | **224.0** | 232.6 |
+
+- **Startup gains beyond the plan's estimate** (~10 % from the probe): −15.4 % startup instructions and −45 ms RPC startup on the default backend, −17.2 % and −43 ms on `sea_trained`, 3–6 MiB less memory. The big write gains as well (−7.5 % instructions), being a print-mode launch. Most of it is group B: A alone is −3.7 %.
+- **Deviation: interactive costs a little more**, as it loads all 11 anyway. Ready +10 ms on `sea_codecache` (spreads touch), +4 ms on `sea_trained` (within spread). `interactive_minstr` is bimodal in every variant (clusters near 3190 and 3235 M, ~40 M apart, on and off alike); like for like, the cost is ~+15 M (+0.5 %). Not attributed; candidates are the stand-ins' first-load work and the getter esbuild's `__toESM` keeps between an importer and a stand-in.
 
 ## Found
 

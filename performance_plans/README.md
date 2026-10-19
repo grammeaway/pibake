@@ -34,7 +34,7 @@ On the default backend:
 | 3 | [`p3_ascii_bundle.md`](p3_ascii_bundle.md) | Escape the bundle's last non-ASCII characters (comments, regex literals): −12 MiB on the code cache, −20 on the snapshot | bench: idle machine |
 | 4 | [`p4_trained_code_cache.md`](p4_trained_code_cache.md) | A `sea_trained` backend: the code cache taken after three harness runs at build time. About −28 % RPC startup and −26 % ready | O4 before step 2; bench: idle machine; then O3 |
 | 5 | [`p5_lazy_http_dispatcher.md`](p5_lazy_http_dispatcher.md) | Create Pi's undici dispatcher on first use, not at `main()`'s start: about −25 ms startup and ready | O5 |
-| 6 | [`p6_lazy_modules.md`](p6_lazy_modules.md) | Evaluate marked, pi-tui's utils and typebox's idna patterns on first use, after a trace and a side-effect review | O5 (pi-tui part) |
+| 6 | [`p6_lazy_modules.md`](p6_lazy_modules.md) | Evaluate marked, pi-tui's utils and the modules reading them at load on first use, after a trace and a side-effect review | O5 (pi-tui part) |
 | 7 | [`p7_session_bench.md`](p7_session_bench.md) | Session scenarios in `bench`: a long answer, a write and 8 MiB of bash output in the TUI, 40 RPC turns. Profile and rank each | bench: idle machine |
 | 8 | [`p8_incremental_markdown.md`](p8_incremental_markdown.md) | Lex and render only the last two blocks of a streaming answer: probe 36.7 s of CPU for 60 k characters, quadratic | O6; bench: idle machine |
 

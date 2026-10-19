@@ -2,7 +2,7 @@
 // Usage: node build.mjs <config.json>. Generated per build by `pibake bundle`; see src/bundle.rs.
 import { readFile } from "node:fs/promises";
 import { createRequire, isBuiltin } from "node:module";
-import { dirname, extname, isAbsolute, join, relative, sep } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, relative, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const config = JSON.parse(await readFile(process.argv[2], "utf8"));
@@ -41,6 +41,8 @@ const overridden = new Set();
 const optional = new Set(config.optional ?? []);
 const fixes = [];
 const shimmed = new Set();
+// `lazy.files` entries some import resolved to.
+const wrapped = new Set();
 const loaders = { ".ts": "ts", ".mts": "ts", ".cts": "ts", ".tsx": "tsx", ".jsx": "jsx" };
 
 const plugin = {
@@ -204,40 +206,77 @@ const LOCATION_DEFINES = {
 };
 
 /**
- * The listed builtins and packages are loaded on first use instead of at import: in a snapshot,
- * loading them creates native state it cannot hold; undici is not needed before the first
- * request (`lazy_http_dispatcher`). Each import gets an object with a getter per export name, read
- * from the real module in this process.
+ * The listed builtins, packages and files are loaded on first use instead of at import: in a
+ * snapshot, loading them creates native state it cannot hold; undici is not needed before the
+ * first request (`lazy_http_dispatcher`); the files' top levels build values startup does not use
+ * (`lazy_modules`). Each import gets an object with a getter per export name, read from the real
+ * module in this process. A file's `fixed` exports, which its code never reassigns, become plain
+ * values once loaded: a getter costs every later read.
  */
 function lazyModules(build, lazy) {
 	const builtins = new Set(lazy.builtins);
 	const packages = new Set(lazy.packages);
-	const names = [...builtins, ...packages].map((n) => n.replace(/[/.]/g, "\\$&")).join("|");
-	build.onResolve({ filter: new RegExp(`^(node:)?(${names})$`) }, async (args) => {
-		if (args.namespace === "pibake-lazy") return undefined;
-		const name = args.path.replace(/^node:/, "");
-		if (builtins.has(name) && isBuiltin(args.path)) return { path: `node:${name}`, namespace: "pibake-lazy" };
-		if (!packages.has(args.path)) return undefined;
-		const r = await build.resolve(args.path, { importer: args.importer, resolveDir: args.resolveDir, kind: args.kind, namespace: "pibake-lazy" });
-		if (r.errors.length) return undefined;
-		// Stage-relative, so the stage's path stays out of the bundle's module names.
-		return { path: relative(config.stage, r.path), namespace: "pibake-lazy", pluginData: { name } };
-	});
+	const files = new Map((lazy.files ?? []).map((f) => [join(config.stage, f.file), f]));
+	const escape = (n) => n.replace(/[/.$]/g, "\\$&");
+	// Stage-relative, so the stage's path stays out of the bundle's module names.
+	const toLazy = (path, pluginData) => ({ path: relative(config.stage, path), namespace: "pibake-lazy", pluginData });
+	const resolveReal = (args) =>
+		build.resolve(args.path, { importer: args.importer, resolveDir: args.resolveDir, kind: args.kind, namespace: "pibake-lazy" });
+	const names = [...builtins, ...packages].map(escape).join("|");
+	if (names) {
+		build.onResolve({ filter: new RegExp(`^(node:)?(${names})$`) }, async (args) => {
+			if (args.namespace === "pibake-lazy") return undefined;
+			const name = args.path.replace(/^node:/, "");
+			if (builtins.has(name) && isBuiltin(args.path)) return { path: `node:${name}`, namespace: "pibake-lazy" };
+			if (!packages.has(args.path)) return undefined;
+			const r = await resolveReal(args);
+			return r.errors.length ? undefined : toLazy(r.path, { name });
+		});
+	}
+	if (files.size) {
+		// A file is imported by a path ending in its own name, or by its package's name.
+		const ends = [...files.values()].flatMap((f) => [basename(f.file), packageOf(f.file)]);
+		build.onResolve({ filter: new RegExp(`(^|/)(${[...new Set(ends)].map(escape).join("|")})$`) }, async (args) => {
+			if (args.namespace !== "file") return undefined;
+			const r = await resolveReal(args);
+			const file = !r.errors.length && r.namespace === "file" && files.get(r.path);
+			if (!file) return undefined;
+			wrapped.add(file.file);
+			return toLazy(r.path, { fixed: file.fixed });
+		});
+	}
 	build.onLoad({ filter: /.*/, namespace: "pibake-lazy" }, (args) => {
 		const path = args.path.startsWith("node:") ? args.path : join(config.stage, args.path);
 		const real = createRequire(join(config.stage, "pibake.js"))(path);
 		const getters = Object.getOwnPropertyNames(real)
 			// esbuild's interop reads `__esModule` at import.
-			.map((n) => `\t${JSON.stringify(n)}: ${n === "__esModule" ? `{ value: ${real[n]} }` : `{ enumerable: true, get: () => load()[${JSON.stringify(n)}] }`},\n`)
+			.map((n) => `\t${JSON.stringify(n)}: ${n === "__esModule" ? `{ value: ${real[n]} }` : `{ enumerable: true, configurable: true, get: () => load()[${JSON.stringify(n)}] }`},\n`)
 			.join("");
 		// Code that uses undici's own exports gets the dispatcher stock Pi would have made by then.
-		const first = lazy.http_dispatcher && args.pluginData?.name === "undici" ? `require("pibake:http-dispatcher").materializeHttpDispatcher(), ` : "";
+		const first = lazy.http_dispatcher && args.pluginData?.name === "undici" ? `require("pibake:http-dispatcher").materializeHttpDispatcher();\n\t` : "";
+		const fixed = JSON.stringify(args.pluginData?.fixed ?? []);
+		// `loading`: a read while the module evaluates (an import cycle) gets it as it stands.
 		return {
-			contents: `let real;\nconst load = () => (real ??= (${first}require(${JSON.stringify(path)})));\nmodule.exports = Object.defineProperties({}, {\n${getters}});\n`,
+			contents: `let real, loading;
+const load = () => {
+	if (real) return real;
+	if (loading) return require(${JSON.stringify(path)});
+	loading = true;
+	${first}const r = require(${JSON.stringify(path)});
+	for (const n of ${fixed}) Object.defineProperty(module.exports, n, { value: r[n], enumerable: true });
+	return (real = r);
+};
+module.exports = Object.defineProperties({}, {\n${getters}});\n`,
 			resolveDir: path.startsWith("node:") ? config.stage : dirname(path),
 			loader: "js",
 		};
 	});
+}
+
+/** `node_modules/@s/p/dist/x.js` → `@s/p`. */
+function packageOf(file) {
+	const parts = file.split("node_modules/").pop().split("/");
+	return parts.slice(0, parts[0].startsWith("@") ? 2 : 1).join("/");
 }
 
 function jitiShim(id) {
@@ -286,6 +325,12 @@ const result = await esbuild.build({
 for (const id of ["jiti", "jiti/static"]) {
 	if (result.errors.length === 0 && !shimmed.has(id)) {
 		result.errors.push({ text: `pibake: Pi's extension loader no longer imports "${id}" from ${loaderDir}/jiti-*loader.js` });
+	}
+}
+
+for (const { file } of config.lazy?.files ?? []) {
+	if (result.errors.length === 0 && !wrapped.has(file)) {
+		result.errors.push({ text: `pibake: lazy_modules lists ${file}, but the bundle never imports it` });
 	}
 }
 
