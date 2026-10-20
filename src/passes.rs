@@ -12,6 +12,7 @@
 pub mod ascii_bundle;
 mod incremental_markdown;
 mod incremental_tool_json;
+mod keep_alive_http;
 mod lazy_http_dispatcher;
 pub mod lazy_modules;
 pub mod snapshot_safety;
@@ -45,6 +46,8 @@ pub enum Pass {
     IncrementalMarkdown,
     /// Makes Pi's HTTP dispatcher on first use instead of at startup, and loads undici then.
     LazyHttpDispatcher,
+    /// Keeps idle provider connections for 120 s instead of undici's 4 s.
+    KeepAliveHttp,
     /// Evaluates `lazy_modules::FILES` on first use instead of at startup; not on the snapshot.
     LazyModules,
     /// Defers module code that reads launch state; added by `backend = "sea_snapshot"`.
@@ -62,6 +65,7 @@ impl Pass {
             Pass::IncrementalToolJson => "incremental_tool_json",
             Pass::IncrementalMarkdown => "incremental_markdown",
             Pass::LazyHttpDispatcher => "lazy_http_dispatcher",
+            Pass::KeepAliveHttp => "keep_alive_http",
             Pass::LazyModules => "lazy_modules",
             Pass::SnapshotSafety => "snapshot_safety",
             Pass::AsciiBundle => "ascii_bundle",
@@ -69,12 +73,13 @@ impl Pass {
     }
 }
 
-pub const DEFAULT_PASSES: [Pass; 7] = [
+pub const DEFAULT_PASSES: [Pass; 8] = [
     Pass::TrimHighlight,
     Pass::TrimApis,
     Pass::IncrementalToolJson,
     Pass::IncrementalMarkdown,
     Pass::LazyHttpDispatcher,
+    Pass::KeepAliveHttp,
     Pass::LazyModules,
     Pass::AsciiBundle,
 ];
@@ -192,6 +197,10 @@ pub fn run(stage: &Path, options: &Options, setup: &Setup) -> Result<Output> {
             ),
             Pass::LazyHttpDispatcher => (
                 lazy_http_dispatcher::run(&mut sources).context("pass lazy_http_dispatcher")?,
+                vec![],
+            ),
+            Pass::KeepAliveHttp => (
+                keep_alive_http::run(&mut sources).context("pass keep_alive_http")?,
                 vec![],
             ),
             Pass::SnapshotSafety => (

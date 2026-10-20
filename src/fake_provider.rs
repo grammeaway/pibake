@@ -3,7 +3,7 @@
 
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -322,37 +322,47 @@ pub struct FakeProvider {
     /// `None` when unrecorded.
     requests: Option<Arc<Mutex<Vec<Value>>>>,
     stop: Arc<AtomicBool>,
+    connections: Arc<AtomicUsize>,
     accept_loop: Option<JoinHandle<()>>,
 }
 
 impl FakeProvider {
     pub fn start() -> Result<Self> {
-        Self::new(BIG_WRITE_BYTES, true)
+        Self::new(BIG_WRITE_BYTES, true, false)
+    }
+
+    /// As `start`, keeping each connection open for the client's next request, as real
+    /// providers do; answers are sent chunked.
+    pub fn keep_alive() -> Result<Self> {
+        Self::new(BIG_WRITE_BYTES, true, true)
     }
 
     /// As `start`, with a `big_write` file of `bytes` and no requests kept: a bench would grow by
     /// every context sent, and a forked Pi starts with that RSS in its `ru_maxrss`.
     pub fn unrecorded(bytes: usize) -> Result<Self> {
-        Self::new(bytes, false)
+        Self::new(bytes, false, false)
     }
 
-    fn new(bytes: usize, record: bool) -> Result<Self> {
+    fn new(bytes: usize, record: bool, keep_alive: bool) -> Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").context("binding the fake provider")?;
         let port = listener.local_addr()?.port();
         let requests = record.then(|| Arc::new(Mutex::new(Vec::new())));
         let stop = Arc::new(AtomicBool::new(false));
+        let connections = Arc::new(AtomicUsize::new(0));
         let content: Arc<str> = big_write_content(bytes).into();
         let accept_loop = {
-            let (requests, stop) = (requests.clone(), stop.clone());
+            let (requests, stop, connections) =
+                (requests.clone(), stop.clone(), connections.clone());
             std::thread::spawn(move || {
                 for stream in listener.incoming() {
                     if stop.load(Ordering::SeqCst) {
                         break;
                     }
                     let Ok(stream) = stream else { continue };
+                    connections.fetch_add(1, Ordering::SeqCst);
                     let (requests, content) = (requests.clone(), content.clone());
                     std::thread::spawn(move || {
-                        if let Err(e) = serve(stream, requests.as_deref(), &content) {
+                        if let Err(e) = serve(stream, requests.as_deref(), &content, keep_alive) {
                             eprintln!("pibake_fake: {e:#}");
                         }
                     });
@@ -363,12 +373,18 @@ impl FakeProvider {
             port,
             requests,
             stop,
+            connections,
             accept_loop: Some(accept_loop),
         })
     }
 
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    /// Connections accepted so far.
+    pub fn connections(&self) -> usize {
+        self.connections.load(Ordering::SeqCst)
     }
 
     pub fn base_url(&self) -> String {
@@ -450,21 +466,42 @@ fn read_request(reader: &mut impl BufRead) -> Result<Option<Request>> {
     Ok(Some(Request { method, path, body }))
 }
 
-fn serve(stream: TcpStream, requests: Option<&Mutex<Vec<Value>>>, content: &str) -> Result<()> {
+/// Answers one request per connection, or, with `keep_alive`, every request until the client
+/// closes.
+fn serve(
+    stream: TcpStream,
+    requests: Option<&Mutex<Vec<Value>>>,
+    content: &str,
+    keep_alive: bool,
+) -> Result<()> {
     stream.set_nodelay(true)?;
     let mut reader = BufReader::new(stream.try_clone()?);
-    let Some(request) = read_request(&mut reader)? else {
-        return Ok(());
-    };
-    let mut out = BufWriter::new(&stream);
-    let status = |out: &mut BufWriter<&TcpStream>, code: &str, msg: &str| -> Result<()> {
+    while let Some(request) = read_request(&mut reader)? {
+        if !respond(&stream, request, requests, content, keep_alive)? {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Whether the connection stays open for another request.
+fn respond(
+    stream: &TcpStream,
+    request: Request,
+    requests: Option<&Mutex<Vec<Value>>>,
+    content: &str,
+    keep_alive: bool,
+) -> Result<bool> {
+    let mut out = BufWriter::new(stream);
+    let status = |out: &mut BufWriter<&TcpStream>, code: &str, msg: &str| -> Result<bool> {
         let body = json!({ "error": { "message": msg } }).to_string();
         write!(
             out,
             "HTTP/1.1 {code}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         )?;
-        Ok(out.flush()?)
+        out.flush()?;
+        Ok(false)
     };
     if request.method != "POST" || !request.path.ends_with("/chat/completions") {
         return status(
@@ -489,23 +526,39 @@ fn serve(stream: TcpStream, requests: Option<&Mutex<Vec<Value>>>, content: &str)
     let Some(script) = body["model"].as_str().and_then(Script::from_model_id) else {
         return status(&mut out, "404 Not Found", "unknown model");
     };
+    let framing = if keep_alive {
+        "Transfer-Encoding: chunked\r\nConnection: keep-alive"
+    } else {
+        "Connection: close"
+    };
     write!(
         out,
-        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n{framing}\r\n\r\n"
     )?;
     out.flush()?;
+    let mut send = |data: &str| -> Result<()> {
+        if keep_alive {
+            write!(out, "{:x}\r\n{data}\r\n", data.len())?;
+        } else {
+            out.write_all(data.as_bytes())?;
+        }
+        Ok(out.flush()?)
+    };
     for (i, event) in events(script, &body, content).into_iter().enumerate() {
         if i > 0 {
             std::thread::sleep(script.pace());
         }
-        write!(out, "data: {event}\n\n")?;
-        out.flush()?;
+        send(&format!("data: {event}\n\n"))?;
     }
-    write!(out, "data: [DONE]\n\n")?;
-    out.flush()?;
+    send("data: [DONE]\n\n")?;
+    if keep_alive {
+        out.write_all(b"0\r\n\r\n")?;
+        out.flush()?;
+        return Ok(true);
+    }
     drop(out);
     let _ = stream.shutdown(Shutdown::Write);
-    Ok(())
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -782,6 +835,34 @@ mod tests {
         assert!(unknown.starts_with("HTTP/1.1 404"), "{unknown}");
         assert!(post(port, "{not json").starts_with("HTTP/1.1 400"));
         assert_eq!(server.request_count(), 2);
+    }
+
+    #[test]
+    fn keep_alive_answers_chunked_on_one_connection() {
+        let server = FakeProvider::keep_alive().unwrap();
+        let stream = TcpStream::connect(("127.0.0.1", server.port())).unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let body = agent_request("hello", "user").to_string();
+        for _ in 0..2 {
+            write!(
+                &stream,
+                "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            let mut response = String::new();
+            while !response.ends_with("\r\n0\r\n\r\n") {
+                assert!(reader.read_line(&mut response).unwrap() > 0, "{response}");
+            }
+            assert!(response.contains("Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n"));
+            assert!(response.contains(HELLO_TEXT));
+            assert!(
+                response.contains("\r\ne\r\ndata: [DONE]\n\n\r\n"),
+                "{response}"
+            );
+        }
+        assert_eq!(server.request_count(), 2);
+        assert_eq!(server.connections(), 1);
     }
 
     #[test]

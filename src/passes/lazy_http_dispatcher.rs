@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use oxc::allocator::Allocator;
 use oxc::span::SourceType;
 
-use super::{Change, Sources, parse};
+use super::{Change, Sources, keep_alive_http, parse};
 use crate::lock::PI_PACKAGE;
 
 const FILE: &str = "dist/core/http-dispatcher.js";
@@ -103,12 +103,16 @@ fn rewrite(text: &str, rel: &str, globals: &[String]) -> Result<String> {
     if text.contains(STOCK) {
         bail!("{rel} already defines {STOCK}");
     }
-    let stock = format!("{DECLARATION}{BODY}");
-    if text.matches(&stock).count() != 1 {
+    let plain = format!("{DECLARATION}{BODY}");
+    // `keep_alive_http` may have run first.
+    let Some(stock) = [keep_alive_http::with_keep_alive(&plain), plain]
+        .into_iter()
+        .find(|stock| text.matches(stock.as_str()).count() == 1)
+    else {
         bail!(
             "{rel}: `configureHttpDispatcher` is not the one pibake's lazy_http_dispatcher knows; it needs an update"
         );
-    }
+    };
     let renamed = stock.replacen(
         "export function configureHttpDispatcher(",
         &format!("function {STOCK}("),
@@ -164,6 +168,17 @@ mod tests {
         );
         let twice = format!("{}{DECLARATION}{BODY}\n", file());
         assert!(rewrite(&twice, "h.js", &[]).is_err());
+    }
+
+    #[test]
+    fn keeps_keep_alive_http_when_it_ran_first() {
+        let kept = keep_alive_http::with_keep_alive(&file());
+        assert_ne!(kept, file());
+        let out = rewrite(&kept, "h.js", &[]).unwrap();
+        assert_eq!(
+            out,
+            keep_alive_http::with_keep_alive(&rewrite(&file(), "h.js", &[]).unwrap())
+        );
     }
 
     #[test]
