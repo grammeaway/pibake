@@ -30,6 +30,9 @@ pub enum Backend {
     SeaCodecache,
     /// A CommonJS main whose evaluated modules ship as a V8 startup snapshot.
     SeaSnapshot,
+    /// A CommonJS bundle with a code cache trained at build time by running the setup (its
+    /// extensions included) in a throwaway home. Opt-in.
+    SeaTrained,
 }
 
 #[derive(Deserialize, Default)]
@@ -192,6 +195,9 @@ mod tests {
         let snapshot = parse("[build]\nbackend = \"sea_snapshot\"").unwrap();
         assert_eq!(snapshot.backend, Backend::SeaSnapshot);
         assert!(snapshot.passes.snapshot);
+        let trained = parse("[build]\nbackend = \"sea_trained\"").unwrap();
+        assert_eq!(trained.backend, Backend::SeaTrained);
+        assert!(!trained.passes.snapshot);
         let err = parse("[build]\nbackend = \"bun\"").unwrap_err();
         assert!(format!("{err:#}").contains("sea_snapshot"), "{err:#}");
         let err = parse("[build]\npasses = [\"snapshot_safety\"]").unwrap_err();

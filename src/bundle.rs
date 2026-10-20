@@ -1,5 +1,6 @@
-//! `pibake bundle`: Pi and every extension entry point of the stage in one file: an ES module, or
-//! for the `sea_snapshot` backend a CommonJS script that defers launch state to its resume.
+//! `pibake bundle`: Pi and every extension entry point of the stage in one file: an ES module; for
+//! the `sea_snapshot` backend a CommonJS script that defers launch state to its resume; for
+//! `sea_trained` CommonJS wrapped in one function expression, which a loader compiles and calls.
 //!
 //! Pi's own extension loader still decides what loads, from where and in what order. The bundle
 //! only answers its jiti imports for the baked entry points (see `bundle/build.mjs`), so filters,
@@ -12,12 +13,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
+use oxc::span::SourceType;
 use serde::{Deserialize, Serialize};
 
 use crate::config::Backend;
 use crate::inventory::Inventory;
 use crate::lock::PI_PACKAGE;
-use crate::passes::{self, PassReport, snapshot_safety};
+use crate::passes::{self, Pass, PassReport, snapshot_safety};
 use crate::paths;
 use crate::stage::{self, Outcome};
 
@@ -29,12 +31,28 @@ pub const REPORT: &str = "report.json";
 const BUILD_SCRIPT: &str = include_str!("bundle/build.mjs");
 const PROLOGUE: &str = include_str!("bundle/prologue.mjs");
 const PROLOGUE_SNAPSHOT: &str = include_str!("bundle/prologue_snapshot.cjs");
+const PROLOGUE_TRAINED: &str = include_str!("bundle/prologue_trained.cjs");
+/// `sea_trained`'s plain-`node` launcher.
+const LAUNCHER_TRAINED: &str = include_str!("bundle/pi.cjs");
+/// `sea_trained`'s executable main, in the bundle so its path, which the executable embeds, is
+/// stable.
+const LOADER: (&str, &str) = ("loader.cjs", include_str!("bundle/loader_trained.cjs"));
+/// Around a `sea_trained` bundle: the module wrapper as a function expression, so a loader can
+/// compile the bundle text as it is, with a code cache, without a 20 MB concatenation.
+const WRAPPER: (&str, &str) = (
+    "(function (exports, require, module, __filename, __dirname) {\n",
+    "\n})",
+);
 /// Both prologues' extraction of an executable's files, spliced in at `// pibake:extract`.
 const EXTRACT: &str = include_str!("bundle/extract.js");
 /// `pibake:staleness`: the entry's check of the setup an executable was built from.
 pub const STALENESS: &str = include_str!("bundle/staleness.mjs");
 /// `pibake:tool-json`: what `incremental_tool_json` calls instead of per-delta `parseStreamingJson`.
 pub const TOOL_JSON: &str = include_str!("bundle/tool_json.mjs");
+/// `pibake:http-dispatcher`: where `lazy_http_dispatcher` defers Pi's `configureHttpDispatcher`.
+pub const HTTP_DISPATCHER: &str = include_str!("bundle/http_dispatcher.mjs");
+/// `pibake:markdown`: where `incremental_markdown` sends Markdown's lexes and block rendering.
+pub const MARKDOWN: &str = include_str!("bundle/markdown.mjs");
 /// `pibake:frozen`'s code: the entry's check of settings passes baked in; `frozen_module` adds
 /// the data.
 pub const FROZEN: &str = include_str!("bundle/frozen.mjs");
@@ -270,6 +288,10 @@ struct Flavor {
     main: &'static str,
     entry: &'static str,
     prologue: &'static str,
+    /// What `node` runs, and its text, if not `main`.
+    launcher: Option<(&'static str, &'static str)>,
+    /// The executable's main, and its text, if not `main`; it runs `main` wrapped in `WRAPPER`.
+    loader: Option<(&'static str, &'static str)>,
 }
 
 fn flavor(backend: Backend) -> Flavor {
@@ -279,12 +301,24 @@ fn flavor(backend: Backend) -> Flavor {
             main: "main.mjs",
             entry: ENTRY,
             prologue: PROLOGUE,
+            launcher: Some((LAUNCHER, LAUNCHER_TEXT)),
+            loader: None,
         },
         Backend::SeaSnapshot => Flavor {
             format: "cjs",
             main: "main.cjs",
             entry: ENTRY_SNAPSHOT,
             prologue: PROLOGUE_SNAPSHOT,
+            launcher: None,
+            loader: None,
+        },
+        Backend::SeaTrained => Flavor {
+            format: "cjs",
+            main: "main.cjs",
+            entry: ENTRY,
+            prologue: PROLOGUE_TRAINED,
+            launcher: Some(("pi.cjs", LAUNCHER_TRAINED)),
+            loader: Some(LOADER),
         },
     }
 }
@@ -294,19 +328,31 @@ pub fn main_file(backend: Backend) -> &'static str {
     flavor(backend).main
 }
 
-/// What `node` runs: the launcher of an ES module bundle, or a CommonJS bundle itself.
-pub fn launcher(backend: Backend) -> &'static str {
-    match backend {
-        Backend::SeaCodecache => LAUNCHER,
-        Backend::SeaSnapshot => main_file(backend),
-    }
+/// The executable's main: a loader of the main file, or the main file itself.
+pub fn sea_main(backend: Backend) -> &'static str {
+    let flavor = flavor(backend);
+    flavor.loader.map_or(flavor.main, |(name, _)| name)
 }
 
-fn prologue(text: &str, stage: &Path) -> String {
-    text.replace("// pibake:extract\n", EXTRACT).replace(
-        r#""__PIBAKE_STAGE__""#,
-        &js_string(&stage.to_string_lossy()),
-    )
+/// What `node` runs: a launcher, or a snapshot's CommonJS bundle itself.
+pub fn launcher(backend: Backend) -> &'static str {
+    let flavor = flavor(backend);
+    flavor.launcher.map_or(flavor.main, |(name, _)| name)
+}
+
+fn prologue(flavor: &Flavor, stage: &Path) -> String {
+    let text = flavor
+        .prologue
+        .replace("// pibake:extract\n", EXTRACT)
+        .replace(
+            r#""__PIBAKE_STAGE__""#,
+            &js_string(&stage.to_string_lossy()),
+        );
+    if flavor.loader.is_some() {
+        format!("{}{text}", WRAPPER.0)
+    } else {
+        text
+    }
 }
 
 fn js_string(s: &str) -> String {
@@ -369,12 +415,19 @@ pub struct BuildConfig {
     pub entry: String,
     /// The bundle's first code: where it is (the stage, or extracted files in an executable).
     pub prologue: String,
+    /// The bundle's last code, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub footer: Option<&'static str>,
     /// The module `pibake:staleness`.
     pub staleness: String,
     /// The module `pibake:frozen`.
     pub frozen: String,
     /// The module `pibake:tool-json`.
     pub tool_json: String,
+    /// The module `pibake:http-dispatcher`.
+    pub http_dispatcher: String,
+    /// The module `pibake:markdown`.
+    pub markdown: String,
     pub baked: String,
     /// Absolute stage directory → agent-relative directory.
     pub owned: Vec<Owned>,
@@ -386,7 +439,7 @@ pub struct BuildConfig {
     pub optional: Vec<String>,
     /// esbuild's output format: `esm` or `cjs`.
     pub format: &'static str,
-    /// Modules loaded on first use rather than at import (snapshot bundles).
+    /// Modules loaded on first use rather than at import.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lazy: Option<Lazy>,
 }
@@ -395,6 +448,9 @@ pub struct BuildConfig {
 pub struct Lazy {
     pub builtins: Vec<&'static str>,
     pub packages: Vec<&'static str>,
+    pub files: Vec<passes::lazy_modules::LazyFile>,
+    /// undici's first load makes the dispatcher `lazy_http_dispatcher` deferred.
+    pub http_dispatcher: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -652,10 +708,6 @@ impl Bundler<'_> {
         let pi_dir = plan.pi_dir();
         check_pi(&pi_dir)?;
         let flavor = flavor(self.backend);
-        let lazy = (self.backend == Backend::SeaSnapshot).then(|| Lazy {
-            builtins: snapshot_safety::LAZY_BUILTINS.to_vec(),
-            packages: snapshot_safety::LAZY_PACKAGES.to_vec(),
-        });
         let all: Vec<&Baked> = plan.baked.iter().collect();
         let owned: Vec<Owned> = plan
             .owned
@@ -673,6 +725,27 @@ impl Bundler<'_> {
             extension_dirs: plan.owned.iter().map(|o| o.stage.clone()).collect(),
         };
         let rewritten = passes::run(&plan.stage, self.passes, &setup)?;
+        let http_dispatcher = self.passes.passes.contains(&Pass::LazyHttpDispatcher);
+        let lazy = if self.backend == Backend::SeaSnapshot {
+            Some(Lazy {
+                builtins: snapshot_safety::LAZY_BUILTINS.to_vec(),
+                packages: snapshot_safety::LAZY_PACKAGES.to_vec(),
+                files: vec![],
+                http_dispatcher,
+            })
+        } else {
+            let files = rewritten.lazy.clone();
+            (http_dispatcher || !files.is_empty()).then(|| Lazy {
+                builtins: vec![],
+                packages: if http_dispatcher {
+                    vec!["undici"]
+                } else {
+                    vec![]
+                },
+                files,
+                http_dispatcher,
+            })
+        };
         for p in &rewritten.reports {
             log(format!(
                 "pass {}: {} files rewritten",
@@ -706,13 +779,20 @@ impl Bundler<'_> {
             ("build.mjs", BUILD_SCRIPT.as_bytes()),
             ("format", flavor.format.as_bytes()),
             ("entry", flavor.entry.as_bytes()),
-            ("launcher", LAUNCHER_TEXT.as_bytes()),
+            (
+                "launcher",
+                flavor.launcher.map_or("", |(_, t)| t).as_bytes(),
+            ),
             ("prologue", flavor.prologue.as_bytes()),
+            ("loader", flavor.loader.map_or("", |(_, t)| t).as_bytes()),
+            ("wrapper", [WRAPPER.0, WRAPPER.1].concat().as_bytes()),
             ("extract", EXTRACT.as_bytes()),
             ("lazy", serde_json::to_string(&lazy)?.as_bytes()),
             ("staleness", STALENESS.as_bytes()),
             ("frozen", frozen.as_bytes()),
             ("tool_json", TOOL_JSON.as_bytes()),
+            ("http_dispatcher", HTTP_DISPATCHER.as_bytes()),
+            ("markdown", MARKDOWN.as_bytes()),
             ("baked", baked_all.as_bytes()),
             ("owned", owned_json.as_bytes()),
             ("passes", passes_json.as_bytes()),
@@ -724,10 +804,13 @@ impl Bundler<'_> {
                 stage: plan.stage.clone(),
                 pi_dir: pi_dir.clone(),
                 entry: flavor.entry.to_owned(),
-                prologue: prologue(flavor.prologue, &plan.stage),
+                prologue: prologue(&flavor, &plan.stage),
+                footer: flavor.loader.map(|_| WRAPPER.1),
                 staleness: STALENESS.to_owned(),
                 frozen: frozen.clone(),
                 tool_json: TOOL_JSON.to_owned(),
+                http_dispatcher: HTTP_DISPATCHER.to_owned(),
+                markdown: MARKDOWN.to_owned(),
                 baked: baked_module(baked),
                 owned: owned.clone(),
                 outfile: dir.join(flavor.main),
@@ -767,8 +850,13 @@ impl Bundler<'_> {
             }
             let mut report = report(&plan.baked, &failed, &result, plan.unbaked.clone());
             report.passes = rewritten.reports.clone();
-            if self.backend == Backend::SeaCodecache {
-                fs::write(dir.join(LAUNCHER), LAUNCHER_TEXT)?;
+            if self.passes.passes.contains(&Pass::AsciiBundle) {
+                report
+                    .passes
+                    .push(ascii_bundle(&dir.join(flavor.main), &flavor)?);
+            }
+            for (name, text) in flavor.launcher.into_iter().chain(flavor.loader) {
+                fs::write(dir.join(name), text)?;
             }
             fs::write(dir.join("entry.mjs"), flavor.entry)?;
             fs::write(dir.join("baked.mjs"), baked_module(&kept))?;
@@ -820,6 +908,33 @@ impl Bundler<'_> {
         }
         Ok(failed)
     }
+}
+
+fn ascii_bundle(main: &Path, flavor: &Flavor) -> Result<PassReport> {
+    let source_type = match flavor.format {
+        "cjs" => SourceType::cjs(),
+        _ => SourceType::mjs(),
+    };
+    let text = fs::read_to_string(main).with_context(|| format!("reading {}", main.display()))?;
+    let mut changes = vec![];
+    if let Some(e) =
+        passes::ascii_bundle::run(&text, source_type, flavor.main).context("pass ascii_bundle")?
+    {
+        fs::write(main, &e.text)?;
+        changes.push(passes::Change {
+            file: flavor.main.to_owned(),
+            what: format!(
+                "escaped {} comments and {} regex literals to ASCII",
+                e.comments, e.regexes
+            ),
+            bytes_removed: 0,
+        });
+    }
+    Ok(PassReport {
+        pass: Pass::AsciiBundle,
+        changes,
+        notes: vec![],
+    })
 }
 
 /// `pibake:frozen`: its check, and what the passes froze.

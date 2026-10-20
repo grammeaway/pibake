@@ -4,10 +4,11 @@ use std::process::ExitCode;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
-use pibake::bench::{self, Bench};
+use pibake::bench::{self, Bench, Scenario};
+use pibake::config::{Backend, Config};
 use pibake::fake_provider::FakeProvider;
 use pibake::harness::PiCommand;
-use pibake::{bundle, config::Config, inventory, lock, paths, sea, snapshot, stage, staleness};
+use pibake::{bundle, inventory, lock, paths, sea, snapshot, stage, staleness, train};
 
 #[derive(Parser)]
 #[command(version, about = "Build a Pi agent directory into one executable")]
@@ -37,7 +38,11 @@ enum Command {
     /// Stage, then bundle Pi and its extensions into target/pibake/bundle/<hash>/pi.mjs
     Bundle,
     /// Check the lock, stage, bundle, then build target/pibake/bin/<name>, a single executable
-    Build,
+    Build {
+        /// Build <name>-profiling instead, with V8's `perf` symbol map and native JS frames
+        #[arg(long)]
+        profiling: bool,
+    },
     /// Build, then copy the executable to ~/.local/bin/<name>
     Install,
     /// Compare tools, system prompt and commands of two Pi commands on the same setup
@@ -49,19 +54,27 @@ enum Command {
         #[arg(long, default_value = "pi")]
         against: String,
     },
-    /// Measure startup and a streamed write (200 KiB by default), interleaved across Pi commands
+    /// Measure startup (RPC, interactive), a streamed write (200 KiB by default) and session
+    /// scenarios, interleaved across Pi commands
     Bench {
         /// A Pi command to measure; repeat to compare
         #[arg(long = "pi", required = true)]
         pi: Vec<String>,
         #[arg(long, default_value_t = 10)]
         runs: usize,
-        /// Size of the streamed write, in KiB
+        /// The scenarios to run, comma-separated [default: all]
+        #[arg(long, value_enum, value_delimiter = ',')]
+        scenarios: Vec<Scenario>,
+        /// Size of the streamed write, in KiB, in `big_write` and `tui_write`; 0 skips both
         #[arg(long, default_value_t = 200)]
         big_write_kib: usize,
         /// Write the results to bench_results/<date>_<label>.json
         #[arg(long)]
         record: Option<String>,
+        /// Also count each run's user-space instructions with `perf stat` (`*_minstr`): far less
+        /// noisy than time. Needs `perf`; times then include perf's own small overhead
+        #[arg(long)]
+        perf_stat: bool,
     },
 }
 
@@ -130,7 +143,12 @@ fn run_bundle(
 }
 
 /// The built executable, or `None` when the setup drifted from the lock (reported to `out`).
-fn run_build(config: &Config, home: &Path, out: &mut dyn Write) -> Result<Option<PathBuf>> {
+fn run_build(
+    config: &Config,
+    home: &Path,
+    profiling: bool,
+    out: &mut dyn Write,
+) -> Result<Option<PathBuf>> {
     let inventory = inventory::read(&config.agent_dir, home)?;
     let host = lock::Host::find()?;
     let setup = serde_json::to_value(staleness::read(&inventory, &host)?)?;
@@ -149,7 +167,38 @@ fn run_build(config: &Config, home: &Path, out: &mut dyn Write) -> Result<Option
         env!("CARGO_PKG_VERSION"),
         &lock::sha256_hex(&lock_text)[..12]
     );
-    let output = config.dir.join(sea::BIN_ROOT).join(&config.name);
+    let (name, v8_flags) = if profiling {
+        (
+            format!("{}-profiling", config.name),
+            sea::profiling_flags(config.backend),
+        )
+    } else {
+        (config.name.clone(), &[][..])
+    };
+    let output = config.dir.join(sea::BIN_ROOT).join(name);
+    let code_cache = if config.backend == Backend::SeaTrained {
+        let trainer = train::Trainer {
+            root: &config.dir.join(train::TRAIN_ROOT),
+            bundle: &bundle_dir,
+            node_version: &host.node_version,
+            v8_flags,
+            source: &config.agent_dir,
+            real_home: home,
+        };
+        eprintln!("build: training the code cache");
+        Some(match trainer.run(&mut |step| eprintln!("{step}"))? {
+            stage::Outcome::Cached(cache) => {
+                writeln!(out, "trained code cache up to date: {}", cache.display())?;
+                cache
+            }
+            stage::Outcome::Built(cache) => {
+                writeln!(out, "trained code cache: {}", cache.display())?;
+                cache
+            }
+        })
+    } else {
+        None
+    };
     eprintln!("build: node --build-sea");
     let kept = sea::Builder {
         stage: &stage_dir,
@@ -159,7 +208,10 @@ fn run_build(config: &Config, home: &Path, out: &mut dyn Write) -> Result<Option
         version: &version,
         setup: &setup,
         output: &output,
+        v8_flags,
+        code_cache: code_cache.as_deref(),
         node: &sea::run_node,
+        check: &sea::check_code_cache,
     }
     .run()?;
     for k in kept {
@@ -218,13 +270,13 @@ fn main() -> Result<ExitCode> {
             let inventory = inventory::read(&config.agent_dir, &home)?;
             run_bundle(&config, &inventory, &mut out)?;
         }
-        Command::Build => {
-            if run_build(&config, &home, &mut out)?.is_none() {
+        Command::Build { profiling } => {
+            if run_build(&config, &home, profiling, &mut out)?.is_none() {
                 return Ok(ExitCode::FAILURE);
             }
         }
         Command::Install => {
-            let Some(built) = run_build(&config, &home, &mut out)? else {
+            let Some(built) = run_build(&config, &home, false, &mut out)? else {
                 return Ok(ExitCode::FAILURE);
             };
             let to = home.join(".local/bin").join(&config.name);
@@ -252,14 +304,13 @@ fn main() -> Result<ExitCode> {
         Command::Bench {
             pi,
             runs,
+            scenarios,
             big_write_kib,
             record,
+            perf_stat,
         } => {
             if runs == 0 {
                 bail!("--runs must be at least 1");
-            }
-            if big_write_kib == 0 {
-                bail!("--big-write-kib must be at least 1");
             }
             let commands = pi
                 .iter()
@@ -268,20 +319,20 @@ fn main() -> Result<ExitCode> {
             let bench = Bench {
                 commands: &commands,
                 runs,
+                scenarios: if scenarios.is_empty() {
+                    &Scenario::ALL
+                } else {
+                    &scenarios
+                },
                 big_write_bytes: big_write_kib * 1024,
                 source: &config.agent_dir,
                 real_home: &home,
+                perf_stat,
             };
             let results = bench.run(|step| eprintln!("bench: {step}"))?;
             write!(out, "{}", bench::render_table(&results))?;
             if let Some(label) = record {
-                let path = bench::record(
-                    Path::new("bench_results"),
-                    &label,
-                    runs,
-                    bench.big_write_bytes,
-                    &results,
-                )?;
+                let path = bench::record(Path::new("bench_results"), &label, &bench, &results)?;
                 writeln!(out, "recorded: {}", path.display())?;
             }
         }

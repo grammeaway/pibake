@@ -6,6 +6,7 @@ use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -17,7 +18,32 @@ pub const BIG_WRITE_BYTES: usize = 200 * 1024;
 /// Real providers stream tool arguments in small pieces; the per-chunk cost is what l11 targets.
 pub const DELTA_BYTES: usize = 20;
 const HELLO_TEXT: &str = "Hello from pibake_fake.";
-const DONE_TEXT: &str = "Done.";
+/// The text closing a scripted turn; the session scenarios watch the screen for it.
+pub const DONE_TEXT: &str = "pibake-fake-done";
+/// The answer to an extension's own model call, which must not look like the turn's end.
+const SIDE_TEXT: &str = "pibake-fake-side";
+/// Starts the answer to a request the script did not expect, e.g. a tool result missing its end.
+pub const UNEXPECTED_TEXT: &str = "pibake-fake-unexpected";
+
+/// The `long_answer` Markdown, streamed `ANSWER_DELTA_BYTES` per delta every `ANSWER_PACE`.
+pub const LONG_ANSWER_BYTES: usize = 20 * 1024;
+/// The last line of the long answer.
+pub const LONG_ANSWER_END: &str = "pibake-answer-end";
+const ANSWER_DELTA_BYTES: usize = 24;
+const ANSWER_PACE: Duration = Duration::from_millis(20);
+
+/// `seq 1 BIG_OUTPUT_LINES` prints exactly `BIG_OUTPUT_BYTES`.
+pub const BIG_OUTPUT_LINES: u64 = 1_187_464;
+pub const BIG_OUTPUT_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Each `long_session` turn reads this file from the working directory, then answers.
+pub const SESSION_FILE: &str = "session_read.md";
+pub const SESSION_FILE_BYTES: usize = 16 * 1024;
+const SESSION_FILE_END: &str = "pibake-file-end";
+pub const SESSION_ANSWER_BYTES: usize = 2 * 1024;
+/// The last line of each `long_session` answer.
+pub const SESSION_TURN_END: &str = "pibake-turn-end";
+
 const MAX_HEAD_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
 
@@ -25,15 +51,35 @@ const MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
 pub enum Script {
     Hello,
     BigWrite,
+    LongAnswer,
+    BigOutput,
+    LongSession,
 }
 
 impl Script {
-    pub const ALL: [Script; 2] = [Script::Hello, Script::BigWrite];
+    pub const ALL: [Script; 5] = [
+        Script::Hello,
+        Script::BigWrite,
+        Script::LongAnswer,
+        Script::BigOutput,
+        Script::LongSession,
+    ];
 
     pub fn model_id(self) -> &'static str {
         match self {
             Script::Hello => "hello",
             Script::BigWrite => "big_write",
+            Script::LongAnswer => "long_answer",
+            Script::BigOutput => "big_output",
+            Script::LongSession => "long_session",
+        }
+    }
+
+    /// The pause between two streamed events.
+    fn pace(self) -> Duration {
+        match self {
+            Script::LongAnswer => ANSWER_PACE,
+            _ => Duration::ZERO,
         }
     }
 
@@ -70,6 +116,72 @@ pub fn big_write_content(bytes: usize) -> String {
     out
 }
 
+/// Deterministic Markdown exactly `bytes` long (at least 256): sections with a heading, a
+/// paragraph with inline styles and non-ASCII text, a list, a table and a code block in one of
+/// four languages, then a filler paragraph and `end` as the last line.
+pub fn markdown_answer(bytes: usize, end: &str) -> String {
+    const LANGUAGES: [(&str, &str); 4] = [
+        (
+            "rust",
+            "fn main() {\n    let n: u64 = (1..=10).sum();\n    println!(\"{n}\");\n}",
+        ),
+        (
+            "python",
+            "def total(xs):\n    return sum(x * 2 for x in xs if x % 3)\n\nprint(total(range(10)))",
+        ),
+        (
+            "javascript",
+            "const total = (xs) => xs.reduce((a, x) => a + x, 0);\nconsole.log(`sum: ${total([1, 2, 3])}`);",
+        ),
+        (
+            "bash",
+            "for f in *.md; do\n  wc -l \"$f\" | awk '{print $1}'\ndone",
+        ),
+    ];
+    let tail = format!("\n\n{end}\n");
+    let mut out = String::with_capacity(bytes);
+    for n in 0.. {
+        let (lang, code) = LANGUAGES[n % LANGUAGES.len()];
+        let section = format!(
+            "## Section {n}: {lang}\n\n\
+             This paragraph has **bold**, *italic* and `inline code`, a [link](https://example.com/{n}), \
+             and text that is not ASCII: caf\u{e9}, na\u{ef}ve, \u{2192}, \u{65e5}\u{672c}.\n\n\
+             - first item {n}\n- second item with `code`\n- third item\n\n\
+             | key | value | note |\n|-----|-------|------|\n| a{n} | {n} | first |\n| b{n} | {} | second |\n\n\
+             ```{lang}\n{code}\n```\n\n",
+            n * 2
+        );
+        if out.len() + section.len() + 64 + tail.len() > bytes {
+            break;
+        }
+        out.push_str(&section);
+    }
+    let filler = "Filler words keep the answer at its exact size. ";
+    while out.len() + tail.len() < bytes {
+        out.push_str(filler);
+    }
+    out.truncate(bytes - tail.len());
+    out.push_str(&tail);
+    out
+}
+
+/// Deterministic ASCII lines exactly `bytes` long (at least 64), ending with `SESSION_FILE_END`.
+pub fn session_file_content(bytes: usize) -> String {
+    let tail = format!("{SESSION_FILE_END}\n");
+    let mut out = String::with_capacity(bytes);
+    let mut line = 0u32;
+    while out.len() + tail.len() < bytes {
+        out.push_str(&format!(
+            "{line:04}: the session reads this file on every turn.\n"
+        ));
+        line += 1;
+    }
+    out.truncate(bytes - tail.len() - 1);
+    out.push('\n');
+    out.push_str(&tail);
+    out
+}
+
 /// Splits `s` into pieces of at most `max_bytes`, on char boundaries. `max_bytes` must be ≥ 4.
 pub fn chunk_str(s: &str, max_bytes: usize) -> Vec<&str> {
     assert!(max_bytes >= 4, "a chunk must fit any UTF-8 char");
@@ -88,28 +200,69 @@ pub fn chunk_str(s: &str, max_bytes: usize) -> Vec<&str> {
 }
 
 enum Reply {
-    Text(&'static str),
-    WriteCall,
+    Text(String),
+    ToolCall { name: &'static str, args: Value },
 }
 
-fn reply_for(script: Script, body: &Value) -> Reply {
+/// A message's text: its `content` as a string, or its text parts joined.
+pub fn content_text(message: &Value) -> String {
+    match &message["content"] {
+        Value::String(s) => s.clone(),
+        Value::Array(parts) => parts.iter().filter_map(|p| p["text"].as_str()).collect(),
+        _ => String::new(),
+    }
+}
+
+/// The text of the request's last message when it is a tool result.
+fn tool_result(body: &Value) -> Option<String> {
+    let last = body["messages"].as_array()?.last()?;
+    (last["role"] == "tool").then(|| content_text(last))
+}
+
+fn reply_for(script: Script, body: &Value, content: &str) -> Reply {
+    let offers = |tool: &str| {
+        body["tools"]
+            .as_array()
+            .is_some_and(|t| t.iter().any(|t| t["function"]["name"] == tool))
+    };
+    let text = |s: &str| Reply::Text(s.to_string());
+    // Extensions make their own model calls (e.g. an observer); only the agent's turn, which
+    // offers the built-in tools, gets the script.
+    let result = tool_result(body);
     match script {
-        Script::Hello => Reply::Text(HELLO_TEXT),
-        Script::BigWrite => {
-            let after_tool = body["messages"]
-                .as_array()
-                .and_then(|m| m.last())
-                .is_some_and(|m| m["role"] == "tool");
-            let offers_write = body["tools"]
-                .as_array()
-                .is_some_and(|t| t.iter().any(|t| t["function"]["name"] == "write"));
-            // Extensions make their own model calls (e.g. an observer); only the agent's turn gets the write.
-            if offers_write && !after_tool {
-                Reply::WriteCall
-            } else {
-                Reply::Text(DONE_TEXT)
+        Script::Hello => text(HELLO_TEXT),
+        Script::BigWrite if !offers("write") => text(SIDE_TEXT),
+        Script::BigWrite => match result {
+            None => Reply::ToolCall {
+                name: "write",
+                args: json!({ "path": BIG_WRITE_PATH, "content": content }),
+            },
+            Some(_) => text(DONE_TEXT),
+        },
+        Script::LongAnswer if !offers("write") => text(SIDE_TEXT),
+        Script::LongAnswer => Reply::Text(markdown_answer(LONG_ANSWER_BYTES, LONG_ANSWER_END)),
+        Script::BigOutput if !offers("bash") => text(SIDE_TEXT),
+        Script::BigOutput => match result {
+            None => Reply::ToolCall {
+                name: "bash",
+                args: json!({ "command": format!("seq 1 {BIG_OUTPUT_LINES}") }),
+            },
+            Some(out) if out.lines().any(|l| l == BIG_OUTPUT_LINES.to_string()) => text(DONE_TEXT),
+            Some(_) => text(&format!(
+                "{UNEXPECTED_TEXT}: the output lacks its last line"
+            )),
+        },
+        Script::LongSession if !offers("read") => text(SIDE_TEXT),
+        Script::LongSession => match result {
+            None => Reply::ToolCall {
+                name: "read",
+                args: json!({ "path": SESSION_FILE }),
+            },
+            Some(out) if out.contains(SESSION_FILE_END) => {
+                Reply::Text(markdown_answer(SESSION_ANSWER_BYTES, SESSION_TURN_END))
             }
-        }
+            Some(_) => text(&format!("{UNEXPECTED_TEXT}: the read lacks the file's end")),
+        },
     }
 }
 
@@ -123,24 +276,32 @@ fn events(script: Script, body: &Value, content: &str) -> Vec<Value> {
         })
     };
     let mut out = Vec::new();
-    match reply_for(script, body) {
+    match reply_for(script, body, content) {
         Reply::Text(text) => {
-            out.push(chunk(
-                json!({ "role": "assistant", "content": text }),
-                Value::Null,
-            ));
+            for (i, piece) in chunk_str(&text, ANSWER_DELTA_BYTES).into_iter().enumerate() {
+                let delta = if i == 0 {
+                    json!({ "role": "assistant", "content": piece })
+                } else {
+                    json!({ "content": piece })
+                };
+                out.push(chunk(delta, Value::Null));
+            }
             out.push(chunk(json!({}), json!("stop")));
         }
-        Reply::WriteCall => {
-            let args = json!({ "path": BIG_WRITE_PATH, "content": content }).to_string();
+        Reply::ToolCall { name, args } => {
+            // Unique per request: a session's turns each call a tool.
+            let id = format!(
+                "call_pibake_{}",
+                body["messages"].as_array().map_or(0, Vec::len)
+            );
             out.push(chunk(
                 json!({ "role": "assistant", "tool_calls": [{
-                    "index": 0, "id": "call_pibake_1", "type": "function",
-                    "function": { "name": "write", "arguments": "" },
+                    "index": 0, "id": id, "type": "function",
+                    "function": { "name": name, "arguments": "" },
                 }]}),
                 Value::Null,
             ));
-            for piece in chunk_str(&args, DELTA_BYTES) {
+            for piece in chunk_str(&args.to_string(), DELTA_BYTES) {
                 out.push(chunk(
                     json!({ "tool_calls": [{ "index": 0, "function": { "arguments": piece } }] }),
                     Value::Null,
@@ -158,21 +319,27 @@ fn events(script: Script, body: &Value, content: &str) -> Vec<Value> {
 
 pub struct FakeProvider {
     port: u16,
-    requests: Arc<Mutex<Vec<Value>>>,
+    /// `None` when unrecorded.
+    requests: Option<Arc<Mutex<Vec<Value>>>>,
     stop: Arc<AtomicBool>,
     accept_loop: Option<JoinHandle<()>>,
 }
 
 impl FakeProvider {
     pub fn start() -> Result<Self> {
-        Self::with_big_write(BIG_WRITE_BYTES)
+        Self::new(BIG_WRITE_BYTES, true)
     }
 
-    /// As `start`, with a `big_write` file of `bytes`.
-    pub fn with_big_write(bytes: usize) -> Result<Self> {
+    /// As `start`, with a `big_write` file of `bytes` and no requests kept: a bench would grow by
+    /// every context sent, and a forked Pi starts with that RSS in its `ru_maxrss`.
+    pub fn unrecorded(bytes: usize) -> Result<Self> {
+        Self::new(bytes, false)
+    }
+
+    fn new(bytes: usize, record: bool) -> Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").context("binding the fake provider")?;
         let port = listener.local_addr()?.port();
-        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests = record.then(|| Arc::new(Mutex::new(Vec::new())));
         let stop = Arc::new(AtomicBool::new(false));
         let content: Arc<str> = big_write_content(bytes).into();
         let accept_loop = {
@@ -185,7 +352,7 @@ impl FakeProvider {
                     let Ok(stream) = stream else { continue };
                     let (requests, content) = (requests.clone(), content.clone());
                     std::thread::spawn(move || {
-                        if let Err(e) = serve(stream, &requests, &content) {
+                        if let Err(e) = serve(stream, requests.as_deref(), &content) {
                             eprintln!("pibake_fake: {e:#}");
                         }
                     });
@@ -210,11 +377,16 @@ impl FakeProvider {
 
     /// Every request body received so far, in arrival order.
     pub fn requests(&self) -> Vec<Value> {
-        self.requests.lock().unwrap().clone()
+        self.recorded().clone()
     }
 
     pub fn request_count(&self) -> usize {
-        self.requests.lock().unwrap().len()
+        self.recorded().len()
+    }
+
+    fn recorded(&self) -> std::sync::MutexGuard<'_, Vec<Value>> {
+        let requests = self.requests.as_ref();
+        requests.expect("an unrecorded provider").lock().unwrap()
     }
 }
 
@@ -278,7 +450,7 @@ fn read_request(reader: &mut impl BufRead) -> Result<Option<Request>> {
     Ok(Some(Request { method, path, body }))
 }
 
-fn serve(stream: TcpStream, requests: &Mutex<Vec<Value>>, content: &str) -> Result<()> {
+fn serve(stream: TcpStream, requests: Option<&Mutex<Vec<Value>>>, content: &str) -> Result<()> {
     stream.set_nodelay(true)?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let Some(request) = read_request(&mut reader)? else {
@@ -311,7 +483,9 @@ fn serve(stream: TcpStream, requests: &Mutex<Vec<Value>>, content: &str) -> Resu
             );
         }
     };
-    requests.lock().unwrap().push(body.clone());
+    if let Some(requests) = requests {
+        requests.lock().unwrap().push(body.clone());
+    }
     let Some(script) = body["model"].as_str().and_then(Script::from_model_id) else {
         return status(&mut out, "404 Not Found", "unknown model");
     };
@@ -320,7 +494,10 @@ fn serve(stream: TcpStream, requests: &Mutex<Vec<Value>>, content: &str) -> Resu
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"
     )?;
     out.flush()?;
-    for event in events(script, &body, content) {
+    for (i, event) in events(script, &body, content).into_iter().enumerate() {
+        if i > 0 {
+            std::thread::sleep(script.pace());
+        }
         write!(out, "data: {event}\n\n")?;
         out.flush()?;
     }
@@ -340,8 +517,24 @@ mod tests {
         json!({
             "model": model,
             "messages": [{ "role": "system", "content": "s" }, { "role": last_role, "content": "x" }],
-            "tools": [{ "type": "function", "function": { "name": "write" } }],
+            "tools": (["read", "bash", "write"]
+                .map(|name| json!({ "type": "function", "function": { "name": name } }))),
         })
+    }
+
+    /// `agent_request` with a tool result as the last message.
+    fn after_tool(model: &str, result: &str) -> Value {
+        let mut body = agent_request(model, "tool");
+        body["messages"][1]["content"] = json!([{ "type": "text", "text": result }]);
+        body
+    }
+
+    fn tool_call(events: &[Value]) -> (String, Value) {
+        let name = events[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        (name, serde_json::from_str(&streamed_args(events)).unwrap())
     }
 
     fn streamed_text(events: &[Value]) -> String {
@@ -411,10 +604,138 @@ mod tests {
         assert_eq!(streamed_text(&after), DONE_TEXT);
         let side =
             json!({ "model": "big_write", "messages": [{ "role": "user", "content": "x" }] });
+        for script in Script::ALL.into_iter().skip(1) {
+            let mut side = side.clone();
+            side["model"] = json!(script.model_id());
+            assert_eq!(
+                streamed_text(&events(script, &side, "c")),
+                SIDE_TEXT,
+                "{script:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn markdown_answers_are_exact_size_and_end_with_their_marker() {
+        for bytes in [256, 300, 2 * 1024, 5000, LONG_ANSWER_BYTES] {
+            let md = markdown_answer(bytes, LONG_ANSWER_END);
+            assert_eq!(md.len(), bytes);
+            assert!(md.ends_with(&format!("\n\n{LONG_ANSWER_END}\n")), "{bytes}");
+            assert_eq!(md.matches(LONG_ANSWER_END).count(), 1);
+        }
+        let md = markdown_answer(LONG_ANSWER_BYTES, LONG_ANSWER_END);
+        for needle in [
+            "## ",
+            "**bold**",
+            "| key |",
+            "```rust",
+            "```python",
+            "```javascript",
+            "```bash",
+            "\u{2192}",
+        ] {
+            assert!(md.contains(needle), "{needle}");
+        }
         assert_eq!(
-            streamed_text(&events(Script::BigWrite, &side, "c")),
-            DONE_TEXT
+            md.matches("```").count() % 2,
+            0,
+            "every code block is closed"
         );
+    }
+
+    #[test]
+    fn the_long_answer_streams_small_paced_deltas() {
+        let events = events(
+            Script::LongAnswer,
+            &agent_request("long_answer", "user"),
+            "c",
+        );
+        assert_eq!(
+            streamed_text(&events),
+            markdown_answer(LONG_ANSWER_BYTES, LONG_ANSWER_END)
+        );
+        let deltas: Vec<&str> = events
+            .iter()
+            .filter_map(|e| e["choices"][0]["delta"]["content"].as_str())
+            .collect();
+        assert!(
+            deltas
+                .iter()
+                .all(|d| !d.is_empty() && d.len() <= ANSWER_DELTA_BYTES)
+        );
+        assert_eq!(
+            deltas.len(),
+            LONG_ANSWER_BYTES.div_ceil(ANSWER_DELTA_BYTES) + 1
+        );
+        assert_eq!(Script::LongAnswer.pace(), Duration::from_millis(20));
+        assert_eq!(Script::LongSession.pace(), Duration::ZERO);
+    }
+
+    #[test]
+    fn big_output_is_8_mib_of_seq() {
+        // `seq` prints the numbers of each digit count d, 9 * 10^(d-1) of them, d + 1 bytes each.
+        let mut bytes = 0;
+        let mut first = 1;
+        while first <= BIG_OUTPUT_LINES {
+            let last = (first * 10 - 1).min(BIG_OUTPUT_LINES);
+            bytes += (last - first + 1) * (first.to_string().len() as u64 + 1);
+            first *= 10;
+        }
+        assert_eq!(bytes, BIG_OUTPUT_BYTES);
+        let call = events(Script::BigOutput, &agent_request("big_output", "user"), "c");
+        assert_eq!(
+            tool_call(&call),
+            ("bash".to_string(), json!({ "command": "seq 1 1187464" }))
+        );
+        let tail =
+            "1187463\n1187464\n\n[Showing lines 1185465-1187464 of 1187464. Full output: /tmp/x]";
+        let done = events(Script::BigOutput, &after_tool("big_output", tail), "c");
+        assert_eq!(streamed_text(&done), DONE_TEXT);
+        let cut = events(Script::BigOutput, &after_tool("big_output", "1\n2\n"), "c");
+        assert!(streamed_text(&cut).starts_with(UNEXPECTED_TEXT));
+    }
+
+    #[test]
+    fn a_session_turn_reads_the_file_then_answers() {
+        let file = session_file_content(SESSION_FILE_BYTES);
+        assert_eq!(file.len(), SESSION_FILE_BYTES);
+        assert!(file.is_ascii() && file.ends_with(&format!("\n{SESSION_FILE_END}\n")));
+        let call = events(
+            Script::LongSession,
+            &agent_request("long_session", "user"),
+            "c",
+        );
+        assert_eq!(
+            tool_call(&call),
+            ("read".to_string(), json!({ "path": SESSION_FILE }))
+        );
+        let answer = events(Script::LongSession, &after_tool("long_session", &file), "c");
+        assert_eq!(
+            streamed_text(&answer),
+            markdown_answer(SESSION_ANSWER_BYTES, SESSION_TURN_END)
+        );
+        let mut string_content = agent_request("long_session", "tool");
+        string_content["messages"][1]["content"] = json!(file);
+        let answer = events(Script::LongSession, &string_content, "c");
+        assert!(streamed_text(&answer).ends_with(&format!("{SESSION_TURN_END}\n")));
+        let cut = events(
+            Script::LongSession,
+            &after_tool("long_session", &file[..100]),
+            "c",
+        );
+        assert!(streamed_text(&cut).starts_with(UNEXPECTED_TEXT));
+    }
+
+    #[hegel::test(test_cases = 100)]
+    fn markdown_answers_fit_any_size(tc: hegel::TestCase) {
+        let bytes = tc.draw(
+            hegel::generators::integers::<usize>()
+                .min_value(256)
+                .max_value(40_000),
+        );
+        let md = markdown_answer(bytes, SESSION_TURN_END);
+        assert_eq!(md.len(), bytes);
+        assert!(md.ends_with(&format!("\n\n{SESSION_TURN_END}\n")));
     }
 
     #[test]

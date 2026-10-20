@@ -1,5 +1,7 @@
 //! Child processes with a deadline and `wait4` resource usage.
 
+use std::fs::File;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, ExitStatus};
 use std::sync::mpsc;
@@ -36,6 +38,26 @@ pub struct Supervised {
 impl Supervised {
     pub fn spawn(mut command: Command, timeout: Duration) -> Result<Self> {
         command.process_group(0);
+        Self::start(command, timeout)
+    }
+
+    /// As `spawn`, with `tty` as stdin, stdout and controlling terminal, in a new session
+    /// (so also its own process group).
+    pub fn spawn_in_pty(mut command: Command, tty: File, timeout: Duration) -> Result<Self> {
+        command.stdin(tty.try_clone()?).stdout(tty);
+        // SAFETY: only async-signal-safe calls between fork and exec.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            })
+        };
+        Self::start(command, timeout)
+    }
+
+    fn start(mut command: Command, timeout: Duration) -> Result<Self> {
         let started = Instant::now();
         let child = command
             .spawn()
@@ -104,6 +126,87 @@ impl Supervised {
     }
 }
 
+/// A pseudo-terminal of `cols`×`rows`: (master, slave). Both are close-on-exec.
+pub fn openpty(cols: u16, rows: u16) -> Result<(File, File)> {
+    let (mut master, mut slave) = (0, 0);
+    let size = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let opened = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            &size,
+        )
+    };
+    if opened < 0 {
+        return Err(std::io::Error::last_os_error()).context("openpty");
+    }
+    // SAFETY: openpty returned two fresh descriptors we now own.
+    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+    for fd in [&master, &slave] {
+        // shortcut: a child another thread spawns before this line inherits the pty and delays
+        // its EOF; open with O_CLOEXEC (posix_openpt) if ptys and spawns ever run concurrently.
+        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            return Err(std::io::Error::last_os_error()).context("fcntl");
+        }
+    }
+    Ok((master.into(), slave.into()))
+}
+
+/// The CPU time (user and system, every thread) a live process has used so far.
+pub fn cpu_time(pid: u32) -> Result<Duration> {
+    let mut clock = 0;
+    let err = unsafe { libc::clock_getcpuclockid(pid as libc::pid_t, &mut clock) };
+    if err != 0 {
+        return Err(std::io::Error::from_raw_os_error(err)).context("clock_getcpuclockid");
+    }
+    let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+    if unsafe { libc::clock_gettime(clock, &mut ts) } < 0 {
+        return Err(std::io::Error::last_os_error()).context("clock_gettime");
+    }
+    Ok(Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32))
+}
+
+/// The process in `pid`'s tree (itself included) that has used the most CPU: the Pi process,
+/// when `pid` is a wrapper such as `perf stat` that waits for it.
+pub fn busiest_in_tree(pid: u32) -> Result<u32> {
+    let mut best = (cpu_time(pid)?, pid);
+    let mut pending = vec![pid];
+    while let Some(parent) = pending.pop() {
+        let children = std::fs::read_to_string(format!("/proc/{parent}/task/{parent}/children"))
+            .unwrap_or_default();
+        for child in children.split_whitespace().filter_map(|c| c.parse().ok()) {
+            // A child that exited in between is skipped.
+            if let Ok(cpu) = cpu_time(child) {
+                best = best.max((cpu, child));
+            }
+            pending.push(child);
+        }
+    }
+    Ok(best.1)
+}
+
+/// A live process's resident set and its peak so far (`VmRSS`, `VmHWM`).
+pub fn memory_kib(pid: u32) -> Result<(u64, u64)> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .with_context(|| format!("reading /proc/{pid}/status"))?;
+    let field = |name: &str| {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(name)?.strip_prefix(':'))
+            .and_then(|v| v.trim().strip_suffix("kB"))
+            .and_then(|v| v.trim().parse().ok())
+            .with_context(|| format!("no {name} in /proc/{pid}/status"))
+    };
+    Ok((field("VmRSS")?, field("VmHWM")?))
+}
+
 impl Drop for Supervised {
     fn drop(&mut self) {
         if !self.reaped {
@@ -129,6 +232,48 @@ mod tests {
         assert!(usage.cpu() > Duration::from_millis(10), "{usage:?}");
         assert!(usage.wall >= usage.cpu() / 4, "{usage:?}");
         assert!(usage.max_rss_kib > 1024, "{usage:?}");
+    }
+
+    #[test]
+    fn runs_in_a_pty_as_its_controlling_terminal() {
+        use std::io::Read;
+        let (mut master, tty) = openpty(120, 40).unwrap();
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "test -t 0 && test -t 1 && stty size < /dev/tty"]);
+        let run = Supervised::spawn_in_pty(cmd, tty, Duration::from_secs(10)).unwrap();
+        let (status, _) = run.wait().unwrap();
+        assert!(status.success());
+        let mut out = vec![];
+        let mut buf = [0; 256];
+        // The hung-up pty reads as EIO once the output is drained.
+        while let Ok(n @ 1..) = master.read(&mut buf) {
+            out.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(String::from_utf8_lossy(&out), "40 120\r\n");
+    }
+
+    #[test]
+    fn finds_the_busiest_process_of_a_tree_and_its_usage() {
+        let mut cmd = Command::new("sh");
+        // The shell waits; its child burns CPU, then idles.
+        cmd.args([
+            "-c",
+            "sh -c 'i=0; while [ $i -lt 100000 ]; do i=$((i+1)); done; sleep 30'; true",
+        ]);
+        let run = Supervised::spawn(cmd, Duration::from_secs(60)).unwrap();
+        let shell = run.child.id();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let busy = loop {
+            let busy = busiest_in_tree(shell).unwrap();
+            if busy != shell && cpu_time(busy).unwrap() > Duration::from_millis(50) {
+                break busy;
+            }
+            assert!(Instant::now() < deadline, "the child never got busy");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(cpu_time(busy).unwrap() > cpu_time(shell).unwrap());
+        let (rss, peak) = memory_kib(busy).unwrap();
+        assert!(rss > 0 && peak >= rss, "{rss} {peak}");
     }
 
     #[test]

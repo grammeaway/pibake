@@ -18,7 +18,7 @@ fn run_bare(bin: &Path, home: &Path, args: &[&str]) -> std::process::Output {
 }
 
 /// A setup with an extension that reads its location, one with an `import.meta.main` self-check,
-/// and one esbuild cannot bundle (it loads through jiti); built as `pi-test`, keeping only the fake
+/// one with non-ASCII regex literals, and one esbuild cannot bundle (it loads through jiti); built as `pi-test`, keeping only the fake
 /// provider's API. `build` adds to `[build]`.
 fn fixture_setup(root: &Path, build: &str) -> (PathBuf, PathBuf) {
     let agent = root.join("agent");
@@ -31,6 +31,11 @@ fn fixture_setup(root: &Path, build: &str) -> (PathBuf, PathBuf) {
     write(
         &agent.join("extensions/self_check.ts"),
         "if ((import.meta as any).main) console.error(\"self-check ran\");\nexport default function () {}\n",
+    );
+    // `ascii_bundle` escapes what esbuild leaves as written; `verify` compares the results.
+    write(
+        &agent.join("extensions/non_ascii.js"),
+        "// Comments – and regex literals keep non-ASCII text.\nconst dashes = /^[-–—]+$/u;\nconst link = /^[#🔗]$/;\nexport default function (pi) {\n\tpi.registerCommand(\"non-ascii\", { description: `${dashes.test(\"–—\")} ${link.test(\"🔗\")} ${link.test(\"\\ud83d\")}`, handler: async () => {} });\n}\n",
     );
     // esbuild cannot resolve its import, so it loads through jiti inside the executable.
     write(
@@ -77,6 +82,7 @@ fn e2e_build_a_fixture_setup() {
         .unwrap()
         .path();
     let main = fs::read_to_string(launcher.with_file_name("main.mjs")).unwrap();
+    assert!(main.is_ascii());
     assert_eq!(
         main.matches(stage_dir.to_str().unwrap()).count(),
         1,
@@ -88,6 +94,51 @@ fn e2e_build_a_fixture_setup() {
     let version = run_bare(&bin, &home, &["--version"]);
     let version = String::from_utf8_lossy(&version.stdout);
     assert!(version.contains(" (pibake "), "{version}");
+
+    // Every bench scenario, each with its end check, for stock Pi and the executable.
+    let bin_command = bin.to_str().unwrap();
+    let benched = pibake(
+        &project,
+        &[
+            "bench",
+            "--pi",
+            "pi",
+            "--pi",
+            bin_command,
+            "--runs",
+            "1",
+            "--big-write-kib",
+            "16",
+            "--record",
+            "e2e",
+        ],
+        true,
+    );
+    let recorded = benched
+        .lines()
+        .last()
+        .unwrap()
+        .strip_prefix("recorded: ")
+        .unwrap();
+    let report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(project.join(recorded)).unwrap()).unwrap();
+    for result in report["results"].as_array().unwrap() {
+        let samples = |m: &str| result["metrics"][m]["samples"].as_array().unwrap().clone();
+        let (first_paint, ready) = (samples("first_paint_ms"), samples("ready_ms"));
+        // Equal when the first frame is `renderNow()`'s own: Pi's first timer render can lose
+        // the race against the DA1 reply.
+        assert!(
+            first_paint[0].as_f64().unwrap() <= ready[0].as_f64().unwrap(),
+            "{result}"
+        );
+        for metric in pibake::bench::metrics().filter(|m| !m.ends_with("_minstr")) {
+            assert_eq!(samples(metric).len(), 1, "{metric}: {result}");
+            assert!(
+                samples(metric)[0].as_f64().unwrap() > 0.0,
+                "{metric}: {result}"
+            );
+        }
+    }
 
     let google = Command::new(&bin)
         .args([
@@ -290,7 +341,9 @@ fn e2e_build_a_fixture_setup_as_a_snapshot() {
         stdout.contains(&format!("built {}", bin.display())),
         "{stdout}"
     );
-    assert!(bundled_launcher(&stdout).ends_with("main.cjs"), "{stdout}");
+    let launcher = bundled_launcher(&stdout);
+    assert!(launcher.ends_with("main.cjs"), "{stdout}");
+    assert!(fs::read_to_string(launcher).unwrap().is_ascii());
     assert!(stdout.contains(" 1 failed\n"), "{stdout}");
     let extracted: Vec<_> = fs::read_dir(cache.join("pibake"))
         .unwrap()
@@ -429,4 +482,76 @@ fn e2e_build_a_fixture_setup_as_a_snapshot() {
         String::from_utf8_lossy(&stale.stderr),
         "pi-test: built from an older setup (extensions/located.js edited); run pibake install\n"
     );
+}
+
+/// The fixture setup as a `sea_trained` executable: its code cache is trained once per bundle,
+/// so a rebuild is byte for byte; the executable runs without `node` and matches stock Pi; and a
+/// cache V8 rejects fails the build, keeping the old executable.
+#[test]
+fn e2e_build_a_fixture_setup_trained() {
+    if !e2e_enabled() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (_, project) = fixture_setup(root.path(), "backend = \"sea_trained\"\n");
+    let cache = root.path().join("cache");
+    let env = [("XDG_CACHE_HOME", cache.as_os_str())];
+    let stdout = pibake_with(&project, &["build"], &env, true);
+    let bin = project.join("target/pibake/bin/pi-test");
+    assert!(
+        stdout.contains(&format!("built {}", bin.display())),
+        "{stdout}"
+    );
+    assert!(bundled_launcher(&stdout).ends_with("pi.cjs"), "{stdout}");
+    let trained = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("trained code cache: "))
+        .unwrap_or_else(|| panic!("no training in:\n{stdout}"));
+    let trained = PathBuf::from(trained);
+    assert!(fs::metadata(&trained).unwrap().len() > 0);
+
+    let home = root.path().join("home");
+    let version = run_bare(&bin, &home, &["--version"]);
+    assert!(String::from_utf8_lossy(&version.stdout).contains(" (pibake "));
+    let checked = Command::new(&bin)
+        .env_clear()
+        .env("PIBAKE_CACHE_CHECK", "1")
+        .status()
+        .unwrap();
+    assert_eq!(checked.code(), Some(0));
+    let verify = pibake_with(
+        &project,
+        &["verify", "--pi", bin.to_str().unwrap(), "--against", "pi"],
+        &env,
+        true,
+    );
+    assert!(verify.starts_with("same: "), "{verify}");
+
+    let built = fs::read(&bin).unwrap();
+    let again = pibake_with(&project, &["build"], &env, true);
+    assert!(
+        again.contains(&format!(
+            "trained code cache up to date: {}",
+            trained.display()
+        )),
+        "{again}"
+    );
+    assert!(fs::read(&bin).unwrap() == built, "the rebuild differs");
+
+    let mut broken = fs::read(&trained).unwrap();
+    broken[..8].copy_from_slice(b"XXXXXXXX");
+    fs::write(&trained, broken).unwrap();
+    let failed = Command::new(env!("CARGO_BIN_EXE_pibake"))
+        .arg("build")
+        .envs(env)
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(!failed.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("V8 rejected the trained code cache"),
+        "{stderr}"
+    );
+    assert!(fs::read(&bin).unwrap() == built);
 }
