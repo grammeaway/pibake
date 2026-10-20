@@ -10,6 +10,7 @@
 //! the live setup against it at startup (`bundle/frozen.mjs`).
 
 pub mod ascii_bundle;
+mod incremental_markdown;
 mod incremental_tool_json;
 mod lazy_http_dispatcher;
 pub mod lazy_modules;
@@ -40,6 +41,8 @@ pub enum Pass {
     TrimApis,
     /// Parses streamed tool-call arguments incrementally instead of re-parsing each delta.
     IncrementalToolJson,
+    /// Lexes and renders streamed Markdown from its last unchanged block instead of in full.
+    IncrementalMarkdown,
     /// Makes Pi's HTTP dispatcher on first use instead of at startup, and loads undici then.
     LazyHttpDispatcher,
     /// Evaluates `lazy_modules::FILES` on first use instead of at startup; not on the snapshot.
@@ -57,6 +60,7 @@ impl Pass {
             Pass::TrimHighlight => "trim_highlight",
             Pass::TrimApis => "trim_apis",
             Pass::IncrementalToolJson => "incremental_tool_json",
+            Pass::IncrementalMarkdown => "incremental_markdown",
             Pass::LazyHttpDispatcher => "lazy_http_dispatcher",
             Pass::LazyModules => "lazy_modules",
             Pass::SnapshotSafety => "snapshot_safety",
@@ -65,10 +69,11 @@ impl Pass {
     }
 }
 
-pub const DEFAULT_PASSES: [Pass; 6] = [
+pub const DEFAULT_PASSES: [Pass; 7] = [
     Pass::TrimHighlight,
     Pass::TrimApis,
     Pass::IncrementalToolJson,
+    Pass::IncrementalMarkdown,
     Pass::LazyHttpDispatcher,
     Pass::LazyModules,
     Pass::AsciiBundle,
@@ -181,6 +186,10 @@ pub fn run(stage: &Path, options: &Options, setup: &Setup) -> Result<Output> {
                 optional.extend(out.optional);
                 (out.changes, vec![])
             }
+            Pass::IncrementalMarkdown => (
+                incremental_markdown::run(&mut sources).context("pass incremental_markdown")?,
+                vec![],
+            ),
             Pass::LazyHttpDispatcher => (
                 lazy_http_dispatcher::run(&mut sources).context("pass lazy_http_dispatcher")?,
                 vec![],

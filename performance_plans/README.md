@@ -102,10 +102,10 @@ Each needs a measurement before it becomes a plan.
 
   | # | Scenario | Cost | Where (Pi 1.3.0) | Likely fix |
   |---|---|---|---|---|
-  | 1 | `long_answer` | ~80 % of the CPU after startup, quadratic; 11.5 s for 20 KiB | pi-tui `Markdown.render`: marked `lex`, highlight.js and `wrapTextWithAnsi` over the whole answer per frame | **p8** (this pass) |
+  | 1 | `long_answer` | ~80 % of the CPU after startup, quadratic; 11.5 s for 20 KiB | pi-tui `Markdown.render`: marked `lex`, highlight.js and `wrapTextWithAnsi` over the whole answer per frame | **Done, p8:** 3.3 s, −71 % |
   | 2 | `tui_write` | 44 % of ~3 s for 200 KiB, quadratic | `formatWriteCall` (write tool `renderCall`) formats the whole content so far on every delta | Pi-Bolt's "redraw only when the arguments change" and "highlight the lines a collapsed call shows"; l11's new object per delta defeats an identity guard, so key on the content's length |
   | 3 | `long_session` memory | +130 MiB over 40 turns (~300 MiB at the end against ~170 after startup; stock ~510) | 34 MiB of live large objects and 16 MiB of array buffers for 720 KiB of content; the young generation grows to its cap (+39 MiB reserved) | A heap snapshot after 40 turns, to find what keeps whole-context strings; then possibly `--max-semi-space-size` (l1 verdict 18) |
-  | 4 | `long_answer`, beyond p8 | ~13 % (stock profile) and 2–3 % | the mermaid transformer lexes the whole answer again per render; the footer's `getContextUsage` → `estimateTokens` per frame | Our own: cache by text, as p8 does |
+  | 4 | `long_answer`, beyond p8 | ~13 % (stock profile) and 2–3 % | the mermaid transformer lexes the whole answer again per render; the footer's `getContextUsage` → `estimateTokens` per frame | The mermaid lex: **done in p8** (owner, O6). The footer: our own, cache by text |
   | 5 | `long_session` CPU | 25–35 ms per turn, flat over 40 turns | per request: the OpenAI SDK's body `JSON.stringify` (11 %), the tool declaration diff (`declareToolChanges`, 11 %), pi-btw's `structuredClone` (4 %) | None at this size; revisit with longer sessions |
   | 6 | `big_output` | less than startup for 8 MiB; the output path 2–5 % | | **Dropped:** Pi-Bolt's bash-output fixes target 1.1.0 and 1.2.0 |
 

@@ -51,6 +51,8 @@ pub const STALENESS: &str = include_str!("bundle/staleness.mjs");
 pub const TOOL_JSON: &str = include_str!("bundle/tool_json.mjs");
 /// `pibake:http-dispatcher`: where `lazy_http_dispatcher` defers Pi's `configureHttpDispatcher`.
 pub const HTTP_DISPATCHER: &str = include_str!("bundle/http_dispatcher.mjs");
+/// `pibake:markdown`: where `incremental_markdown` sends Markdown's lexes and block rendering.
+pub const MARKDOWN: &str = include_str!("bundle/markdown.mjs");
 /// `pibake:frozen`'s code: the entry's check of settings passes baked in; `frozen_module` adds
 /// the data.
 pub const FROZEN: &str = include_str!("bundle/frozen.mjs");
@@ -424,6 +426,8 @@ pub struct BuildConfig {
     pub tool_json: String,
     /// The module `pibake:http-dispatcher`.
     pub http_dispatcher: String,
+    /// The module `pibake:markdown`.
+    pub markdown: String,
     pub baked: String,
     /// Absolute stage directory → agent-relative directory.
     pub owned: Vec<Owned>,
@@ -788,6 +792,7 @@ impl Bundler<'_> {
             ("frozen", frozen.as_bytes()),
             ("tool_json", TOOL_JSON.as_bytes()),
             ("http_dispatcher", HTTP_DISPATCHER.as_bytes()),
+            ("markdown", MARKDOWN.as_bytes()),
             ("baked", baked_all.as_bytes()),
             ("owned", owned_json.as_bytes()),
             ("passes", passes_json.as_bytes()),
@@ -805,6 +810,7 @@ impl Bundler<'_> {
                 frozen: frozen.clone(),
                 tool_json: TOOL_JSON.to_owned(),
                 http_dispatcher: HTTP_DISPATCHER.to_owned(),
+                markdown: MARKDOWN.to_owned(),
                 baked: baked_module(baked),
                 owned: owned.clone(),
                 outfile: dir.join(flavor.main),

@@ -41,10 +41,10 @@ Where it lives is the owner's call (O6): a pibake pass, or an upstream PR to pi-
 
 ## Completion
 
-- [ ] The property test is green over the step 1 grammar. Every fall-back has a unit test.
-- [ ] `verify` same on the live setup and the fixture.
-- [ ] Recorded bench in `bench_results/`.
-- [ ] `cargo fmt --check`, clippy and every test green, E2E included.
+- [x] The property test is green over the step 1 grammar. Every fall-back has a test that fails without it (E2E, deterministic documents and the property test; mutation-checked, `progress.md`), not a unit test: the guards are only meaningful against stock's render.
+- [x] `verify` same on the live setup and the fixture.
+- [x] Recorded bench in `bench_results/`.
+- [x] `cargo fmt --check`, clippy and every test green, E2E included.
 
 ## Non-goals
 
