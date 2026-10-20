@@ -13,8 +13,8 @@ use serde::Serialize;
 use serde_json::json;
 
 use crate::fake_provider::{
-    self, BIG_WRITE_PATH, DONE_TEXT, FakeProvider, LONG_ANSWER_END, PROVIDER, SESSION_FILE,
-    SESSION_FILE_BYTES, SESSION_TURN_END, Script, UNEXPECTED_TEXT,
+    self, BIG_WRITE_PATH, DONE_TEXT, FakeProvider, HELLO_TEXT, LONG_ANSWER_END, PROVIDER,
+    SESSION_FILE, SESSION_FILE_BYTES, SESSION_TURN_END, Script, UNEXPECTED_TEXT,
 };
 use crate::harness::{Harness, PiCommand};
 use crate::process::{self, Supervised, Usage};
@@ -25,6 +25,8 @@ const LONG_ANSWER_PROMPT: &str = "Answer at length.";
 const BIG_OUTPUT_PROMPT: &str = "Print the numbers.";
 const SESSION_PROMPT: &str = "Read the file, then answer.";
 const SESSION_TURNS: usize = 40;
+/// Idle time between RPC ready and the first prompt, as a client or a typing user leaves.
+const FIRST_TURN_PAUSE: Duration = Duration::from_secs(1);
 /// Exits Pi from an empty editor.
 const CTRL_D: &[u8] = b"\x04";
 /// A VT220's answer to DA1, as a real terminal gives it within a millisecond; without it, Pi
@@ -42,6 +44,9 @@ const PERF_STAT_EVENT: &str = "instructions:u";
 pub enum Scenario {
     /// RPC startup, until the `get_state` response.
     Startup,
+    /// RPC: from the session's first prompt, sent `FIRST_TURN_PAUSE` after ready, to its first
+    /// `message_update`.
+    FirstTurn,
     /// Interactive startup in a pty, run to its end by `PI_STARTUP_BENCHMARK=1`.
     Interactive,
     /// `-p`: a streamed write of `--big-write-kib`.
@@ -57,8 +62,9 @@ pub enum Scenario {
 }
 
 impl Scenario {
-    pub const ALL: [Scenario; 7] = [
+    pub const ALL: [Scenario; 8] = [
         Scenario::Startup,
+        Scenario::FirstTurn,
         Scenario::Interactive,
         Scenario::BigWrite,
         Scenario::LongAnswer,
@@ -76,6 +82,7 @@ impl Scenario {
                 "startup_peak_rss_mib",
                 "startup_minstr",
             ],
+            Scenario::FirstTurn => &["first_turn_ms"],
             Scenario::Interactive => &[
                 "first_paint_ms",
                 "ready_ms",
@@ -254,6 +261,7 @@ impl Bench<'_> {
                 let (ready, usage, minstr) = self.startup(pi, provider)?;
                 vec![ms(ready), ms(usage.cpu()), mib(usage.max_rss_kib), minstr]
             }
+            Scenario::FirstTurn => vec![ms(self.first_turn(pi, provider)?)],
             Scenario::Interactive => {
                 let (first_paint, ready, usage, minstr) = self.interactive(pi, provider)?;
                 vec![
@@ -378,6 +386,77 @@ impl Bench<'_> {
         run().with_context(|| {
             format!(
                 "startup of `{}`, stderr:\n{}",
+                pi.label,
+                harness.log_tail(log)
+            )
+        })
+    }
+
+    /// RPC: time from the first prompt, sent `FIRST_TURN_PAUSE` after the `get_state` response, to
+    /// its first `message_update`. The turn must end in the scripted answer.
+    pub(crate) fn first_turn(&self, pi: &PiCommand, provider: &FakeProvider) -> Result<Duration> {
+        let harness = self.harness(provider)?;
+        let log = "first_turn.log";
+        let run = || -> Result<Duration> {
+            let mut cmd = self.command(&harness, pi, log)?;
+            cmd.args(["--mode", "rpc", "--no-session", "--provider", PROVIDER])
+                .args(["--model", Script::Hello.model_id()])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped());
+            let mut run = Supervised::spawn(cmd, TIMEOUT)?;
+            let mut stdin = run.child.stdin.take().context("no stdin")?;
+            let mut lines = BufReader::new(run.child.stdout.take().context("no stdout")?).lines();
+            let mut next = || -> Result<serde_json::Value> {
+                let line = lines.next().context("Pi exited mid-turn")??;
+                serde_json::from_str(&line).with_context(|| format!("not JSON: {line}"))
+            };
+            writeln!(
+                stdin,
+                "{}",
+                json!({ "id": "pibake_state", "type": "get_state" })
+            )?;
+            while next()?["id"] != "pibake_state" {}
+            std::thread::sleep(FIRST_TURN_PAUSE);
+            let sent = Instant::now();
+            writeln!(
+                stdin,
+                "{}",
+                json!({ "id": "turn_1", "type": "prompt", "message": "hi" })
+            )?;
+            let mut first = None;
+            let mut answered = false;
+            loop {
+                let event = next()?;
+                match event["type"].as_str() {
+                    Some("message_update") => {
+                        first.get_or_insert_with(|| sent.elapsed());
+                    }
+                    Some("response") if event["id"] == "turn_1" && event["success"] != true => {
+                        bail!("prompt rejected: {event}")
+                    }
+                    Some("message_end") if event["message"]["role"] == "assistant" => {
+                        answered |=
+                            fake_provider::content_text(&event["message"]).contains(HELLO_TEXT);
+                    }
+                    Some("agent_settled") => break,
+                    _ => {}
+                }
+            }
+            drop(stdin);
+            while next().is_ok() {}
+            let (status, _) = run.wait()?;
+            if !status.success() {
+                bail!("exited with {status}");
+            }
+            match (first, answered) {
+                (Some(first), true) => Ok(first),
+                (None, _) => bail!("the turn sent no message_update"),
+                (_, false) => bail!("the turn settled without the scripted answer"),
+            }
+        };
+        run().with_context(|| {
+            format!(
+                "first turn of `{}`, stderr:\n{}",
                 pi.label,
                 harness.log_tail(log)
             )
@@ -1172,6 +1251,41 @@ done"#
     }
 
     #[test]
+    fn a_first_turn_times_the_first_update_after_the_pause() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/agent_dir");
+        let bench = test_bench(&fixture, dir.path());
+        let provider = FakeProvider::start().unwrap();
+        let session = |answer: &str| {
+            format!(
+                r#"read -r line
+echo '{{"id":"pibake_state","type":"response","success":true}}'
+read -r line
+echo '{{"id":"turn_1","type":"response","success":true}}'
+sleep 0.1
+echo '{{"type":"message_update"}}'
+sleep 0.1
+echo '{{"type":"message_update"}}'
+echo '{{"type":"message_end","message":{{"role":"assistant","content":[{{"type":"text","text":"{answer}"}}]}}}}'
+echo '{{"type":"agent_settled"}}'
+cat >/dev/null"#
+            )
+        };
+        let run =
+            |name: &str, body: &str| bench.first_turn(&fake_pi(dir.path(), name, body), &provider);
+        let first = run("ok", &session(HELLO_TEXT)).unwrap();
+        assert!(
+            first >= Duration::from_millis(100) && first < Duration::from_millis(200),
+            "{first:?}"
+        );
+        let err = format!("{:#}", run("wrong", &session("other")).unwrap_err());
+        assert!(err.contains("without the scripted answer"), "{err}");
+        let short = "read -r line; echo '{\"id\":\"pibake_state\"}'; read -r line";
+        let err = format!("{:#}", run("short", short).unwrap_err());
+        assert!(err.contains("Pi exited mid-turn"), "{err}");
+    }
+
+    #[test]
     fn turn_medians_take_turns_2_to_6_and_36_to_40() {
         let turns: Vec<Duration> = (1..=40).map(|t| Duration::from_millis(t * 10)).collect();
         assert_eq!(turn_medians(&turns), (Some(40.0), Some(380.0)));
@@ -1193,6 +1307,7 @@ done"#
             names,
             [
                 "startup",
+                "first_turn",
                 "interactive",
                 "big_write",
                 "long_answer",

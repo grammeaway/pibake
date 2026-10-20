@@ -170,6 +170,7 @@ mod tests {
     fn passes_default_on_and_switch_off() {
         let default = parse("").unwrap().passes;
         assert_eq!(default.passes, passes::DEFAULT_PASSES);
+        assert!(!default.passes.contains(&Pass::KeepAliveHttp));
         assert!(default.highlight_languages.iter().any(|l| l == "rust"));
         assert_eq!(default.apis, None);
         let apis = parse("[trim]\napis = [\"anthropic-messages\"]")
