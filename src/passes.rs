@@ -46,7 +46,8 @@ pub enum Pass {
     IncrementalMarkdown,
     /// Makes Pi's HTTP dispatcher on first use instead of at startup, and loads undici then.
     LazyHttpDispatcher,
-    /// Keeps idle provider connections for 120 s instead of undici's 4 s.
+    /// Keeps idle provider connections for 120 s instead of undici's 4 s; opt-in, it changes
+    /// stock Pi's network behaviour.
     KeepAliveHttp,
     /// Evaluates `lazy_modules::FILES` on first use instead of at startup; not on the snapshot.
     LazyModules,
@@ -73,13 +74,12 @@ impl Pass {
     }
 }
 
-pub const DEFAULT_PASSES: [Pass; 8] = [
+pub const DEFAULT_PASSES: [Pass; 7] = [
     Pass::TrimHighlight,
     Pass::TrimApis,
     Pass::IncrementalToolJson,
     Pass::IncrementalMarkdown,
     Pass::LazyHttpDispatcher,
-    Pass::KeepAliveHttp,
     Pass::LazyModules,
     Pass::AsciiBundle,
 ];

@@ -38,7 +38,7 @@ What a user waits for, against its floor:
 
 | # | Call | Needed by |
 |---|---|---|
-| O7 | n1: a pass, default on or opt-in, or an upstream PR to Pi. **Decided:** a pass, default on (`progress.md`) | n1 step 3 |
+| O7 | n1: a pass, default on or opt-in, or an upstream PR to Pi. **Decided:** a pass, opt-in (revised from default on, `progress.md`) | n1 step 3 |
 | O8 | n2: a pass, default on or opt-in, or an upstream PR to Pi | n2 step 3 |
 
 ## Outside pibake: the live setup's status bar

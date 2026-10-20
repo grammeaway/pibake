@@ -81,9 +81,17 @@ fn e2e_a_prompt_after_idle_reuses_the_connection() {
         "{\"retry\": {\"enabled\": false}}",
     );
     let project = root.path().join("project");
+    let passes: Vec<_> = pibake::passes::DEFAULT_PASSES
+        .iter()
+        .map(|p| p.name())
+        .chain(["keep_alive_http"])
+        .collect();
     write(
         &project.join("pibake.toml"),
-        &format!("[source]\nagent_dir = \"{}\"\n", agent.display()),
+        &format!(
+            "[source]\nagent_dir = \"{}\"\n[build]\npasses = {passes:?}\n",
+            agent.display()
+        ),
     );
     pibake(&project, &["lock"], true);
     let stdout = pibake(&project, &["bundle"], true);

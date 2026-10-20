@@ -6,7 +6,7 @@ Live log for `README.md`'s plans: status, decisions, and the probe round's findi
 
 | Plan | Status | Notes |
 |---|---|---|
-| n1 idle keep-alive | implemented; owner's live check open | Pass `keep_alive_http`, default on, 120 s. E2E: two RPC prompts 5 s apart, 1 connection against stock Pi's 2. Open: step 2's live connect log and a day of use without `other side closed` (n1 → Owner checks). Step 1: `api.anthropic.com` keeps an idle connection > 20 min; the other `models.json` origins were unreachable (2026-10-20: both OVH hosts time out on connect, the two `127.0.0.1` servers are not running), so not probed |
+| n1 idle keep-alive | implemented; owner's live check open | Pass `keep_alive_http`, opt-in (O7 revised), 120 s. E2E: two RPC prompts 5 s apart, 1 connection against stock Pi's 2. Open: step 2's live connect log and a day of use without `other side closed` (n1 → Owner checks). Step 1: `api.anthropic.com` keeps an idle connection > 20 min; the other `models.json` origins were unreachable (2026-10-20: both OVH hosts time out on connect, the two `127.0.0.1` servers are not running), so not probed |
 | n2 first-turn prewarm | planned | O8 open |
 
 ## Decisions
@@ -14,11 +14,12 @@ Live log for `README.md`'s plans: status, decisions, and the probe round's findi
 | Plan | Decision | Taken |
 |---|---|---|
 | n1 (O7) | A pibake pass, default on: `keep_alive_http`, `keepAliveTimeout` 120 s | 2026-10-20, owner |
+| n1 (O7, revised) | `keep_alive_http` is opt-in: out of `DEFAULT_PASSES`, listed in the README. Every other default pass keeps stock Pi's behaviour; this one changes how long every origin's idle connections live (extensions' included), and origins that close sooner without a `Keep-Alive` hint pay an `other side closed` retry. Defaults don't reconfigure a user's setup | 2026-10-20, owner |
 | Outside pibake | The owner allowed changing the live `statusbar.js`; changed (README → Outside pibake) | 2026-10-20, owner |
 
 ## n1: idle keep-alive (2026-10-20)
 
-- **Pass `keep_alive_http`** (`src/passes/keep_alive_http.rs`), in `DEFAULT_PASSES` after `lazy_http_dispatcher`. It matches Pi 1.3.0's whole `EnvHttpProxyAgent` options object and adds `keepAliveTimeout: 120000` on its last line, so line numbers stay. esbuild prints it as `12e4`.
+- **Pass `keep_alive_http`** (`src/passes/keep_alive_http.rs`), opt-in through `[build] passes` (O7, revised; first shipped in `DEFAULT_PASSES` after `lazy_http_dispatcher`). The E2E test lists it after the defaults. It matches Pi 1.3.0's whole `EnvHttpProxyAgent` options object and adds `keepAliveTimeout: 120000` on its last line, so line numbers stay. esbuild prints it as `12e4`.
 - **Deviation: `lazy_http_dispatcher` accepts the keep-alive edit.** It matches `configureHttpDispatcher`'s whole text, so it now takes either stock's or `keep_alive_http`'s version. Either pass order works, and either pass works alone.
 - **Deviation: the fake provider's keep-alive variant** (`FakeProvider::keep_alive`) answers with chunked framing and serves each connection until the client closes; it counts accepted connections. The default stays `Connection: close`, so `bench` does not change.
 - **The E2E test's "fails without the change"** is stock `pi` in the same test: 2 connections for the 5 s gap, against 1 for the bundle. A pass-off bundle would cost a second build for the same evidence.
@@ -27,6 +28,8 @@ Live log for `README.md`'s plans: status, decisions, and the probe round's findi
 - **No `bench` numbers.** The fake provider closes every connection in `bench`, so nothing there moves.
 
 ### Owner checks (open)
+
+A new build for these needs `keep_alive_http` in `[build] passes`; `target/n1/on` already has it.
 
 1. **Live connect log (step 2).** Run each of these, send two prompts about 10 s apart, then quit:
 
