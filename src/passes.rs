@@ -15,6 +15,7 @@ mod incremental_tool_json;
 mod keep_alive_http;
 mod lazy_http_dispatcher;
 pub mod lazy_modules;
+mod prewarm_first_turn;
 pub mod snapshot_safety;
 mod trim_apis;
 mod trim_highlight;
@@ -46,6 +47,9 @@ pub enum Pass {
     IncrementalMarkdown,
     /// Makes Pi's HTTP dispatcher on first use instead of at startup, and loads undici then.
     LazyHttpDispatcher,
+    /// Makes the HTTP dispatcher and evaluates the model's stream API module once RPC or
+    /// interactive mode is ready, instead of on the first prompt.
+    PrewarmFirstTurn,
     /// Keeps idle provider connections for 120 s instead of undici's 4 s; opt-in, it changes
     /// stock Pi's network behaviour.
     KeepAliveHttp,
@@ -66,6 +70,7 @@ impl Pass {
             Pass::IncrementalToolJson => "incremental_tool_json",
             Pass::IncrementalMarkdown => "incremental_markdown",
             Pass::LazyHttpDispatcher => "lazy_http_dispatcher",
+            Pass::PrewarmFirstTurn => "prewarm_first_turn",
             Pass::KeepAliveHttp => "keep_alive_http",
             Pass::LazyModules => "lazy_modules",
             Pass::SnapshotSafety => "snapshot_safety",
@@ -74,12 +79,13 @@ impl Pass {
     }
 }
 
-pub const DEFAULT_PASSES: [Pass; 7] = [
+pub const DEFAULT_PASSES: [Pass; 8] = [
     Pass::TrimHighlight,
     Pass::TrimApis,
     Pass::IncrementalToolJson,
     Pass::IncrementalMarkdown,
     Pass::LazyHttpDispatcher,
+    Pass::PrewarmFirstTurn,
     Pass::LazyModules,
     Pass::AsciiBundle,
 ];
@@ -197,6 +203,10 @@ pub fn run(stage: &Path, options: &Options, setup: &Setup) -> Result<Output> {
             ),
             Pass::LazyHttpDispatcher => (
                 lazy_http_dispatcher::run(&mut sources).context("pass lazy_http_dispatcher")?,
+                vec![],
+            ),
+            Pass::PrewarmFirstTurn => (
+                prewarm_first_turn::run(&mut sources).context("pass prewarm_first_turn")?,
                 vec![],
             ),
             Pass::KeepAliveHttp => (

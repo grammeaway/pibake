@@ -1,18 +1,20 @@
 //! `lazy_http_dispatcher`: `pibake:http-dispatcher` on its own, and a bundle against stock Pi
-//! on a request through a proxy and one cut off by the idle timeout. Needs `node`; the bundle
-//! tests also real `pi` and npm (network). All behind PIBAKE_E2E.
+//! on a request through a proxy and one cut off by the idle timeout, in print mode and over RPC
+//! after `prewarm_first_turn` has run. Needs `node`; the bundle tests also real `pi` and npm
+//! (network). All behind PIBAKE_E2E.
 
 mod common;
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use common::{bundled_launcher, e2e_enabled, pibake, write};
 use pibake::fake_provider::{self, FakeProvider};
+use serde_json::{Value, json};
 
 /// Each case imports a fresh instance of the module, with a `configure` that records its calls.
 const CASES: &str = r#"
@@ -211,8 +213,84 @@ fn print_turn(pi: &str, home: &Path, agent: &Path, provider: &str) -> (Output, D
     (out, start.elapsed())
 }
 
-/// Real `pi`, `node` and npm (network): with the pass on (the default), a print turn goes
-/// through the proxy in `httpProxy` and fails on `httpIdleTimeoutMs` as in stock Pi.
+/// One RPC prompt, sent `PREWARM_PAUSE` after ready so `prewarm_first_turn` runs first: the
+/// assistant's text or error, and the time from the prompt to `agent_settled`.
+fn rpc_turn(pi: &str, home: &Path, agent: &Path, provider: &str) -> (String, Duration) {
+    let mut words = pi.split(' ');
+    let mut child = Command::new(words.next().unwrap())
+        .args(words)
+        .args([
+            "--mode",
+            "rpc",
+            "--no-session",
+            "--provider",
+            provider,
+            "--model",
+        ])
+        .arg(fake_provider::Script::Hello.model_id())
+        .current_dir(home)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap())
+        .env("HOME", home)
+        .env("PI_CODING_AGENT_DIR", agent)
+        .env("PI_OFFLINE", "1")
+        .env("PI_SKIP_VERSION_CHECK", "1")
+        .env("PI_TELEMETRY", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut next = || -> Value {
+        serde_json::from_str(&lines.next().expect("Pi exited mid-turn").unwrap()).unwrap()
+    };
+    writeln!(stdin, "{}", json!({ "id": "state", "type": "get_state" })).unwrap();
+    while next()["id"] != "state" {}
+    std::thread::sleep(PREWARM_PAUSE);
+    let start = Instant::now();
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "id": "turn", "type": "prompt", "message": "hi" })
+    )
+    .unwrap();
+    let mut outcome = String::new();
+    loop {
+        let event = next();
+        match event["type"].as_str() {
+            Some("message_end") if event["message"]["role"] == "assistant" => {
+                let m = &event["message"];
+                outcome = match m["errorMessage"].as_str() {
+                    Some(e) => format!("error: {e}"),
+                    None => fake_provider::content_text(m),
+                };
+            }
+            Some("agent_settled") => break,
+            _ => {}
+        }
+    }
+    let took = start.elapsed();
+    drop(stdin);
+    assert!(child.wait().unwrap().success(), "{pi}");
+    (outcome, took)
+}
+
+const PREWARM_PAUSE: Duration = Duration::from_secs(1);
+
+/// A request body with Pi's package directory, which the system prompt names, as `<pi>`: the
+/// bundle runs from its stage.
+fn without_pi_dir(body: &Value) -> String {
+    let text = body.to_string();
+    let label = "Main documentation: ";
+    let start = text.find(label).expect("the system prompt names Pi's docs") + label.len();
+    let end = start + text[start..].find("/README.md").unwrap();
+    text.replace(&text[start..end], "<pi>")
+}
+
+/// Real `pi`, `node` and npm (network): with the passes on (the default), a turn goes through the
+/// proxy in `httpProxy` and fails on `httpIdleTimeoutMs` as in stock Pi; over RPC, the request
+/// the provider gets is stock's.
 #[test]
 fn e2e_proxy_and_idle_timeout_behave_as_stock() {
     if !e2e_enabled() {
@@ -266,11 +344,26 @@ fn e2e_proxy_and_idle_timeout_behave_as_stock() {
         );
         tunnels.push(std::mem::take(&mut *targets.lock().unwrap()));
     }
+    let mut requests = vec![];
+    for pi in [bundle.as_str(), "pi"] {
+        let (outcome, _) = rpc_turn(pi, &home, &agent, "fake");
+        assert_eq!(outcome, "Hello from pibake_fake.", "{pi}");
+        tunnels.push(std::mem::take(&mut *targets.lock().unwrap()));
+        requests.push(fake.requests());
+    }
     assert_eq!(tunnels[0], tunnels[1]);
+    assert_eq!(tunnels[2], tunnels[3]);
     assert!(
-        !tunnels[0].is_empty() && tunnels[0].iter().all(|t| *t == fake_target),
+        tunnels
+            .iter()
+            .all(|t| !t.is_empty() && t.iter().all(|t| *t == fake_target)),
         "{tunnels:?}"
     );
+    // `requests()` accumulates: the stock run's list starts with the bundle's.
+    let (ours, stock) = (&requests[0], &requests[1]);
+    assert_eq!(ours.len(), 3, "{ours:?}");
+    assert_eq!(stock[..3], ours[..]);
+    assert_eq!(without_pi_dir(&stock[3]), without_pi_dir(&ours[2]));
 
     settings(", \"httpIdleTimeoutMs\": 1000");
     let results: Vec<(Output, Duration)> = [bundle.as_str(), "pi"]
@@ -290,6 +383,18 @@ fn e2e_proxy_and_idle_timeout_behave_as_stock() {
     // undici reports the body timeout as `terminated`; the default timeout would take 300 s.
     assert!(text(&stock.0).contains("terminated"), "{}", text(&stock.0));
     for (_, took) in &results {
+        assert!(
+            (Duration::from_secs(1)..Duration::from_secs(20)).contains(took),
+            "{took:?}"
+        );
+    }
+    let rpc: Vec<(String, Duration)> = [bundle.as_str(), "pi"]
+        .into_iter()
+        .map(|pi| rpc_turn(pi, &home, &agent, "stall"))
+        .collect();
+    assert_eq!(rpc[0].0, rpc[1].0);
+    assert!(rpc[1].0.contains("terminated"), "{}", rpc[1].0);
+    for (_, took) in &rpc {
         assert!(
             (Duration::from_secs(1)..Duration::from_secs(20)).contains(took),
             "{took:?}"

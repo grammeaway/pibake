@@ -39,7 +39,7 @@ What a user waits for, against its floor:
 | # | Call | Needed by |
 |---|---|---|
 | O7 | n1: a pass, default on or opt-in, or an upstream PR to Pi. **Decided:** a pass, opt-in (revised from default on, `progress.md`) | n1 step 3 |
-| O8 | n2: a pass, default on or opt-in, or an upstream PR to Pi | n2 step 3 |
+| O8 | n2: a pass, default on or opt-in, or an upstream PR to Pi. **Decided:** a pass, default on, as it does not reconfigure the setup (`progress.md`) | n2 step 3 |
 
 ## Outside pibake: the live setup's status bar
 
@@ -49,6 +49,7 @@ The live setup's own `extensions/statusbar.js` is 31 % of `long_answer`'s CPU af
 
 Each needs a measurement before it becomes a plan.
 
+- **The first turn's code in the default code cache.** After n2, most of turn 1 on `sea_codecache` is `CompileLazy` (66–69 % of its samples): `--build-sea` caches only what it compiles eagerly. The plain bundle, with a compile cache from earlier runs, gets turn 1 to ~110 ms without n2; `sea_trained` (trained on a print turn) with n2 to 65–120 ms, against 267–319 ms for `sea_codecache` (`progress.md` → n2).
 - **Preconnect** to the current model's origin once it is known. That hides the first connection's 55–65 ms: behind typing in interactive mode, behind startup in print mode. undici has no public preconnect, so it means a cheap request to the provider or undici internals. An owner call either way; after n1.
 - **The exit wait.** `shutdown()` → `terminal.drainInput(1000, 50)` waits for 50 ms without input, so key-release events of the Kitty keyboard protocol don't leak into the shell. Without a negotiated protocol nothing can leak, and the 50 ms is pure wait (as in the bench's pty). Ctrl+D to exit: 90–116 ms, 20–35 ms of it JS (re-rendering the transcript for the normal screen, `dispose`). Small; an upstream matter.
 - **Interactive-only init** (`--cpu-prof`, `init` onward, at the probe's clock): `graphemeWidth`'s first call 16 ms (ICU segmenter set-up, for lines with any non-ASCII character such as box drawing), `ensureTool`'s `spawnSync` 8 ms (`../performance_plans/README.md` Candidates), highlight.js registration 5 ms, `parseChangelog` 3 ms. Together ~30 ms of ready's ~100 ms over RPC.

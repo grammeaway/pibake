@@ -17,7 +17,7 @@ pub const BIG_WRITE_PATH: &str = "big_write.txt";
 pub const BIG_WRITE_BYTES: usize = 200 * 1024;
 /// Real providers stream tool arguments in small pieces; the per-chunk cost is what l11 targets.
 pub const DELTA_BYTES: usize = 20;
-const HELLO_TEXT: &str = "Hello from pibake_fake.";
+pub const HELLO_TEXT: &str = "Hello from pibake_fake.";
 /// The text closing a scripted turn; the session scenarios watch the screen for it.
 pub const DONE_TEXT: &str = "pibake-fake-done";
 /// The answer to an extension's own model call, which must not look like the turn's end.
