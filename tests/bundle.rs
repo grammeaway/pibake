@@ -334,6 +334,21 @@ fn changed_inputs_get_their_own_bundle() {
     assert_eq!(f.bundle_entries().len(), 2);
 }
 
+#[test]
+fn the_report_follows_the_plan() {
+    let f = Fixture::new();
+    let (_, report) = f.bundle(&FakeBuild::new(&[])).unwrap();
+    assert!(report.unbaked.is_empty());
+    // Only the live manifest changes: the stage and the baked entries stay the same.
+    f.write(
+        "agent/npm/node_modules/pkg/package.json",
+        r#"{"name":"pkg","version":"1.0.0","pi":{"extensions":["./index.ts","./gone.ts"]}}"#,
+    );
+    let (_, report) = f.bundle(&FakeBuild::new(&[])).unwrap();
+    let unbaked: Vec<&str> = report.unbaked.iter().map(|u| u.entry.as_str()).collect();
+    assert_eq!(unbaked, ["./gone.ts"]);
+}
+
 fn trim(langs: &[&str]) -> Options {
     Options {
         passes: vec![Pass::TrimHighlight],
@@ -430,7 +445,7 @@ fn e2e_bundle_a_fixture_setup() {
         ("extensions/once.ts", ONCE_TS),
         (
             "extensions/located.js",
-            "import { fileURLToPath } from \"node:url\";\nexport default function (pi) {\n\tpi.registerCommand(\"located\", { description: fileURLToPath(import.meta.url), handler: async () => {} });\n}\n",
+            "#!/usr/bin/env node\nimport { fileURLToPath } from \"node:url\";\nexport default function (pi) {\n\tpi.registerCommand(\"located\", { description: fileURLToPath(import.meta.url), handler: async () => {} });\n}\n",
         ),
         (
             "extensions/pkg/package.json",

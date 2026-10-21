@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::inventory::Inventory;
+use crate::inventory::{self, Inventory};
 use crate::lock::{self, ESBUILD_VERSION, LOCK_FILE, Lock, NPM_LOCK_FILE};
 use crate::package::Source;
 
@@ -115,7 +115,7 @@ fn refuse_unstaged_local_code(inventory: &Inventory) -> Result<()> {
             .get("extensions")
             .into_iter()
             .flatten()
-            .filter(|e| !e.starts_with(['!', '+', '-']) && !e.starts_with("builtin:"))
+            .filter(|e| inventory::is_path_entry(e))
             .map(String::as_str),
     );
     if !found.is_empty() {

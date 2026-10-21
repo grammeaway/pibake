@@ -6,20 +6,20 @@
 //! in the answer's length. The pass sends both lexes and each block's rendering to
 //! `pibake:markdown` (`bundle/markdown.mjs`), which keeps what an extended text leaves as it was.
 //! The rendering moves into a function per block with stock's statements, in stock's order.
-//! Every site is matched by its whole text, and so is the theme global the block cache keys on:
-//! any change in Pi fails the pass.
+//! The block cache keys on Pi's theme global and on a flag the pass sets once highlight.js has
+//! loaded every language, after which Pi redraws. Every site is matched by its whole text, and
+//! so is the theme global: any change in Pi fails the pass.
 
-use anyhow::{Context, Result, bail};
-use oxc::allocator::Allocator;
-use oxc::span::SourceType;
+use anyhow::{Result, bail};
 
-use super::{Change, Sources, parse};
+use super::{Change, Sources, check_parses};
 use crate::lock::PI_PACKAGE;
 
 const PI_TUI: &str = "@earendil-works/pi-tui";
 const MARKDOWN: &str = "dist/components/markdown.js";
 const MERMAID: &str = "dist/modes/interactive/components/mermaid.js";
 const THEME: &str = "dist/modes/interactive/theme/theme.js";
+const SYNTAX: &str = "dist/utils/syntax-highlight.js";
 const OURS: &str = "__pibake_lexMarkdown";
 const MARKDOWN_IMPORT: &str = "import { lexMarkdown as __pibake_lexMarkdown, markdownBlock as __pibake_markdownBlock, markdownContext as __pibake_markdownContext } from \"pibake:markdown\"; ";
 const MERMAID_IMPORT: &str =
@@ -121,6 +121,11 @@ const MERMAID_LEX: &str = "        return markdownParser\n            .lexer(mar
 const MERMAID_LEX_OURS: &str =
     "        return __pibake_lexMarkdown(markdownParser,\n            markdown)\n";
 
+/// Pi 1.3.0's `loadAllHighlightLanguages` resolving; ours also sets the flag `markdownContext` reads.
+const ALL_LANGUAGES: &str =
+    "void import(\"highlight.js/lib/index.js\").then(() => resolve(), () => {";
+const ALL_LANGUAGES_OURS: &str = "void import(\"highlight.js/lib/index.js\").then(() => { globalThis[Symbol.for(\"pibake:highlight-all\")] = true; resolve(); }, () => {";
+
 /// Where Pi 1.3.0 keeps its theme, which `markdownContext` reads.
 const THEME_GLOBAL: [&str; 2] = [
     "const THEME_KEY = Symbol.for(\"@earendil-works/pi-coding-agent:theme\");",
@@ -139,6 +144,7 @@ pub fn run(sources: &mut Sources) -> Result<Vec<Change>> {
     }
     let markdown = format!("{}/{MARKDOWN}", sources.resolve_package(&pi, PI_TUI)?);
     let mermaid = format!("{pi}/{MERMAID}");
+    let syntax = format!("{pi}/{SYNTAX}");
     let mut changes = vec![];
     for (rel, stock, ours, import, what) in [
         (
@@ -154,6 +160,13 @@ pub fn run(sources: &mut Sources) -> Result<Vec<Change>> {
             MERMAID_LEX_OURS,
             MERMAID_IMPORT,
             "lexes a streamed text from its last unchanged block",
+        ),
+        (
+            &syntax,
+            ALL_LANGUAGES,
+            ALL_LANGUAGES_OURS,
+            "",
+            "flags when every highlight.js language has loaded",
         ),
     ] {
         let new = rewrite(&sources.read(rel)?, rel, stock, ours, import)?;
@@ -185,8 +198,7 @@ fn rewrite(text: &str, rel: &str, stock: &str, ours: &str, import: &str) -> Resu
         "{import}{}",
         text.replacen(stock, &format!("{ours}{}", "\n".repeat(padding)), 1)
     );
-    let allocator = Allocator::default();
-    parse(&allocator, &new, SourceType::mjs(), rel).context("the rewritten file")?;
+    check_parses(&new, rel)?;
     Ok(new)
 }
 

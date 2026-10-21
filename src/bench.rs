@@ -947,13 +947,8 @@ pub fn render_table(results: &[CommandResult]) -> String {
     out
 }
 
-/// Writes `<dir>/<date>_<label>.json`; refuses to overwrite an earlier record.
-pub fn record(
-    dir: &Path,
-    label: &str,
-    bench: &Bench,
-    results: &[CommandResult],
-) -> Result<PathBuf> {
+/// `<dir>/<date>_<label>.json`, checked before the bench runs: a valid label, no earlier record.
+pub fn record_path(dir: &Path, label: &str) -> Result<PathBuf> {
     if label.is_empty()
         || !label
             .chars()
@@ -961,6 +956,16 @@ pub fn record(
     {
         bail!("--record label must be non-empty [A-Za-z0-9_-]");
     }
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let path = dir.join(format!("{}_{label}.json", utc_date(now)));
+    if path.exists() {
+        bail!("{} exists; pick another --record label", path.display());
+    }
+    Ok(path)
+}
+
+/// Writes the record to `path`, from `record_path`; refuses to overwrite an earlier record.
+pub fn record(path: &Path, label: &str, bench: &Bench, results: &[CommandResult]) -> Result<()> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let date = utc_date(now);
     let git = |args: &[&str]| {
@@ -985,13 +990,14 @@ pub fn record(
         "delta_bytes": fake_provider::DELTA_BYTES,
         "results": results,
     });
-    std::fs::create_dir_all(dir)?;
-    let path = dir.join(format!("{date}_{label}.json"));
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
     let mut file =
-        std::fs::File::create_new(&path).with_context(|| format!("creating {}", path.display()))?;
+        std::fs::File::create_new(path).with_context(|| format!("creating {}", path.display()))?;
     file.write_all(serde_json::to_string_pretty(&report)?.as_bytes())?;
     file.write_all(b"\n")?;
-    Ok(path)
+    Ok(())
 }
 
 /// `YYYY-MM-DD` for a Unix time (Howard Hinnant's civil-from-days).
@@ -1398,7 +1404,8 @@ cat >/dev/null"#
             scenarios: &[Scenario::Startup, Scenario::LongSession],
             ..test_bench(Path::new("/unused"), home.path())
         };
-        let path = record(dir.path(), "baseline", &bench, &results).unwrap();
+        let path = record_path(dir.path(), "baseline").unwrap();
+        record(&path, "baseline", &bench, &results).unwrap();
         let json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(
@@ -1408,7 +1415,8 @@ cat >/dev/null"#
         assert_eq!(json["label"], "baseline");
         assert_eq!(json["big_write_bytes"], 100);
         assert_eq!(json["scenarios"], json!(["startup", "long_session"]));
-        assert!(record(dir.path(), "baseline", &bench, &results).is_err());
-        assert!(record(dir.path(), "../x", &bench, &results).is_err());
+        assert!(record_path(dir.path(), "baseline").is_err());
+        assert!(record(&path, "baseline", &bench, &results).is_err());
+        assert!(record_path(dir.path(), "../x").is_err());
     }
 }

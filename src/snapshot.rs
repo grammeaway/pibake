@@ -285,12 +285,18 @@ pub fn compare(
         "Request options",
         json_diff(&reference.request_options, &ours.request_options),
     );
+    let prompt = diff::render(
+        &diff::lines(&reference.system_prompt, &ours.system_prompt),
+        3,
+    );
+    // `diff::lines` compares lines, blind to `\r\n` and a final line break.
     section(
         "System prompt",
-        diff::render(
-            &diff::lines(&reference.system_prompt, &ours.system_prompt),
-            3,
-        ),
+        if prompt.is_empty() && reference.system_prompt != ours.system_prompt {
+            "differs only in line endings\n".into()
+        } else {
+            prompt
+        },
     );
 
     let command_key = |c: &Value| {
@@ -442,6 +448,19 @@ mod tests {
             "{report}"
         );
         assert!(!report.contains("Request options"), "{report}");
+    }
+
+    #[test]
+    fn line_ending_only_prompt_changes_are_reported() {
+        let a = Snapshot::from_parts(&request(&[], "a\nb"), vec![]).unwrap();
+        for prompt in ["a\nb\n", "a\r\nb"] {
+            let b = Snapshot::from_parts(&request(&[], prompt), vec![]).unwrap();
+            let report = compare(&b, "b", &a, "a");
+            assert!(
+                report.contains("## System prompt\ndiffers only in line endings"),
+                "{prompt:?}: {report}"
+            );
+        }
     }
 
     #[test]

@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use oxc::allocator::Allocator;
 use oxc::ast::ast::Program;
-use oxc::span::SourceType;
+use oxc::span::{SourceType, Span};
 use serde::{Deserialize, Serialize};
 
 pub use trim_apis::left_out_message;
@@ -319,6 +319,31 @@ pub fn parse<'a>(
         bail!("{rel} does not parse: {e}");
     }
     Ok(ret.program)
+}
+
+/// Fails unless a rewritten ES module still parses.
+pub fn check_parses(text: &str, rel: &str) -> Result<()> {
+    parse(&Allocator::default(), text, SourceType::mjs(), rel).context("the rewritten file")?;
+    Ok(())
+}
+
+pub fn range(span: Span) -> Range<usize> {
+    span.start as usize..span.end as usize
+}
+
+/// The first line at `span`, cut to 100 bytes, for error messages.
+pub fn snippet(text: &str, span: Span) -> String {
+    let line = text[range(span)].lines().next().unwrap_or("");
+    if line.len() > 100 {
+        format!("{}…", &line[..line.floor_char_boundary(100)])
+    } else {
+        line.to_owned()
+    }
+}
+
+/// The 1-based line of byte offset `at`.
+pub fn line_of(text: &str, at: usize) -> usize {
+    text[..at].matches('\n').count() + 1
 }
 
 /// `range` widened over the line break that follows it, so a removed statement leaves no blank line.

@@ -16,9 +16,9 @@ use oxc::ast::ast::{
     PropertyKind, Statement,
 };
 use oxc::semantic::SemanticBuilder;
-use oxc::span::{GetSpan, SourceType, Span};
+use oxc::span::{GetSpan, SourceType};
 
-use super::{Change, Sources, parse, splice, with_line_break};
+use super::{Change, Sources, parse, range, snippet, splice, with_line_break};
 use crate::lock::PI_PACKAGE;
 
 /// Pi's startup languages plus those of the owner's code (2026-10-16, owner).
@@ -158,21 +158,6 @@ pub fn run(sources: &mut Sources, keep: &[String]) -> Result<Vec<Change>> {
 
 fn names<'a>(names: impl Iterator<Item = &'a str>) -> String {
     names.collect::<Vec<_>>().join(", ")
-}
-
-fn range(span: Span) -> Range<usize> {
-    span.start as usize..span.end as usize
-}
-
-/// The statement's first line, for error messages.
-fn snippet(text: &str, span: Span) -> String {
-    let s = &text[range(span)];
-    let line = s.lines().next().unwrap_or("");
-    if line.len() > 100 {
-        format!("{}…", &line[..line.floor_char_boundary(100)])
-    } else {
-        line.to_owned()
-    }
 }
 
 #[derive(Debug)]

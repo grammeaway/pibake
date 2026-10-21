@@ -773,6 +773,8 @@ impl Bundler<'_> {
             .map(|rel| plan.stage.join(rel).to_string_lossy().into_owned())
             .collect();
         let passes_json = serde_json::to_string(&(self.passes, &overrides, &optional))?;
+        // What the report says besides the build: entries' owners, and what is left to jiti.
+        let plan_json = serde_json::to_string(&(&plan.baked, &plan.unbaked))?;
         let hash = stage::content_hash([
             ("pibake", env!("CARGO_PKG_VERSION").as_bytes()),
             ("stage", stage_path.as_bytes()),
@@ -796,6 +798,7 @@ impl Bundler<'_> {
             ("baked", baked_all.as_bytes()),
             ("owned", owned_json.as_bytes()),
             ("passes", passes_json.as_bytes()),
+            ("plan", plan_json.as_bytes()),
         ]);
         let mut report_out = None;
         let outcome = stage::publish(self.root, &hash, log, |dir, log| {

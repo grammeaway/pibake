@@ -237,6 +237,34 @@ fn missing_settings_means_no_packages() {
 }
 
 #[test]
+fn null_packages_mean_none_as_in_pi() {
+    let scratch = Scratch::with_agent_dir(None);
+    fs::write(
+        scratch.agent().join("settings.json"),
+        "{\"packages\": null}",
+    )
+    .unwrap();
+    assert_eq!(scratch.inspect_json()["packages"], json!([]));
+}
+
+#[test]
+fn the_first_entry_of_a_package_wins_as_in_pi() {
+    let scratch = Scratch::with_agent_dir(None);
+    fs::write(
+        scratch.agent().join("settings.json"),
+        r#"{"packages": ["npm:x@1", "git:github.com/o/r", "npm:x@2", "https://github.com/o/r.git"]}"#,
+    )
+    .unwrap();
+    let sources: Vec<Value> = scratch.inspect_json()["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["source"].clone())
+        .collect();
+    assert_eq!(sources, [json!("npm:x@1"), json!("git:github.com/o/r")]);
+}
+
+#[test]
 fn settings_with_a_bom_parse() {
     let scratch = Scratch::with_agent_dir(None);
     fs::write(

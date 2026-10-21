@@ -8,10 +8,8 @@
 //! any change in Pi fails the pass.
 
 use anyhow::{Context, Result, bail};
-use oxc::allocator::Allocator;
-use oxc::span::SourceType;
 
-use super::{Change, Sources, keep_alive_http, parse};
+use super::{Change, Sources, check_parses, keep_alive_http};
 use crate::lock::PI_PACKAGE;
 
 const FILE: &str = "dist/core/http-dispatcher.js";
@@ -126,8 +124,7 @@ fn rewrite(text: &str, rel: &str, globals: &[String]) -> Result<String> {
         "{IMPORT}{}",
         text.replacen(&stock, &format!("{renamed}{stand_in}"), 1)
     );
-    let allocator = Allocator::default();
-    parse(&allocator, &new, SourceType::mjs(), rel).context("the rewritten file")?;
+    check_parses(&new, rel)?;
     Ok(new)
 }
 

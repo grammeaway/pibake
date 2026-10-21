@@ -115,10 +115,13 @@ pub fn read(agent_dir: &Path, home: &Path) -> Result<Inventory> {
         bail!("agent directory {} does not exist", agent_dir.display());
     }
     let settings = read_settings(&agent_dir.join("settings.json"))?;
-    let packages: Vec<Package> = package_entries(&settings)?
+    let mut packages: Vec<Package> = package_entries(&settings)?
         .into_iter()
         .map(|entry| read_package(entry, agent_dir, home))
         .collect::<Result<_>>()?;
+    // Pi's `dedupePackages`: the first entry of a package wins.
+    let mut seen = std::collections::HashSet::new();
+    packages.retain(|p| seen.insert(p.identity.clone()));
     let settings_resources: BTreeMap<_, _> = RESOURCE_TYPES
         .into_iter()
         .filter_map(|t| Some((t, string_array(settings.get(t)?)?)))
@@ -132,7 +135,7 @@ pub fn read(agent_dir: &Path, home: &Path) -> Result<Inventory> {
     let resource_paths = settings_resources
         .values()
         .flatten()
-        .filter(|e| !e.starts_with(['!', '+', '-']) && !e.starts_with("builtin:"))
+        .filter(|e| is_path_entry(e))
         .map(|e| paths::resolve(agent_dir, e, home));
     let referenced: Vec<String> = local_package_paths
         .chain(resource_paths)
@@ -242,6 +245,11 @@ pub fn render_text(inv: &Inventory) -> String {
     s
 }
 
+/// A `settings.json` resource entry that names a path, not a pattern or a builtin.
+pub fn is_path_entry(entry: &str) -> bool {
+    !entry.starts_with(['!', '+', '-']) && !entry.starts_with("builtin:")
+}
+
 fn read_settings(path: &Path) -> Result<Value> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
@@ -259,7 +267,7 @@ fn read_settings(path: &Path) -> Result<Value> {
 }
 
 fn package_entries(settings: &Value) -> Result<Vec<PackageEntry>> {
-    let Some(packages) = settings.get("packages") else {
+    let Some(packages) = settings.get("packages").filter(|v| !v.is_null()) else {
         return Ok(vec![]);
     };
     let Some(packages) = packages.as_array() else {

@@ -141,8 +141,8 @@ for (const name of Object.getOwnPropertyNames(Intl)) {
 		},
 	});
 }
-// Builtins whose native state a snapshot cannot hold (checked one by one on Node 26).
-const unsafe = new Set(["http", "https", "http2", "tls", "repl", "sqlite"]);
+// Builtins whose native state a snapshot cannot hold: snapshot_safety's `LAZY_BUILTINS`.
+const unsafe = new Set(process.env.PIBAKE_LAZY_BUILTINS.split(","));
 const load = Module._load;
 Module._load = function (request, ...rest) {
 	const name = request.replace(/^node:/, "");

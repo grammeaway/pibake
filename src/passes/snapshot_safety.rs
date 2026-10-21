@@ -14,17 +14,16 @@
 //! Signal listeners and the working directory are the prologue's, for any module.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ops::Range;
 
 use anyhow::{Context, Result, bail};
 use oxc::allocator::Allocator;
 use oxc::ast::AstKind;
 use oxc::ast::ast::{Expression, Statement};
 use oxc::semantic::SemanticBuilder;
-use oxc::span::{GetSpan, SourceType, Span};
+use oxc::span::{GetSpan, SourceType};
 use serde::Deserialize;
 
-use super::{Change, Sources, parse, splice};
+use super::{Change, Sources, line_of, parse, range, splice};
 use crate::lock::PI_PACKAGE;
 
 /// Builtins whose loading creates state a snapshot cannot hold (each checked alone on Node 26).
@@ -275,14 +274,6 @@ fn const_declarator<'s, 'a>(
         }
         _ => None,
     }
-}
-
-fn range(span: Span) -> Range<usize> {
-    span.start as usize..span.end as usize
-}
-
-fn line_of(text: &str, at: usize) -> usize {
-    text[..at].matches('\n').count() + 1
 }
 
 /// What `bundle/trace.cjs` saw a module do at load.

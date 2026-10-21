@@ -142,6 +142,10 @@ impl Source {
         if let Some(spec) = source.strip_prefix("npm:") {
             let spec = spec.trim();
             let (name, version) = parse_npm_spec(spec);
+            // Its install path is `npm/node_modules/<name>`, which must stay there.
+            if name.contains('\\') || name.split('/').any(|s| matches!(s, "" | "." | "..")) {
+                bail!("npm package name {name:?} of `{source}` is not a package name");
+            }
             return Ok(Self::Npm {
                 spec: spec.to_owned(),
                 name,
@@ -187,14 +191,6 @@ impl Source {
             Self::Npm { name, .. } => agent_dir.join("npm").join("node_modules").join(name),
             Self::Git { host, path, .. } => agent_dir.join("git").join(host).join(path),
             Self::Local { path } => paths::resolve(agent_dir, path, home),
-        }
-    }
-
-    pub fn requested(&self) -> Option<&str> {
-        match self {
-            Self::Npm { version, .. } => version.as_deref(),
-            Self::Git { git_ref, .. } => git_ref.as_deref(),
-            Self::Local { .. } => None,
         }
     }
 }
@@ -277,15 +273,22 @@ fn scp_like(url: &str) -> Option<(&str, &str)> {
 /// Pi's `parseGenericGitUrl` plus `buildGitSource`.
 // shortcut: URLs are split textually, without WHATWG normalisation (host case, percent-encoding); `%` is rejected instead. Port `new URL` semantics if a setup needs escaped URLs.
 fn parse_generic_git_url(url: &str) -> Option<Source> {
+    // hosted-git-info would take a `#` fragment as the ref.
+    if url.contains('#') {
+        return None;
+    }
     let (repo_without_ref, git_ref) = split_ref(url);
     let (repo, host, path) = if let Some((host, path)) = scp_like(&repo_without_ref) {
         (repo_without_ref.clone(), host.to_owned(), path.to_owned())
-    } else if has_git_protocol(&repo_without_ref) {
+    } else if ["https://", "http://", "ssh://", "git://"]
+        .iter()
+        .any(|p| repo_without_ref.starts_with(p))
+    {
         let rest = repo_without_ref.split_once("://")?.1;
         let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
         let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
         let host = host_port.split_once(':').map_or(host_port, |(h, _)| h);
-        let path = path.split(['?', '#']).next().unwrap_or("");
+        let path = path.split('?').next().unwrap_or("");
         (
             repo_without_ref.clone(),
             host.to_owned(),
@@ -315,9 +318,21 @@ fn parse_generic_git_url(url: &str) -> Option<Source> {
             || (!allow_slash && part.contains('/'))
             || part.split('/').any(|s| s == "..")
     };
+    let segments = path.split('/').count();
+    // hosted-git-info reads a ref from GitHub's `/tree/<ref>` and cuts these hosts' paths to
+    // `<user>/<project>`.
+    let hosted_cut = [
+        "github.com",
+        "gist.github.com",
+        "bitbucket.org",
+        "git.sr.ht",
+    ]
+    .iter()
+    .any(|h| host.eq_ignore_ascii_case(h));
     if host.is_empty()
         || path.is_empty()
-        || path.split('/').count() < 2
+        || segments < 2
+        || (hosted_cut && segments > 2)
         || unsafe_part(&host, false)
         || unsafe_part(path, true)
     {
@@ -369,12 +384,26 @@ mod tests {
             ("npm:@s/p", npm("@s/p", "@s/p", None)),
             ("npm:p@", npm("p@", "p@", None)),
             ("npm:@", npm("@", "@", None)),
-            ("npm:", npm("", "", None)),
             ("npm:p@1@2", npm("p@1@2", "p", Some("1@2"))),
             ("npm:p@1\n2", npm("p@1\n2", "p@1\n2", None)),
         ];
         for (input, expected) in cases {
             assert_eq!(Source::parse(input).unwrap(), expected, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn npm_names_that_are_not_relative_paths_are_errors() {
+        for input in [
+            "npm:",
+            "npm:.",
+            "npm:..",
+            "npm:../x",
+            "npm:@s/",
+            "npm:@s/..",
+            "npm:a\\b",
+        ] {
+            assert!(Source::parse(input).is_err(), "{input:?}");
         }
     }
 
@@ -435,6 +464,15 @@ mod tests {
             "git:github.com/o/../r",
             "git:github.com/o/r%2e%2e",
             "https://github.com/",
+            // hosted-git-info takes these as refs or drops path segments; pibake does not port it.
+            "git:github.com/o/r#v1",
+            "https://github.com/o/r#v1",
+            "git:github.com/o/r/tree/main",
+            "https://GitHub.com/o/r/tree/main",
+            "git:bitbucket.org/o/r/src",
+            "git:git.sr.ht/~o/r/x",
+            // Pi's generic parser matches the protocol case-sensitively.
+            "git:HTTPS://example.com/o/r",
         ] {
             assert!(Source::parse(input).is_err(), "{input:?}");
         }

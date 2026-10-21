@@ -6,11 +6,9 @@
 //! keeps its loader as a non-enumerable `warm`; compat's `BUILTIN_APIS` holds one per API, and
 //! every provider's loader for an API imports the same module. Each edit stays on its line.
 
-use anyhow::{Context, Result, bail};
-use oxc::allocator::Allocator;
-use oxc::span::SourceType;
+use anyhow::{Result, bail};
 
-use super::{Change, Sources, parse};
+use super::{Change, Sources, check_parses};
 use crate::lock::PI_PACKAGE;
 
 const PI_AI: &str = "@earendil-works/pi-ai";
@@ -143,8 +141,7 @@ fn rewrite<'a>(text: &str, rel: &str, edits: impl Iterator<Item = &'a Edit>) -> 
         }
         out = out.replacen(&e.old, &e.new, 1);
     }
-    let allocator = Allocator::default();
-    parse(&allocator, &out, SourceType::mjs(), rel).context("the rewritten file")?;
+    check_parses(&out, rel)?;
     Ok(out)
 }
 

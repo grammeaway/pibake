@@ -22,3 +22,6 @@ npm-debug.log*
 
 # Hegel example database
 .hegel/
+
+# V8 profiler logs (node --prof)
+isolate-*.log

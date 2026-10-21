@@ -86,6 +86,9 @@ const themeIds = new WeakMap();
 let lastThemeId = 0;
 const STYLES = ["heading", "link", "linkUrl", "code", "codeBlock", "codeBlockBorder", "quote", "quoteBorder", "hr", "listBullet", "bold", "italic", "strikethrough", "underline"];
 const probe = (f) => (typeof f === "function" ? f("\0") : "");
+// Set when highlight.js has loaded every language (pass incremental_markdown): code blocks may
+// colour now what they could not before.
+const HIGHLIGHT_ALL = Symbol.for("pibake:highlight-all");
 
 /** Everything besides the tokens that `markdown`'s block lines depend on, as a string. */
 export function markdownContext(markdown, width, hyperlinks) {
@@ -105,6 +108,7 @@ export function markdownContext(markdown, width, hyperlinks) {
 		!!options.preserveBackslashEscapes,
 		!!options.preserveOrderedListMarkers,
 		typeof theme.highlightCode,
+		globalThis[HIGHLIGHT_ALL] === true,
 		theme.codeBlockIndent,
 		...STYLES.map((k) => probe(theme[k])),
 		probe(style?.color),

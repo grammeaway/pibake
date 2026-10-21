@@ -62,7 +62,7 @@ fn source_parsing_is_total_and_deterministic(tc: TestCase) {
     let second = Source::parse(&source);
     assert_eq!(format!("{first:?}"), format!("{second:?}"));
     if let Ok(parsed) = first {
-        // Install paths never escape their root: Pi refuses those, so must we.
+        // Install paths never escape their root: pibake refuses such sources.
         let install = paths::normalize(&parsed.install_path(agent, home));
         match parsed {
             Source::Npm { .. } => assert!(
@@ -78,13 +78,18 @@ fn source_parsing_is_total_and_deterministic(tc: TestCase) {
 #[hegel::test(test_cases = 300)]
 fn npm_spec_splits_back_into_itself(tc: TestCase) {
     let spec = tc.draw(gs::from_regex(r"@?[a-z0-9/@.^~-]{0,16}"));
-    let Ok(Source::Npm {
-        spec: parsed,
-        name,
-        version,
-    }) = Source::parse(&format!("npm:{spec}"))
-    else {
-        panic!("npm: prefix always parses as npm");
+    let (parsed, name, version) = match Source::parse(&format!("npm:{spec}")) {
+        Ok(Source::Npm {
+            spec,
+            name,
+            version,
+        }) => (spec, name, version),
+        Ok(other) => panic!("npm: prefix parsed as {other:?}"),
+        // The one refusal: a name that would leave `npm/node_modules`.
+        Err(e) => {
+            assert!(e.to_string().contains("is not a package name"), "{e}");
+            return;
+        }
     };
     assert_eq!(parsed, spec);
     match version {

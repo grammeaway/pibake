@@ -329,10 +329,14 @@ fn main() -> Result<ExitCode> {
                 real_home: &home,
                 perf_stat,
             };
+            let record_path = record
+                .as_deref()
+                .map(|label| bench::record_path(Path::new("bench_results"), label))
+                .transpose()?;
             let results = bench.run(|step| eprintln!("bench: {step}"))?;
             write!(out, "{}", bench::render_table(&results))?;
-            if let Some(label) = record {
-                let path = bench::record(Path::new("bench_results"), &label, &bench, &results)?;
+            if let (Some(path), Some(label)) = (record_path, record) {
+                bench::record(&path, &label, &bench, &results)?;
                 writeln!(out, "recorded: {}", path.display())?;
             }
         }

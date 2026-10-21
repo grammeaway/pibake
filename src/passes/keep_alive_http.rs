@@ -6,11 +6,9 @@
 //! handshake. undici hands the option on through Pi's factories to each origin's `Pool` and
 //! `Client`; a server's hint still wins. The options object is matched by its whole text.
 
-use anyhow::{Context, Result, bail};
-use oxc::allocator::Allocator;
-use oxc::span::SourceType;
+use anyhow::{Result, bail};
 
-use super::{Change, Sources, parse};
+use super::{Change, Sources, check_parses};
 use crate::lock::PI_PACKAGE;
 
 const FILE: &str = "dist/core/http-dispatcher.js";
@@ -63,8 +61,7 @@ fn rewrite(text: &str, rel: &str) -> Result<String> {
         );
     }
     let new = text.replacen(OPTIONS, &with_keep_alive(OPTIONS), 1);
-    let allocator = Allocator::default();
-    parse(&allocator, &new, SourceType::mjs(), rel).context("the rewritten file")?;
+    check_parses(&new, rel)?;
     Ok(new)
 }
 

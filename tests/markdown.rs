@@ -147,7 +147,7 @@ fn driver() -> &'static Mutex<Driver> {
     DRIVER_PROCESS.get_or_init(|| {
         let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("markdown");
         std::fs::create_dir_all(&dir).unwrap();
-        let (stock, ours) = rewritten_markdown();
+        let (stock, ours) = rewritten("pi-tui/dist/components/markdown.js");
         let ours_path = dir.join("markdown.pibake.js");
         std::fs::write(&ours_path, ours).unwrap();
         let paths = json!({
@@ -171,8 +171,8 @@ fn driver() -> &'static Mutex<Driver> {
     })
 }
 
-/// Stock `markdown.js` of the Pi on PATH, and the pass's rewrite of it.
-fn rewritten_markdown() -> (PathBuf, String) {
+/// The stock file of the Pi on PATH that ends in `suffix`, and the pass's rewrite of it.
+fn rewritten(suffix: &str) -> (PathBuf, String) {
     let pi = pibake::harness::PiCommand::parse("pi")
         .unwrap()
         .package_dir()
@@ -191,8 +191,8 @@ fn rewritten_markdown() -> (PathBuf, String) {
     let (rel, text) = out
         .overrides
         .into_iter()
-        .find(|(rel, _)| rel.ends_with("pi-tui/dist/components/markdown.js"))
-        .expect("the pass rewrites markdown.js");
+        .find(|(rel, _)| rel.ends_with(suffix))
+        .unwrap_or_else(|| panic!("the pass rewrites {suffix}"));
     (stage.join(rel), text)
 }
 
@@ -562,4 +562,90 @@ fn e2e_settings_changed_mid_stream_render_as_stock() {
         "style": null, "indent": false, "highlight": true, "ext_theme": true, "ordered_markers": false,
         "backslashes": false, "latex": true, "hyperlinks": false, "events": events,
     }));
+}
+
+/// Serves the rewritten `markdown.js` and `syntax-highlight.js` next to stock's, renders a code
+/// block in a language Pi loads late, loads every language and renders again, as Pi does.
+const LATE_LANGUAGES: &str = r#"
+import { registerHooks, createRequire } from "node:module";
+import { readFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+const [markdownStock, markdownOurs, syntaxStock, syntaxOurs, markdownMjs] = process.argv.slice(2);
+const markdownUrl = new URL("markdown.pibake.js", pathToFileURL(markdownStock)).href;
+const syntaxUrl = new URL("syntax-highlight.pibake.js", pathToFileURL(syntaxStock)).href;
+const served = new Map([[markdownUrl, markdownOurs], [syntaxUrl, syntaxOurs]]);
+registerHooks({
+	resolve(specifier, context, next) {
+		if (specifier === "pibake:markdown") return { url: pathToFileURL(markdownMjs).href, shortCircuit: true };
+		if (served.has(specifier)) return { url: specifier, shortCircuit: true };
+		return next(specifier, context);
+	},
+	load(url, context, next) {
+		const file = served.get(url);
+		if (file) return { format: "module", source: readFileSync(file, "utf8"), shortCircuit: true };
+		return next(url, context);
+	},
+});
+const { Markdown: Stock } = await import(pathToFileURL(markdownStock).href);
+const { Markdown: Ours } = await import(markdownUrl);
+const { loadAllHighlightLanguages } = await import(syntaxUrl);
+const hljs = (await import(pathToFileURL(createRequire(syntaxStock).resolve("highlight.js/lib/core.js")).href)).default;
+const id = (t) => t;
+const theme = {
+	heading: id, link: id, linkUrl: id, code: id, codeBlock: id, codeBlockBorder: id, quote: id,
+	quoteBorder: id, hr: id, listBullet: id, bold: id, italic: id, strikethrough: id, underline: id,
+	highlightCode: (code, lang) => code.split("\n").map((l) => (hljs.getLanguage(lang) ? `<${l}>` : l)),
+};
+const text = "```yaml\na: 1\n```";
+const components = [Stock, Ours].map((M) => new M(text, 0, 0, theme, undefined, {}));
+const before = components.map((c) => c.render(40));
+await loadAllHighlightLanguages();
+const after = components.map((c) => {
+	c.invalidate();
+	return c.render(40);
+});
+process.stdout.write(JSON.stringify({ before, after }));
+"#;
+
+/// A code block drawn before highlight.js has its language is drawn again in colour once Pi has
+/// loaded every language, as stock does.
+#[test]
+fn e2e_languages_loaded_later_render_as_stock() {
+    if !common::e2e_enabled() {
+        return;
+    }
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("markdown_late");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut args = vec![];
+    for (suffix, name) in [
+        ("pi-tui/dist/components/markdown.js", "markdown.pibake.js"),
+        (
+            "pi-coding-agent/dist/utils/syntax-highlight.js",
+            "syntax.pibake.js",
+        ),
+    ] {
+        let (stock, ours) = rewritten(suffix);
+        std::fs::write(dir.join(name), ours).unwrap();
+        args.extend([stock, dir.join(name)]);
+    }
+    std::fs::write(dir.join("markdown.mjs"), pibake::bundle::MARKDOWN).unwrap();
+    std::fs::write(dir.join("driver.mjs"), LATE_LANGUAGES).unwrap();
+    let out = Command::new("node")
+        .arg(dir.join("driver.mjs"))
+        .args(&args)
+        .arg(dir.join("markdown.mjs"))
+        .output()
+        .expect("node");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let frames: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let [stock, ours] = [0, 1].map(|i| [&frames["before"][i], &frames["after"][i]]);
+    assert_ne!(
+        stock[0], stock[1],
+        "stock colours the block once yaml loads"
+    );
+    assert_eq!(ours, stock);
 }

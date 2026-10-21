@@ -10,7 +10,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::ops::Range;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -19,10 +18,10 @@ use oxc::ast::ast::{
     Argument, ArrayExpressionElement, BindingPattern, Declaration, Expression,
     ImportDeclarationSpecifier, Statement,
 };
-use oxc::span::{GetSpan, SourceType, Span};
+use oxc::span::{GetSpan, SourceType};
 use serde_json::Value;
 
-use super::{Change, Frozen, Setup, Sources, parse, splice};
+use super::{Change, Frozen, Setup, Sources, parse, range, snippet, splice};
 use crate::lock::PI_PACKAGE;
 
 const PI_AI: &str = "@earendil-works/pi-ai";
@@ -145,19 +144,6 @@ pub fn run(sources: &mut Sources, explicit: Option<&[String]>, setup: &Setup) ->
 
 fn names<'a>(names: impl Iterator<Item = &'a String>) -> String {
     names.map(String::as_str).collect::<Vec<_>>().join(", ")
-}
-
-fn range(span: Span) -> Range<usize> {
-    span.start as usize..span.end as usize
-}
-
-fn snippet(text: &str, span: Span) -> String {
-    let line = text[range(span)].lines().next().unwrap_or("");
-    if line.len() > 100 {
-        format!("{}…", &line[..line.floor_char_boundary(100)])
-    } else {
-        line.to_owned()
-    }
 }
 
 #[derive(Debug)]

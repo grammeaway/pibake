@@ -310,11 +310,13 @@ impl Builder<'_> {
         let trace = work.join("trace.cjs");
         let out = work.join("trace.json");
         fs::write(&trace, TRACE)?;
+        let lazy_builtins = snapshot_safety::LAZY_BUILTINS.join(",");
         (self.node)(
             &["--require".as_ref(), trace.as_os_str(), main.as_os_str()],
             Some(&[
                 ("PIBAKE_SNAPSHOT_ROOT", root.as_os_str()),
                 ("PIBAKE_TRACE_OUT", out.as_os_str()),
+                ("PIBAKE_LAZY_BUILTINS", lazy_builtins.as_ref()),
             ]),
         )
         .context("evaluating the bundle's modules as the snapshot build would")?;

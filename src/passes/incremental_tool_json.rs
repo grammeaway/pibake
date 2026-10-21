@@ -16,7 +16,7 @@ use oxc::ast::ast::{ImportDeclarationSpecifier, Statement};
 use oxc::semantic::SemanticBuilder;
 use oxc::span::{GetSpan, SourceType};
 
-use super::{Change, Sources, parse, splice};
+use super::{Change, Sources, check_parses, line_of, parse, splice};
 use crate::lock::PI_PACKAGE;
 
 const PI_AI: &str = "@earendil-works/pi-ai";
@@ -241,8 +241,7 @@ fn rewrite(text: &str, rel: &str, sites: &[&Site]) -> Result<String> {
     // On the first line, so the file's line numbers stay as they are.
     edits.push((0..0, IMPORT.to_owned()));
     let new = splice(text, &mut edits)?;
-    let allocator = Allocator::default();
-    parse(&allocator, &new, SourceType::mjs(), rel).context("the rewritten file")?;
+    check_parses(&new, rel)?;
     Ok(new)
 }
 
@@ -254,10 +253,6 @@ fn preceded_by(mut text: &str, fragments: &[&str]) -> bool {
         text = rest;
     }
     true
-}
-
-fn line_of(text: &str, at: usize) -> usize {
-    text[..at].matches('\n').count() + 1
 }
 
 #[cfg(test)]

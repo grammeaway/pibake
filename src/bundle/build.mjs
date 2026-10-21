@@ -162,8 +162,8 @@ const plugin = {
 			// Mentioned only in strings or comments: nothing to rewrite.
 			if (!out.code.includes("__pibake_location")) return plain;
 			located[relative(config.stage, args.path)] = kind;
-			// A hashbang must stay first; the bundle drops it from non-entry modules anyway.
-			const code = out.code.startsWith("#!") ? out.code.slice(out.code.indexOf("\n") + 1) : out.code;
+			// A hashbang must stay first; as a comment it keeps the source map's lines.
+			const code = out.code.startsWith("#!") ? `//${out.code.slice(2)}` : out.code;
 			return { contents: `const __pibake_location = ${location};${code}`, loader: "js" };
 		});
 	},
@@ -343,7 +343,7 @@ for (const file of overrides.keys()) {
 	}
 }
 
-const message = (m) => ({ text: m.text, id: m.id || null, file: m.location?.file ?? null, line: m.location?.line ?? null, line_text: m.location?.lineText ?? null });
+const message = (m) => ({ text: m.text, id: m.id || null, file: m.location?.file ?? null, line: m.location?.line ?? null });
 process.stdout.write(
 	JSON.stringify({
 		errors: result.errors.map(message),
