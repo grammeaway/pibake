@@ -1,6 +1,6 @@
 [package]
 name = "pibake"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "cargo build --release for your Pi setup: one pinned, optimized executable from a Pi agent directory."
 license = "MIT OR Apache-2.0"
