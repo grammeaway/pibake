@@ -25,3 +25,7 @@ npm-debug.log*
 
 # V8 profiler logs (node --prof)
 isolate-*.log
+
+# Bench setups build into their own target/
+bench/setups/*/target/
+bench/setups/*/bench_results/
