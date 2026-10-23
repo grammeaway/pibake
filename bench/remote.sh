@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Runs on the bench server (see run.sh): installs the Node and Pi each setup's lock pins, then
-# builds, verifies and benches it. Results land in ~/bench/results/.
+# builds and verifies it on the default backend and on sea_snapshot, and benches both against
+# stock Pi. Results land in ~/bench/results/.
 set -euo pipefail
 cd ~/bench
 mkdir -p results
@@ -29,11 +30,18 @@ for setup in setups/*/; do
   scenarios=()
   [ -n "${SCENARIOS:-}" ] && scenarios=(--scenarios "$SCENARIOS")
 
+  snapshot_setup=~/bench/snapshot/$name
+  mkdir -p ~/bench/snapshot
+  rsync -a --delete --exclude target --exclude bench_results "$setup" "$snapshot_setup/"
+  printf '\n[build]\nbackend = "sea_snapshot"\nname = "pi-snapshot"\n' >> "$snapshot_setup/pibake.toml"
+  (cd "$snapshot_setup" && ~/bench/pibake build && ~/bench/pibake verify --pi "$PWD/target/pibake/bin/pi-snapshot")
+  snapshot=$snapshot_setup/target/pibake/bin/pi-snapshot
+
   cd "$setup"
   baked=$PWD/target/pibake/bin/pi-baked
   ~/bench/pibake build
   ~/bench/pibake verify --pi "$baked"
-  ~/bench/pibake bench --pi pi --pi "$baked" --runs "$RUNS" --record "hetzner_$name" "${perf[@]}" "${scenarios[@]}" \
+  ~/bench/pibake bench --pi pi --pi "$baked" --pi "$snapshot" --runs "$RUNS" --record "hetzner_$name" "${perf[@]}" "${scenarios[@]}" \
     | tee ~/bench/results/"${date}_hetzner_$name.txt"
   cp bench_results/*_hetzner_"$name".json ~/bench/results/
   cd ~/bench

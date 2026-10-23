@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Benches stock Pi against a pibake build of each setup in bench/setups/ on the server from
-# bench/infra (`terraform apply` there first), then copies results to bench_results/hetzner/.
-# RUNS (default 20) sets runs per scenario; SCENARIOS (comma-separated, default all) picks them.
+# Benches stock Pi against pibake builds (default backend and sea_snapshot) of each setup in
+# bench/setups/ on the server from bench/infra (`terraform apply` there first), then copies
+# results to bench_results/hetzner/.
+# RUNS (default 10) sets runs per scenario; SCENARIOS (comma-separated, default all) picks them.
 #
 # The run lives in a tmux session on the server, so a dropped connection loses nothing: rerun
 # this script to follow it again, and it fetches the results once the run ends. A finished
@@ -29,7 +30,7 @@ if [ -z "$state" ]; then
     bench/setups bench/remote.sh target/x86_64-unknown-linux-musl/release/pibake "$host:bench/"
   commit=$(git rev-parse HEAD)$(git diff --quiet HEAD -- . ':!bench_results' || echo -dirty)
   "${ssh[@]}" "$host" "tmux new-session -d -s bench \
-    'RUNS=${RUNS:-20} SCENARIOS=${SCENARIOS:-} PIBAKE_COMMIT=$commit bash bench/remote.sh > bench/run.log 2>&1; echo \$? > bench/exit'"
+    'RUNS=${RUNS:-10} SCENARIOS=${SCENARIOS:-} PIBAKE_COMMIT=$commit bash bench/remote.sh > bench/run.log 2>&1; echo \$? > bench/exit'"
   echo "started; Ctrl+C stops following, not the run"
 fi
 
