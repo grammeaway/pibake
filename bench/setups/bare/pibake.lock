@@ -1,0 +1,10 @@
+# Written by `pibake lock` from the setup as installed. Re-pin with `pibake lock --update`.
+[pi]
+version = "1.4.0"
+integrity = "sha512-Z41LpZ3yYHSC/UUps6Mr39UMFPwH8elhJBG9DY1P7kuzsE5qSK/6eMj2EHzO5evJRQWLbKSqUMw+4nCNtIyiQg=="
+
+[node]
+version = "26.12.0"
+
+[npm_lock]
+sha256 = "7fb83834ef22cbaf1aed17610da127f21312dce7fa123b928c9cb888aa004b80"

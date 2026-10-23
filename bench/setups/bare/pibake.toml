@@ -1,0 +1,6 @@
+[source]
+agent_dir = "agent"
+
+# The bench's fake provider speaks openai-completions; a bare config would otherwise trim it.
+[trim]
+apis = ["anthropic-messages", "openai-completions"]

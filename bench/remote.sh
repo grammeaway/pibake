@@ -20,7 +20,9 @@ for setup in setups/*/; do
   export PATH=/opt/node-v$node/bin:$PATH
   [ "$(pi --version 2>/dev/null)" = "$pi" ] || npm install -g "@earendil-works/pi-coding-agent@$pi"
 
-  (cd "$setup/agent/npm" && npm ci --legacy-peer-deps --no-audit --no-fund)
+  if [ -d "$setup/agent/npm" ]; then
+    (cd "$setup/agent/npm" && npm ci --legacy-peer-deps --no-audit --no-fund)
+  fi
 
   perf=()
   perf stat -e instructions:u true >/dev/null 2>&1 && perf=(--perf-stat)
