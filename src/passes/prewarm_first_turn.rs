@@ -1,6 +1,7 @@
 //! `prewarm_first_turn`: once RPC or interactive mode is ready, and after a model change, Pi
 //! makes its HTTP dispatcher (deferred by `lazy_http_dispatcher`) and evaluates the current
-//! model's stream API module, each in its own macrotask, instead of on the first request.
+//! model's stream API module, each in its own macrotask after a quiet spell, instead of on the
+//! first request.
 //!
 //! The same modules and dispatcher result, only sooner, while the user types. pi-ai's `lazyApi`
 //! keeps its loader as a non-enumerable `warm`; compat's `BUILTIN_APIS` holds one per API, and
@@ -14,9 +15,11 @@ use crate::lock::PI_PACKAGE;
 const PI_AI: &str = "@earendil-works/pi-ai";
 const COMPAT: &str = "from \"@earendil-works/pi-ai/compat\";";
 
-/// Reads `globalThis.fetch` (the dispatcher), then calls the model's API loader. Unref'd, so a
-/// warm-up never holds the process open; a failed load is left for the request to report.
-const PREWARM: &str = "export function pibakePrewarm(getModel) { const later = (f) => setTimeout(f).unref(); later(() => { void globalThis.fetch; later(() => BUILTIN_APIS.find(([api]) => api === getModel()?.api)?.[1].warm?.()?.catch(() => { })); }); } ";
+/// After 100 ms, reads `globalThis.fetch` (the dispatcher), then calls the model's API loader.
+/// The wait lets input already sent (an RPC client's first command) go first: a 0 ms timer runs
+/// before Node polls stdin. Unref'd, so a warm-up never holds the process open; a failed load is
+/// left for the request to report.
+const PREWARM: &str = "export function pibakePrewarm(getModel) { const later = (f, ms) => setTimeout(f, ms).unref(); later(() => { void globalThis.fetch; later(() => BUILTIN_APIS.find(([api]) => api === getModel()?.api)?.[1].warm?.()?.catch(() => { })); }, 100); } ";
 
 struct Edit {
     package: &'static str,
@@ -207,6 +210,31 @@ mod tests {
                 "{rel}: {out}"
             );
         }
+    }
+
+    /// An RPC client's first command, sent as Pi gets ready, is answered before the warm-up's
+    /// synchronous module loads run; the warm-up still comes, well before a typed first prompt.
+    #[test]
+    fn warms_up_after_a_quiet_spell_not_before_waiting_input() {
+        let script = format!(
+            "const log = []; \
+             const BUILTIN_APIS = [['a', {{ warm: async () => log.push('warm') }}]]; \
+             Object.defineProperty(globalThis, 'fetch', {{ get: () => log.push('fetch') }}); \
+             {} \
+             pibakePrewarm(() => ({{ api: 'a' }})); \
+             setTimeout(() => log.push('command'), 20); \
+             setTimeout(() => console.log(log.join(',')), 500);",
+            PREWARM.replacen("export ", "", 1)
+        );
+        let out = std::process::Command::new("node")
+            .args(["-e", &script])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "command,fetch,warm"
+        );
     }
 
     #[test]
