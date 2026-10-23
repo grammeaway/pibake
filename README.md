@@ -17,6 +17,32 @@ Two uses, one tool:
 
 Pi itself is not forked. pibake builds released Pi packages through Pi's own entry point, so the behaviour is Pi's.
 
+## Numbers
+
+Stock Pi → pibake (default backend), on a Hetzner CCX13 (2 dedicated AMD EPYC vCPUs). Each figure is the median of 10 interleaved runs, on Pi 1.4.0 and Node 26.12.0. The three setups are in [`bench/setups/`](bench/setups):
+
+- `bare`: no packages.
+- `typical`: 7 popular packages and 3 of Pi's example extensions.
+- `batteries`: 15 packages, roughly oh-my-pi's built-in features.
+
+| | bare | typical | batteries |
+|---|---|---|---|
+| RPC startup | 315 → 318 ms | 3021 → 581 ms (5.2×) | 6209 → 675 ms (9.2×) |
+| Interactive startup, ready | 352 → 390 ms | 3185 → 729 ms (4.4×) | 6313 → 792 ms (8.0×) |
+| Startup peak memory | 110 → 140 MiB | 419 → 203 MiB | 544 → 234 MiB |
+| 200 KiB streamed write, print mode (wall) | 30.0 → 0.79 s | 33.0 → 1.14 s | 36.3 → 1.29 s |
+| Same write in the TUI (CPU) | 32.2 → 2.4 s | 36.8 → 2.9 s | 41.3 → 3.1 s |
+| First turn, prompt to first token | 73.5 → 74.5 ms | 88.6 → 74.8 ms | 76.5 → 110.8 ms |
+
+What the numbers show:
+
+- **Startup:** the gain grows with the setup. Stock Pi transpiles and evaluates every extension at every launch. With no packages, the default backend is level on RPC startup, but takes 11% longer to be ready and uses 30 MiB more memory.
+- **Streaming:** the gains come from the incremental passes and hold on every setup.
+- **First turn:** batteries' first turn is about 35 ms slower than stock. The cause is not yet found.
+- **`sea_snapshot`** roughly halves bare Pi's startup: 167 ms RPC startup, 205 ms to ready. On `typical` and `batteries` it is about 30% slower than the default backend; see [How it builds](#how-it-builds).
+
+The full results, covering every scenario, CPU, memory, instruction counts and the `sea_snapshot` column, are in [`bench_results/hetzner/`](bench_results/hetzner). To reproduce them, `bench/infra` provisions the server with Terraform and [`bench/run.sh`](bench/run.sh) runs the bench: about 2 hours, under €0.20.
+
 ## Install
 
 Linux only for now (x86_64 and aarch64; see [Roadmap](#roadmap)). Download a static binary from [Releases](https://github.com/grammeaway/pibake/releases) and put `pibake` on your `PATH`, or build from source with `cargo install --path .`.
@@ -81,7 +107,7 @@ pibake.lock ─► stage ─► passes ─► bundle ─► backend ─► verif
 - **Bundle:** one file holding Pi and every extension. Pi still discovers and orders extensions as usual; the bundle answers its loader with the baked code instead of transpiling from disk, and anything it did not bake (a project extension, one added later) loads as in stock Pi.
 - **Backend:** Node's [single executable applications](https://nodejs.org/api/single-executable-applications.html). Node is the runtime Pi targets, so there is no runtime drift. `[build] backend` picks one of three:
   - `sea_codecache` (the default) ships an ES module with V8's code cache.
-  - `sea_snapshot` ships a V8 startup snapshot. The snapshot is taken after every module has been evaluated at build time, so a launch skips that work.
+  - `sea_snapshot` ships a V8 startup snapshot. The snapshot is taken after every module has been evaluated at build time, so a launch skips that work. It is the fastest backend when every extension goes into its bundle. The bundle is CommonJS, so it cannot hold an extension that uses top-level `await`. The build reports such an extension as `FAILED, loads through jiti`, and that extension is then transpiled from source at every launch, as in stock Pi. In the bench's `typical` and `batteries` setups, three packages do this (`pi-subagents` and two `rpiv-*`), which makes the snapshot about 30% slower to start than the default backend. Opt-in, for this and the deferral rules below.
   - `sea_trained` (opt-in) ships a CommonJS bundle with a code cache trained at build time. That cache holds every function startup and a print turn compile, where `sea_codecache`'s holds only the top level. Training runs the setup, its extensions included, under `node` in a throwaway home with a local fake provider, offline. It is kept under `target/pibake/train/` and reused while the bundle is unchanged, so a rebuild is byte-identical. The build fails if the new executable's V8 rejects the cache.
 
   For `sea_snapshot`, pibake defers what module code would otherwise freeze at build time: environment and terminal reads, ICU objects, signal listeners, and the HTTP stack. Those run at launch instead. A traced build fails, naming the module, on anything else read at load. The files Pi reads from disk are extracted to the user's cache at build time, and the executable keeps using that path. Other backends ([Pi-Bolt](https://github.com/opensec-git/Pi-Bolt)'s ahead-of-time compiled JavaScriptCore, `deno compile`) can plug in at the same point later.
