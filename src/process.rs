@@ -179,9 +179,7 @@ pub fn busiest_in_tree(pid: u32) -> Result<u32> {
     let mut best = (cpu_time(pid)?, pid);
     let mut pending = vec![pid];
     while let Some(parent) = pending.pop() {
-        let children = std::fs::read_to_string(format!("/proc/{parent}/task/{parent}/children"))
-            .unwrap_or_default();
-        for child in children.split_whitespace().filter_map(|c| c.parse().ok()) {
+        for child in children(parent) {
             // A child that exited in between is skipped.
             if let Ok(cpu) = cpu_time(child) {
                 best = best.max((cpu, child));
@@ -190,6 +188,15 @@ pub fn busiest_in_tree(pid: u32) -> Result<u32> {
         }
     }
     Ok(best.1)
+}
+
+/// A live process's children; none once it is gone.
+pub fn children(pid: u32) -> Vec<u32> {
+    std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter_map(|c| c.parse().ok())
+        .collect()
 }
 
 /// A live process's resident set and its peak so far (`VmRSS`, `VmHWM`).

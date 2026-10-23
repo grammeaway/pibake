@@ -1,0 +1,21 @@
+{
+  "packages": [
+    "npm:pi-mcp-adapter",
+    "npm:pi-web-access",
+    "npm:pi-subagents",
+    "npm:@juicesharp/rpiv-ask-user-question",
+    "npm:@juicesharp/rpiv-todo",
+    "npm:pi-powerline-footer",
+    "npm:@dietrichgebert/ponytail",
+    "npm:@narumitw/pi-lsp",
+    "npm:pi-memory",
+    "npm:pi-goal-x",
+    "npm:@narumitw/pi-plan-mode",
+    "npm:pi-background-tasks",
+    "npm:pi-workspace-history",
+    "npm:pi-agent-browser-native",
+    "npm:@narumitw/pi-usage"
+  ],
+  "defaultProvider": "anthropic",
+  "defaultModel": "claude-sonnet-5-5"
+}

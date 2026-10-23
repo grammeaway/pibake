@@ -1,0 +1,15 @@
+#cloud-config
+package_update: true
+packages:
+  - git
+  # Official Node builds link it.
+  - libatomic1
+  - rsync
+  - tmux
+  - xz-utils
+  - linux-tools-generic
+runcmd:
+  # Keep background apt work from landing in the middle of a run.
+  - systemctl disable --now unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer
+  - apt-get install -y "linux-tools-$(uname -r)" || true
+  - sysctl -w kernel.perf_event_paranoid=1

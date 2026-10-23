@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -20,6 +21,9 @@ use crate::harness::{Harness, PiCommand};
 use crate::process::{self, Supervised, Usage};
 
 const TIMEOUT: Duration = Duration::from_secs(300);
+/// How long Pi may take to exit after its `PI_STARTUP_BENCHMARK` teardown before it is killed:
+/// an extension's timer or socket can keep Node's event loop alive.
+const TEARDOWN_GRACE: Duration = Duration::from_secs(1);
 const BIG_WRITE_PROMPT: &str = "Write the file.";
 const LONG_ANSWER_PROMPT: &str = "Answer at length.";
 const BIG_OUTPUT_PROMPT: &str = "Print the numbers.";
@@ -481,12 +485,17 @@ impl Bench<'_> {
         }
         let run = Supervised::spawn_in_pty(cmd, tty, TIMEOUT)?;
         let started = run.started;
-        let reader = std::thread::spawn(move || read_screen(master, started, until));
+        let kill_after_teardown = until.is_none().then(|| Teardown {
+            pgid: run.child.id() as libc::pid_t,
+            perf_stat: self.perf_stat,
+        });
+        let reader =
+            std::thread::spawn(move || read_screen(master, started, until, kill_after_teardown));
         let (status, usage) = run.wait()?;
-        let screen = reader
+        let (screen, killed_after_teardown) = reader
             .join()
             .map_err(|_| anyhow!("the pty reader panicked"))??;
-        if !status.success() {
+        if !status.success() && !killed_after_teardown {
             bail!("exited with {status}");
         }
         Ok((screen, usage, self.minstr(harness)?))
@@ -745,18 +754,45 @@ fn turn_medians(turn_cpu: &[Duration]) -> (Option<f64>, Option<f64>) {
 }
 
 /// Drains the pty until nothing holds its terminal side any more, answering DA1 queries. With
-/// `until`, sends Ctrl+D once, when the drawn text first shows it or `UNEXPECTED_TEXT`.
+/// `until`, sends Ctrl+D once, when the drawn text first shows it or `UNEXPECTED_TEXT`. With
+/// `kill_after_teardown`, Pi still holding the pty `TEARDOWN_GRACE` after the teardown is killed;
+/// the bool says whether that happened.
 fn read_screen(
     mut master: File,
     started: Instant,
     until: Option<&'static str>,
-) -> std::io::Result<Screen> {
+    mut kill_after_teardown: Option<Teardown>,
+) -> std::io::Result<(Screen, bool)> {
     let mut reply = master.try_clone()?;
     let mut screen = Screen::default();
     let mut buf = [0; 64 * 1024];
     let mut watch = until.map(|u| [u, UNEXPECTED_TEXT]);
     let mut scanned: usize = 0;
+    let mut deadline = None;
+    let mut killed = false;
     loop {
+        if let Some(at) = deadline {
+            let left = at - Instant::now().min(at);
+            let mut fd = libc::pollfd {
+                fd: master.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ready = unsafe { libc::poll(&mut fd, 1, left.as_millis() as libc::c_int) };
+            if ready < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err);
+            }
+            if ready == 0 {
+                if let Some(teardown) = kill_after_teardown.take() {
+                    teardown.kill();
+                }
+                (deadline, killed) = (None, true);
+            }
+        }
         let n = match master.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => n,
@@ -767,6 +803,9 @@ fn read_screen(
         };
         for _ in 0..screen.feed(&buf[..n], started.elapsed()) {
             reply.write_all(DA1_REPLY)?;
+        }
+        if screen.torn_down && deadline.is_none() && kill_after_teardown.is_some() {
+            deadline = Some(Instant::now() + TEARDOWN_GRACE);
         }
         if let Some(texts) = watch {
             // Only the new text, plus enough before it for a marker split across reads.
@@ -779,7 +818,27 @@ fn read_screen(
             scanned = screen.text.len();
         }
     }
-    Ok(screen)
+    Ok((screen, killed))
+}
+
+/// The process group of a run in the pty, and whether its leader is `perf stat` around Pi.
+struct Teardown {
+    pgid: libc::pid_t,
+    perf_stat: bool,
+}
+
+impl Teardown {
+    /// Kills Pi; under `perf stat` only Pi, so perf still writes its counts.
+    fn kill(&self) {
+        let pi = self
+            .perf_stat
+            .then(|| process::children(self.pgid as u32).first().copied())
+            .flatten();
+        match pi {
+            Some(pid) => unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) },
+            None => unsafe { libc::killpg(self.pgid, libc::SIGKILL) },
+        };
+    }
 }
 
 /// Pi's terminal output, parsed byte by byte, so sequences split across reads are still found.
@@ -1134,6 +1193,38 @@ mod tests {
         assert!(err("blank", "true").contains("no frame drawn"));
         assert!(err("other", &frame("hi")).contains("never showed the model"));
         assert!(err("failing", &format!("{}; exit 3", frame("hello"))).contains("exit status: 3"));
+
+        let hung = Instant::now();
+        let (_, ready, _, _) = run(
+            "hangs_after_teardown",
+            &format!("{}; printf '\\033[?1049l'; sleep 60", frame("hello")),
+        )
+        .unwrap();
+        assert!(ready < TEARDOWN_GRACE);
+        assert!(hung.elapsed() < TEARDOWN_GRACE * 5);
+    }
+
+    #[test]
+    fn perf_stat_still_counts_a_pi_killed_after_teardown() {
+        let perf_works = Command::new("perf")
+            .args(["stat", "-e", PERF_STAT_EVENT, "true"])
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !perf_works {
+            eprintln!("skipped: perf stat -e {PERF_STAT_EVENT} is unavailable here");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/agent_dir");
+        let bench = Bench {
+            perf_stat: true,
+            ..test_bench(&fixture, dir.path())
+        };
+        let provider = FakeProvider::start().unwrap();
+        let body = format!("{}; printf '\\033[?1049l'; sleep 60", frame("hello"));
+        let pi = fake_pi(dir.path(), "hangs_after_teardown", &body);
+        let (_, _, _, minstr) = bench.interactive(&pi, &provider).unwrap();
+        assert!(minstr.is_some_and(|m| m > 0.0));
     }
 
     fn test_bench<'a>(fixture: &'a Path, home: &'a Path) -> Bench<'a> {

@@ -1,0 +1,13 @@
+{
+  "name": "pi-extensions",
+  "private": true,
+  "dependencies": {
+    "@dietrichgebert/ponytail": "^5.3.2",
+    "@juicesharp/rpiv-ask-user-question": "^2.13.9",
+    "@juicesharp/rpiv-todo": "^2.13.9",
+    "pi-mcp-adapter": "^6.0.0",
+    "pi-powerline-footer": "^0.20.2",
+    "pi-subagents": "^0.81.0",
+    "pi-web-access": "^0.44.0"
+  }
+}
