@@ -27,12 +27,12 @@ Stock Pi → pibake (default backend), on a Hetzner CCX13 (2 dedicated AMD EPYC 
 
 | | bare | typical | batteries |
 |---|---|---|---|
-| RPC startup | 315 → 318 ms | 3021 → 581 ms (5.2×) | 6209 → 675 ms (9.2×) |
-| Interactive startup, ready | 352 → 390 ms | 3185 → 729 ms (4.4×) | 6313 → 792 ms (8.0×) |
-| Startup peak memory | 110 → 140 MiB | 419 → 203 MiB | 544 → 234 MiB |
-| 200 KiB streamed write, print mode (wall) | 30.0 → 0.79 s | 33.0 → 1.14 s | 36.3 → 1.29 s |
-| Same write in the TUI (CPU) | 32.2 → 2.4 s | 36.8 → 2.9 s | 41.3 → 3.1 s |
-| First turn, prompt to first token | 73.5 → 74.5 ms | 88.6 → 74.8 ms | 76.5 → 110.8 ms |
+| RPC startup | 315 → 318 ms (1.01× slower) | 3021 → 581 ms (5.2× faster) | 6209 → 675 ms (9.2× faster) |
+| Interactive startup, ready | 352 → 390 ms (1.1× slower) | 3185 → 729 ms (4.4× faster) | 6313 → 792 ms (8.0× faster) |
+| Startup peak memory | 110 → 140 MiB (1.3× more) | 419 → 203 MiB (2.1× less) | 544 → 234 MiB (2.3× less) |
+| 200 KiB streamed write, print mode (wall) | 30.0 → 0.79 s (38.0× faster) | 33.0 → 1.14 s (28.9× faster) | 36.3 → 1.29 s (28.1× faster) |
+| Same write in the TUI (CPU) | 32.2 → 2.4 s (13.4× faster) | 36.8 → 2.9 s (12.7× faster) | 41.3 → 3.1 s (13.3× faster) |
+| First turn, prompt to first token | 73.5 → 74.5 ms (1.01× slower) | 88.6 → 74.8 ms (1.2× faster) | 76.5 → 110.8 ms (1.4× slower) |
 
 What the numbers show:
 
