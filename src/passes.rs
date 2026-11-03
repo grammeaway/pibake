@@ -195,7 +195,7 @@ pub fn run(stage: &Path, options: &Options, setup: &Setup) -> Result<Output> {
                 let out = incremental_tool_json::run(&mut sources)
                     .context("pass incremental_tool_json")?;
                 optional.extend(out.optional);
-                (out.changes, vec![])
+                (out.changes, out.notes)
             }
             Pass::IncrementalMarkdown => (
                 incremental_markdown::run(&mut sources).context("pass incremental_markdown")?,

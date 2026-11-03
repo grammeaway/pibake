@@ -9,7 +9,8 @@
 // only constructs that reach over a cut are link reference definitions (`]:`), a pending `$$`
 // line and an open inline `<a `, `<pre>`, `<code>`, `<kbd>` or `<script>`, so those lex in full.
 // Rendering: a block's lines depend only on the block, the next block's type and the render
-// context, so a kept block reuses its lines while those stay the same.
+// context, so a kept block reuses its lines while those stay the same. pi-tui 1.5.0 does that
+// itself, and calls only `lexMarkdown`.
 // shortcut: a list grows as one block, re-lexed and re-rendered per delta; cut inside lists if
 // answers made of one long list show up slow.
 
@@ -61,7 +62,10 @@ function extend(parser, old, source) {
 	if (STATE_TAG.test(source) && kept.some(setsState)) return undefined;
 	let offset = 0;
 	for (const t of kept) offset += t.raw.length;
-	const tokens = kept.concat(parser.lexer(source.slice(offset)));
+	const rest = parser.lexer(source.slice(offset));
+	const tokens = kept.concat(rest);
+	// No definitions: the source has no `]:`. pi-tui 1.5.0 reads them.
+	tokens.links = rest.links;
 	// marked can merge a continuation into a token with a `\n` the source lacks.
 	let length = 0;
 	for (const t of tokens) length += t.raw.length;

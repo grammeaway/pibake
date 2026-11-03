@@ -6,6 +6,9 @@
 //! given the delta. It returns what stock would, from the delta alone while a string streams.
 //! The parse at the end of a call (`parseToolCallArguments`) is untouched. The sites are matched
 //! by exact text: any other per-delta call in `dist/api/` fails the pass, naming it.
+//!
+//! pi-ai 1.5.0 parses incrementally itself (`ToolCallArgumentsStream`); there the pass changes
+//! nothing.
 
 use std::fs;
 use std::ops::Range;
@@ -23,6 +26,11 @@ const PI_AI: &str = "@earendil-works/pi-ai";
 const API_DIR: &str = "dist/api";
 const STOCK: &str = "parseStreamingJson";
 const STOCK_MODULE: &str = "../utils/json-parse.js";
+/// pi-ai 1.5.0's own incremental parser, which the providers call instead of `STOCK`.
+const UPSTREAM: (&str, &str) = (
+    "dist/utils/streaming-json.js",
+    "export class ToolCallArgumentsStream {",
+);
 const OURS: &str = "__pibake_streamToolJson";
 const IMPORT: &str =
     "import { streamToolJson as __pibake_streamToolJson } from \"pibake:tool-json\"; ";
@@ -118,6 +126,7 @@ pub struct Out {
     pub changes: Vec<Change>,
     /// Rewritten files: a provider whose API `trim_apis` left out is not bundled.
     pub optional: Vec<String>,
+    pub notes: Vec<String>,
 }
 
 pub fn run(sources: &mut Sources) -> Result<Out> {
@@ -125,11 +134,24 @@ pub fn run(sources: &mut Sources) -> Result<Out> {
     let api_dir = format!("{pi_ai}/{API_DIR}");
     let mut files: Vec<&str> = SITES.iter().map(|s| s.file).collect();
     files.dedup();
-    unknown_callers(&sources.stage().join(&api_dir), &files)?;
     let mut out = Out {
         changes: vec![],
         optional: vec![],
+        notes: vec![],
     };
+    if !stock_callers(&sources.stage().join(&api_dir), &files)? {
+        let upstream = format!("{pi_ai}/{}", UPSTREAM.0);
+        let text = sources.read(&upstream).ok();
+        if !text.is_some_and(|t| t.contains(UPSTREAM.1)) {
+            bail!(
+                "no provider in {api_dir} calls {STOCK}, and {upstream} has no `{}`; pibake's incremental_tool_json needs an update",
+                UPSTREAM.1
+            );
+        }
+        out.notes
+            .push("skipped: pi-ai parses streamed tool calls incrementally itself".to_owned());
+        return Ok(out);
+    }
     for file in files {
         let rel = format!("{api_dir}/{file}");
         let text = sources.read(&rel)?;
@@ -150,17 +172,19 @@ pub fn run(sources: &mut Sources) -> Result<Out> {
     Ok(out)
 }
 
-/// A provider in `dir` that calls `parseStreamingJson` without a site here would stay quadratic.
-fn unknown_callers(dir: &std::path::Path, known: &[&str]) -> Result<()> {
+/// Whether any provider in `dir` calls `parseStreamingJson`. One without a site here would stay
+/// quadratic, so it fails.
+fn stock_callers(dir: &std::path::Path, known: &[&str]) -> Result<bool> {
     let entries = fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))?;
+    let mut any = false;
     let mut unknown = vec![];
     for entry in entries {
         let name = entry?.file_name().to_string_lossy().into_owned();
-        if name.ends_with(".js")
-            && !known.contains(&name.as_str())
-            && fs::read_to_string(dir.join(&name))?.contains(STOCK)
-        {
-            unknown.push(name);
+        if name.ends_with(".js") && fs::read_to_string(dir.join(&name))?.contains(STOCK) {
+            any = true;
+            if !known.contains(&name.as_str()) {
+                unknown.push(name);
+            }
         }
     }
     if !unknown.is_empty() {
@@ -171,7 +195,7 @@ fn unknown_callers(dir: &std::path::Path, known: &[&str]) -> Result<()> {
             dir.display()
         );
     }
-    Ok(())
+    Ok(any)
 }
 
 /// `text` with each site's call sent to `pibake:tool-json`. Every call of the imported

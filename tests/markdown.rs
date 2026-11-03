@@ -147,7 +147,8 @@ fn driver() -> &'static Mutex<Driver> {
     DRIVER_PROCESS.get_or_init(|| {
         let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("markdown");
         std::fs::create_dir_all(&dir).unwrap();
-        let (stock, ours) = rewritten("pi-tui/dist/components/markdown.js");
+        let (stock, ours) = rewritten("pi-tui/dist/components/markdown.js")
+            .expect("the pass rewrites markdown.js");
         let ours_path = dir.join("markdown.pibake.js");
         std::fs::write(&ours_path, ours).unwrap();
         let paths = json!({
@@ -171,12 +172,16 @@ fn driver() -> &'static Mutex<Driver> {
     })
 }
 
-/// The stock file of the Pi on PATH that ends in `suffix`, and the pass's rewrite of it.
-fn rewritten(suffix: &str) -> (PathBuf, String) {
-    let pi = pibake::harness::PiCommand::parse("pi")
+fn pi_dir() -> PathBuf {
+    pibake::harness::PiCommand::parse("pi")
         .unwrap()
         .package_dir()
-        .expect("pi on PATH");
+        .expect("pi on PATH")
+}
+
+/// The stock file of the Pi on PATH that ends in `suffix`, and the pass's rewrite of it, if any.
+fn rewritten(suffix: &str) -> Option<(PathBuf, String)> {
+    let pi = pi_dir();
     // The install root, whose node_modules holds Pi, read as a stage.
     let stage: &Path = pi.ancestors().nth(3).unwrap();
     let out = passes::run(
@@ -188,12 +193,10 @@ fn rewritten(suffix: &str) -> (PathBuf, String) {
         &common::no_setup(stage),
     )
     .unwrap();
-    let (rel, text) = out
-        .overrides
+    out.overrides
         .into_iter()
         .find(|(rel, _)| rel.ends_with(suffix))
-        .unwrap_or_else(|| panic!("the pass rewrites {suffix}"));
-    (stage.join(rel), text)
+        .map(|(rel, text)| (stage.join(rel), text))
 }
 
 /// Renders the prefixes of `case["text"]` ending at its cuts with both; panics on the first
@@ -624,7 +627,14 @@ fn e2e_languages_loaded_later_render_as_stock() {
             "syntax.pibake.js",
         ),
     ] {
-        let (stock, ours) = rewritten(suffix);
+        // Pi 1.5.0's syntax highlighting is left as it is: pi-tui 1.5.0 reuses blocks itself.
+        let (stock, ours) = rewritten(suffix)
+            .or_else(|| {
+                let stock = pi_dir().join("dist/utils/syntax-highlight.js");
+                let text = std::fs::read_to_string(&stock).unwrap();
+                suffix.ends_with("syntax-highlight.js").then_some((stock, text))
+            })
+            .unwrap_or_else(|| panic!("the pass rewrites {suffix}"));
         std::fs::write(dir.join(name), ours).unwrap();
         args.extend([stock, dir.join(name)]);
     }

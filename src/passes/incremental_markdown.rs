@@ -9,6 +9,9 @@
 //! The block cache keys on Pi's theme global and on a flag the pass sets once highlight.js has
 //! loaded every language, after which Pi redraws. Every site is matched by its whole text, and
 //! so is the theme global: any change in Pi fails the pass.
+//!
+//! pi-tui 1.5.0 reuses a block's rendering itself, keyed on its source; there the pass sends only
+//! the two lexes to `pibake:markdown`.
 
 use anyhow::{Result, bail};
 
@@ -22,7 +25,7 @@ const THEME: &str = "dist/modes/interactive/theme/theme.js";
 const SYNTAX: &str = "dist/utils/syntax-highlight.js";
 const OURS: &str = "__pibake_lexMarkdown";
 const MARKDOWN_IMPORT: &str = "import { lexMarkdown as __pibake_lexMarkdown, markdownBlock as __pibake_markdownBlock, markdownContext as __pibake_markdownContext } from \"pibake:markdown\"; ";
-const MERMAID_IMPORT: &str =
+const LEX_IMPORT: &str =
     "import { lexMarkdown as __pibake_lexMarkdown } from \"pibake:markdown\"; ";
 
 /// pi-tui 1.3.0's `Markdown.render`, from the lex to the padded content lines.
@@ -116,6 +119,25 @@ const RENDER_OURS: &str = r#"        const tokens = __pibake_lexMarkdown(markdow
         }
 "#;
 
+/// pi-tui 1.5.0's lex in `Markdown.render`, up to where it starts reusing blocks.
+const LEX: &str = r#"        if (!tokens) {
+            tokens = markdownParser.lexer(normalizedText);
+            trimPartialClosingFences(tokens);
+            this.cachedTokens = new WeakRef({ source: normalizedText, tokens });
+        }
+        // A reference link resolves through a definition anywhere in the text, so blocks with the same source can render
+        // differently; such texts are rare in practice and render without reusing blocks.
+        const reuseBlocks = Object.keys(tokens.links).length === 0;
+"#;
+const LEX_OURS: &str = r#"        if (!tokens) {
+            tokens = __pibake_lexMarkdown(markdownParser, normalizedText, trimPartialClosingFences);
+            this.cachedTokens = new WeakRef({ source: normalizedText, tokens });
+        }
+        // A reference link resolves through a definition anywhere in the text, so blocks with the same source can render
+        // differently; such texts are rare in practice and render without reusing blocks.
+        const reuseBlocks = Object.keys(tokens.links).length === 0;
+"#;
+
 /// Pi 1.3.0's mermaid transformer lexing the whole text.
 const MERMAID_LEX: &str = "        return markdownParser\n            .lexer(markdown)\n";
 const MERMAID_LEX_OURS: &str =
@@ -134,41 +156,42 @@ const THEME_GLOBAL: [&str; 2] = [
 
 pub fn run(sources: &mut Sources) -> Result<Vec<Change>> {
     let pi = format!("node_modules/{PI_PACKAGE}");
-    let theme = format!("{pi}/{THEME}");
-    let text = sources.read(&theme)?;
-    if let Some(missing) = THEME_GLOBAL.iter().find(|t| text.matches(*t).count() != 1) {
-        bail!(
-            "{theme}: no `{}`; Pi's theme global is not the one pibake's incremental_markdown knows; it needs an update",
-            missing.lines().next().unwrap_or("")
-        );
-    }
     let markdown = format!("{}/{MARKDOWN}", sources.resolve_package(&pi, PI_TUI)?);
     let mermaid = format!("{pi}/{MERMAID}");
     let syntax = format!("{pi}/{SYNTAX}");
+    const LEXES: &str = "lexes a streamed text from its last unchanged block";
+    let mermaid_lex = (&mermaid, MERMAID_LEX, MERMAID_LEX_OURS, LEX_IMPORT, LEXES);
+    let rewrites = if sources.read(&markdown)?.contains(RENDER) {
+        let theme = format!("{pi}/{THEME}");
+        let text = sources.read(&theme)?;
+        if let Some(missing) = THEME_GLOBAL.iter().find(|t| text.matches(*t).count() != 1) {
+            bail!(
+                "{theme}: no `{}`; Pi's theme global is not the one pibake's incremental_markdown knows; it needs an update",
+                missing.lines().next().unwrap_or("")
+            );
+        }
+        vec![
+            (
+                &markdown,
+                RENDER,
+                RENDER_OURS,
+                MARKDOWN_IMPORT,
+                "lexes and renders a streamed text from its last unchanged block",
+            ),
+            mermaid_lex,
+            (
+                &syntax,
+                ALL_LANGUAGES,
+                ALL_LANGUAGES_OURS,
+                "",
+                "flags when every highlight.js language has loaded",
+            ),
+        ]
+    } else {
+        vec![(&markdown, LEX, LEX_OURS, LEX_IMPORT, LEXES), mermaid_lex]
+    };
     let mut changes = vec![];
-    for (rel, stock, ours, import, what) in [
-        (
-            &markdown,
-            RENDER,
-            RENDER_OURS,
-            MARKDOWN_IMPORT,
-            "lexes and renders a streamed text from its last unchanged block",
-        ),
-        (
-            &mermaid,
-            MERMAID_LEX,
-            MERMAID_LEX_OURS,
-            MERMAID_IMPORT,
-            "lexes a streamed text from its last unchanged block",
-        ),
-        (
-            &syntax,
-            ALL_LANGUAGES,
-            ALL_LANGUAGES_OURS,
-            "",
-            "flags when every highlight.js language has loaded",
-        ),
-    ] {
+    for (rel, stock, ours, import, what) in rewrites {
         let new = rewrite(&sources.read(rel)?, rel, stock, ours, import)?;
         if let Some(removed) = sources.replace(rel, new)? {
             changes.push(Change {
@@ -234,10 +257,21 @@ mod tests {
         let text = format!(
             "const f = (markdown) => {{\n{MERMAID_LEX}            .map((t) => t.raw).join(\"\");\n}};\n"
         );
-        let out = rewrite(&text, "m.js", MERMAID_LEX, MERMAID_LEX_OURS, MERMAID_IMPORT).unwrap();
+        let out = rewrite(&text, "m.js", MERMAID_LEX, MERMAID_LEX_OURS, LEX_IMPORT).unwrap();
         assert_eq!(out.lines().count(), text.lines().count());
         assert!(out.contains(
             "return __pibake_lexMarkdown(markdownParser,\n            markdown)\n            .map("
+        ));
+    }
+
+    #[test]
+    fn the_1_5_lex_keeps_line_numbers() {
+        let text = format!("class M {{\n    render(width) {{\n{LEX}        return x;\n    }}\n}}\n");
+        let out = rewrite(&text, "m.js", LEX, LEX_OURS, LEX_IMPORT).unwrap();
+        assert_eq!(out.lines().count(), text.lines().count());
+        assert!(!out.contains("markdownParser.lexer("));
+        assert!(out.contains(
+            "tokens = __pibake_lexMarkdown(markdownParser, normalizedText, trimPartialClosingFences);\n"
         ));
     }
 

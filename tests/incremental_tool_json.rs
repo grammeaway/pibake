@@ -185,3 +185,29 @@ fn a_missing_provider_file_fails_the_pass() {
     let err = format!("{:#}", run(s.path()).unwrap_err());
     assert!(err.contains("pi-messages.js"), "{err}");
 }
+
+/// pi-ai 1.5.0: the providers call its own incremental parser, so the pass changes nothing.
+#[test]
+fn pi_ai_parsing_incrementally_itself_is_left_as_it_is() {
+    let s = stage();
+    let api = s.path().join(PI_AI).join("dist/api");
+    for (file, _) in PROVIDERS {
+        write(
+            &api.join(file),
+            "import { ToolCallArgumentsStream } from \"../utils/streaming-json.js\";\nblock.arguments = open.arguments.append(delta);\n",
+        );
+    }
+    let err = format!("{:#}", run(s.path()).unwrap_err());
+    assert!(err.contains("has no `export class ToolCallArgumentsStream {`"), "{err}");
+    write(
+        &s.path().join(PI_AI).join("dist/utils/streaming-json.js"),
+        "export class ToolCallArgumentsStream {\n}\n",
+    );
+    let out = run(s.path()).unwrap();
+    assert!(out.overrides.is_empty());
+    assert!(out.optional.is_empty());
+    assert_eq!(
+        out.reports[0].notes,
+        ["skipped: pi-ai parses streamed tool calls incrementally itself"]
+    );
+}
