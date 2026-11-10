@@ -43,6 +43,10 @@ impl Fixture {
         let pi = format!("stage/node_modules/{PI_PACKAGE}");
         f.write(&format!("{pi}/dist/cli.js"), PI_CLI);
         f.write(&format!("{pi}/dist/bun/runtime-setup.js"), PI_SETUP);
+        f.write(
+            &format!("{pi}/dist/core/extensions/loader.js"),
+            "const module = await jiti.import(extensionPath, { default: true });\n",
+        );
         f.write(&format!("{pi}/dist/bundle/chunks/codemode-worker.js"), "");
         f.write(
             &format!("{pi}/dist/bundle/chunks/image-resize-worker.js"),

@@ -147,8 +147,8 @@ fn driver() -> &'static Mutex<Driver> {
     DRIVER_PROCESS.get_or_init(|| {
         let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("markdown");
         std::fs::create_dir_all(&dir).unwrap();
-        let (stock, ours) = rewritten("pi-tui/dist/components/markdown.js")
-            .expect("the pass rewrites markdown.js");
+        let (stock, ours) =
+            rewritten("pi-tui/dist/components/markdown.js").expect("the pass rewrites markdown.js");
         let ours_path = dir.join("markdown.pibake.js");
         std::fs::write(&ours_path, ours).unwrap();
         let paths = json!({
@@ -222,7 +222,7 @@ fn stream(case: Value) -> u64 {
     reply["frames"].as_u64().unwrap()
 }
 
-const WORDS: [&str; 33] = [
+const WORDS: [&str; 34] = [
     "foo",
     "bar",
     "baz",
@@ -256,6 +256,7 @@ const WORDS: [&str; 33] = [
     "</pre>",
     "<kbd>",
     "<script>",
+    "<!-- c -->",
 ];
 
 fn word(tc: &TestCase) -> String {
@@ -288,7 +289,7 @@ fn inline(tc: &TestCase) -> String {
 }
 
 /// Every construct the lex map covers (`performance_plans/progress.md`, p8); `{}` is inline text.
-const BLOCKS: [&str; 52] = [
+const BLOCKS: [&str; 55] = [
     "{}",
     "{}\n{}",
     "# {}",
@@ -325,6 +326,9 @@ const BLOCKS: [&str; 52] = [
     "- - -",
     "<div>\n{}\n</div>",
     "<!-- c -->",
+    "- {}\n\n  <!-- c -->\n- {}",
+    "> {}\n>\n> <!-- c -->",
+    "<!-- c\n\n{}",
     "<pre>\na\n\nb\n</pre>",
     "<details>\n<summary>x</summary>\n\n{}\n\n</details>",
     "$$\n\\frac{a}{b}\n$$",
@@ -497,6 +501,8 @@ fn e2e_reaching_back_renders_as_stock() {
         "<a href=x> a\n\nb https://e.x/a\n\nc </a>\n\nd https://e.x/b\n\n<code> e\n\nf `g`",
         "a [ref] b and [foo]\n\npara\n\n[ref]: http://d.ef/x\n\nmore\n\n[foo]: http://d.ef/y \"t\"\n\nend",
         "> a\nb\n\n> c\n\nd\n===\n\ne\n\n---\n\n<pre>\nf\n\ng\n</pre>\n\nh",
+        // pi-tui 1.5.1 removes comment-only blocks from the lexed tokens.
+        "a\n\nb\n\n<!-- c -->\n\nb\n\nc\n\n- d\n\n  <!-- e -->\n- f\n\n> g\n>\n> <!-- h -->\n\ni\n\nj <!-- k --> l\n\nm",
     ];
     for text in texts {
         for trim in [true, false] {
@@ -632,7 +638,9 @@ fn e2e_languages_loaded_later_render_as_stock() {
             .or_else(|| {
                 let stock = pi_dir().join("dist/utils/syntax-highlight.js");
                 let text = std::fs::read_to_string(&stock).unwrap();
-                suffix.ends_with("syntax-highlight.js").then_some((stock, text))
+                suffix
+                    .ends_with("syntax-highlight.js")
+                    .then_some((stock, text))
             })
             .unwrap_or_else(|| panic!("the pass rewrites {suffix}"));
         std::fs::write(dir.join(name), ours).unwrap();

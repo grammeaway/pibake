@@ -19,7 +19,11 @@
 const RECENT = 8;
 const recent = []; // { parser, source, tokens }
 
-/** `parser.lexer(source)`, then `trim(tokens)` if given; the tokens must not be mutated. */
+/**
+ * `parser.lexer(source)`, then `trim(tokens)` if given. The tokens must not be mutated, but for
+ * pi-tui 1.5.1's `removeHtmlCommentBlocks`: it changes nothing without a `<!--`, and a text with
+ * one is never extended, so its tokens are only returned again for the same text, as pi-tui would.
+ */
 export function lexMarkdown(parser, source, trim) {
 	const exact = recent.findIndex((e) => e.parser === parser && e.source === source);
 	if (exact >= 0) {
@@ -53,7 +57,7 @@ const setsState = (t) =>
 	[t.tokens, t.items, t.header, ...(t.rows ?? [])].some((c) => Array.isArray(c) && c.some(setsState));
 
 function extend(parser, old, source) {
-	if (source.includes("]:") || source.includes("\r")) return undefined;
+	if (source.includes("]:") || source.includes("\r") || source.includes("<!--")) return undefined;
 	let k = old.length - 2;
 	while (k >= 1 && old[k - 1].type !== "space") k--;
 	if (k < 1) return undefined;

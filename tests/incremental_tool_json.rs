@@ -198,7 +198,10 @@ fn pi_ai_parsing_incrementally_itself_is_left_as_it_is() {
         );
     }
     let err = format!("{:#}", run(s.path()).unwrap_err());
-    assert!(err.contains("has no `export class ToolCallArgumentsStream {`"), "{err}");
+    assert!(
+        err.contains("has no `export class ToolCallArgumentsStream {`"),
+        "{err}"
+    );
     write(
         &s.path().join(PI_AI).join("dist/utils/streaming-json.js"),
         "export class ToolCallArgumentsStream {\n}\n",

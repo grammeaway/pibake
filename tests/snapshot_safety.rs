@@ -137,3 +137,24 @@ fn a_changed_pi_fails_loudly_naming_the_file() {
     let err = format!("{:#}", snapshot(stage.path()).unwrap_err());
     assert!(err.contains("grok-mermaid"), "{err}");
 }
+
+/// Pi 1.5.1 renamed grok-mermaid to lovely-mermaid, and added tool search's word segmenter.
+#[test]
+fn the_sites_of_pi_1_5_1_are_deferred() {
+    let stage = tempfile::tempdir().unwrap();
+    common::write_snapshot_stage(stage.path());
+    let modules = stage.path().join("node_modules");
+    fs::rename(modules.join("grok-mermaid"), modules.join("lovely-mermaid")).unwrap();
+    let tool = format!("node_modules/{PI_PACKAGE}/dist/extensions/tool-search/tool.js");
+    common::write(
+        &stage.path().join(&tool),
+        "const wordSegmenter = new Intl.Segmenter(undefined, { granularity: \"word\" });\nexport const words = (s) => [...wordSegmenter.segment(s)];\n",
+    );
+    let out = snapshot(stage.path()).unwrap();
+    assert_eq!(out.overrides.len(), 10, "{:?}", out.overrides.keys());
+    assert!(
+        out.overrides
+            .contains_key("node_modules/lovely-mermaid/dist/width.js")
+    );
+    assert!(out.overrides[&tool].starts_with("let wordSegmenter; globalThis.__pibake_reinit("));
+}

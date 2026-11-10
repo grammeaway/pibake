@@ -247,16 +247,44 @@ impl Plan {
     }
 }
 
-/// The module Pi's loader asks through the jiti stand-in: agent-relative path → baked entry.
-/// Resolved from the stage directory. It also gives extension code its installed location.
-pub fn baked_module(baked: &[&Baked]) -> String {
-    let mut s = String::from(
-        r#"import { dirname, join, relative } from "node:path";
-import { pathToFileURL } from "node:url";
-import { getAgentDir } from "./node_modules/@earendil-works/pi-coding-agent/dist/config.js";
+/// Pi's extension loader importing an extension by the path it found it at, or (1.5.1) by
+/// that path with its symlinks resolved, which the extension then sees as its location.
+const EXTENSION_LOADER: (&str, [&str; 2]) = (
+    "dist/core/extensions/loader.js",
+    [
+        "jiti.import(extensionPath, { default: true })",
+        "jiti.import(canonicalizePath(extensionPath), { default: true })",
+    ],
+);
 
-const baked = {
-"#,
+/// Whether Pi's extension loader imports extensions by their real path.
+pub fn canonical_extension_paths(pi_dir: &Path) -> Result<bool> {
+    let text = fs::read_to_string(pi_dir.join(EXTENSION_LOADER.0))
+        .with_context(|| format!("reading {} in {}", EXTENSION_LOADER.0, pi_dir.display()))?;
+    match EXTENSION_LOADER.1.map(|call| text.contains(call)) {
+        [_, true] => Ok(true),
+        [true, false] => Ok(false),
+        _ => bail!(
+            "Pi's {} no longer calls `{}`; pibake's baked extension loader needs an update",
+            EXTENSION_LOADER.0,
+            EXTENSION_LOADER.1[1]
+        ),
+    }
+}
+
+/// The module Pi's loader asks through the jiti stand-in: agent-relative path → baked entry.
+/// Resolved from the stage directory. It also gives extension code its installed location,
+/// with its symlinks resolved when `canonical` (see `canonical_extension_paths`).
+pub fn baked_module(baked: &[&Baked], canonical: bool) -> String {
+    let mut s = format!(
+        r#"import {{ realpathSync }} from "node:fs";
+import {{ dirname, join, relative }} from "node:path";
+import {{ pathToFileURL }} from "node:url";
+import {{ getAgentDir }} from "./node_modules/@earendil-works/pi-coding-agent/dist/config.js";
+
+const canonical = {canonical};
+const baked = {{
+"#
     );
     for b in baked {
         s.push_str(&format!(
@@ -268,13 +296,27 @@ const baked = {
     s.push_str(
         r#"};
 
+// A canonical Pi asks for an extension by its real path, through any symlink in the agent directory.
+let byRealPath;
+const realPath = (path) => {
+	try {
+		return realpathSync(path);
+	} catch {
+		return path;
+	}
+};
+
 export function bakedLoader(path) {
 	const key = relative(getAgentDir(), path);
-	return Object.hasOwn(baked, key) ? baked[key] : undefined;
+	if (Object.hasOwn(baked, key)) return baked[key];
+	byRealPath ??= new Map(Object.keys(baked).map((k) => [realPath(join(getAgentDir(), k)), k]));
+	const real = byRealPath.get(realPath(path));
+	return real === undefined ? undefined : baked[real];
 }
 
 globalThis.__pibake_live = (rel) => {
-	const filename = join(getAgentDir(), rel);
+	const path = join(getAgentDir(), rel);
+	const filename = canonical ? realPath(path) : path;
 	return { url: pathToFileURL(filename).href, dirname: dirname(filename), filename };
 };
 "#,
@@ -707,6 +749,7 @@ impl Bundler<'_> {
     pub fn run(&self, plan: &Plan, log: &mut dyn FnMut(String)) -> Result<(Outcome, Report)> {
         let pi_dir = plan.pi_dir();
         check_pi(&pi_dir)?;
+        let canonical = canonical_extension_paths(&pi_dir)?;
         let flavor = flavor(self.backend);
         let all: Vec<&Baked> = plan.baked.iter().collect();
         let owned: Vec<Owned> = plan
@@ -718,7 +761,7 @@ impl Bundler<'_> {
             })
             .collect();
         let owned_json = serde_json::to_string(&owned)?;
-        let baked_all = baked_module(&all);
+        let baked_all = baked_module(&all, canonical);
         let stage_path = plan.stage.to_string_lossy();
         let setup = passes::Setup {
             agent_dir: plan.agent_dir.clone(),
@@ -814,7 +857,7 @@ impl Bundler<'_> {
                 tool_json: TOOL_JSON.to_owned(),
                 http_dispatcher: HTTP_DISPATCHER.to_owned(),
                 markdown: MARKDOWN.to_owned(),
-                baked: baked_module(baked),
+                baked: baked_module(baked, canonical),
                 owned: owned.clone(),
                 outfile: dir.join(flavor.main),
                 write,
@@ -862,7 +905,7 @@ impl Bundler<'_> {
                 fs::write(dir.join(name), text)?;
             }
             fs::write(dir.join("entry.mjs"), flavor.entry)?;
-            fs::write(dir.join("baked.mjs"), baked_module(&kept))?;
+            fs::write(dir.join("baked.mjs"), baked_module(&kept, canonical))?;
             fs::write(
                 dir.join(REPORT),
                 format!("{}\n", serde_json::to_string_pretty(&report)?),
@@ -994,7 +1037,7 @@ mod tests {
             key: "npm/node_modules/x/\"q\".ts".into(),
             stage_path: "node_modules/x/\"q\".ts".into(),
         };
-        let text = baked_module(&[&b]);
+        let text = baked_module(&[&b], false);
         assert!(
             text.contains(
                 r#"	"npm/node_modules/x/\"q\".ts": () => import("./node_modules/x/\"q\".ts"),"#
@@ -1002,7 +1045,23 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("export function bakedLoader(path)"));
-        assert!(baked_module(&[]).contains("const baked = {\n};"));
+        assert!(text.contains("const canonical = false;\n"));
+        assert!(baked_module(&[], true).contains("const canonical = true;\nconst baked = {\n};"));
+    }
+
+    #[test]
+    fn canonical_extension_paths_follows_the_loader() {
+        let dir = tempfile::tempdir().unwrap();
+        let loader = dir.path().join(EXTENSION_LOADER.0);
+        fs::create_dir_all(loader.parent().unwrap()).unwrap();
+        let canonical = |text: &str| {
+            fs::write(&loader, text).unwrap();
+            canonical_extension_paths(dir.path()).map_err(|e| e.to_string())
+        };
+        assert_eq!(canonical(EXTENSION_LOADER.1[0]), Ok(false));
+        assert_eq!(canonical(EXTENSION_LOADER.1[1]), Ok(true));
+        let err = canonical("jiti.import(realpath(extensionPath))").unwrap_err();
+        assert!(err.contains("needs an update"), "{err}");
     }
 
     fn metafile(edges: &[(&str, &[&str])]) -> Metafile {

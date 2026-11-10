@@ -59,8 +59,10 @@ enum How {
 const CALLBACK_HOST: &str =
     r#"const CALLBACK_HOST = getProviderEnvValue("PI_OAUTH_CALLBACK_HOST") || "127.0.0.1";"#;
 
-/// Pi 1.3.0's load-time reads of launch state, and its ICU objects created at load.
-const SITES: [Site; 11] = [
+/// Pi 1.3.0's load-time reads of launch state, and its ICU objects created at load. Sites that
+/// differ only in their package are alternatives: one of them must be installed.
+/// A site whose file is not in the stage is skipped (an older Pi); the gate catches what moved.
+const SITES: [Site; 13] = [
     Site {
         package: Some("@earendil-works/pi-tui"),
         file: "dist/utils.js",
@@ -86,6 +88,22 @@ const SITES: [Site; 11] = [
         package: Some("grok-mermaid"),
         file: "dist/width.js",
         statement: "const segmenter = new Intl.Segmenter('en', { granularity: 'grapheme' });",
+        how: How::Const,
+        rerun: None,
+    },
+    // Pi 1.5.1's, renamed.
+    Site {
+        package: Some("lovely-mermaid"),
+        file: "dist/width.js",
+        statement: "const segmenter = new Intl.Segmenter('en', { granularity: 'grapheme' });",
+        how: How::Const,
+        rerun: None,
+    },
+    // From Pi 1.5.1.
+    Site {
+        package: PI,
+        file: "dist/extensions/tool-search/tool.js",
+        statement: r#"const wordSegmenter = new Intl.Segmenter(undefined, { granularity: "word" });"#,
         how: How::Const,
         rerun: None,
     },
@@ -146,10 +164,23 @@ const SITES: [Site; 11] = [
 pub fn run(sources: &mut Sources) -> Result<Vec<Change>> {
     let pi = format!("node_modules/{PI_PACKAGE}");
     let mut by_file: BTreeMap<String, Vec<&Site>> = BTreeMap::new();
+    let resolve = |p: &str| sources.resolve_package(&format!("{pi}/dist"), p);
     for site in &SITES {
         let dir = match site.package {
             None => pi.clone(),
-            Some(p) => sources.resolve_package(&format!("{pi}/dist"), p)?,
+            Some(p) => match resolve(p) {
+                Ok(dir) => dir,
+                Err(_)
+                    if SITES.iter().any(|o| {
+                        o.file == site.file
+                            && o.statement == site.statement
+                            && o.package.is_some_and(|q| q != p && resolve(q).is_ok())
+                    }) =>
+                {
+                    continue;
+                }
+                Err(e) => return Err(e),
+            },
         };
         by_file
             .entry(format!("{dir}/{}", site.file))
@@ -158,6 +189,9 @@ pub fn run(sources: &mut Sources) -> Result<Vec<Change>> {
     }
     let mut changes = vec![];
     for (rel, sites) in by_file {
+        if !sources.stage().join(&rel).is_file() {
+            continue;
+        }
         let text = sources.read(&rel)?;
         // Already rewritten: a pass runs once, but its output must stay a fixed point.
         if text.contains(REINIT) {
