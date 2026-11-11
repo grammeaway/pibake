@@ -161,8 +161,19 @@ const SITES: [Site; 13] = [
     },
 ];
 
-pub fn run(sources: &mut Sources) -> Result<Vec<Change>> {
+pub struct Out {
+    pub changes: Vec<Change>,
+    /// Rewritten files of alternative packages: one may be an extension's, which Pi never loads.
+    pub optional: Vec<String>,
+}
+
+pub fn run(sources: &mut Sources) -> Result<Out> {
     let pi = format!("node_modules/{PI_PACKAGE}");
+    let alternative = |site: &Site| {
+        SITES.iter().any(|o| {
+            o.file == site.file && o.statement == site.statement && o.package != site.package
+        })
+    };
     let mut by_file: BTreeMap<String, Vec<&Site>> = BTreeMap::new();
     let resolve = |p: &str| sources.resolve_package(&format!("{pi}/dist"), p);
     for site in &SITES {
@@ -187,10 +198,16 @@ pub fn run(sources: &mut Sources) -> Result<Vec<Change>> {
             .or_default()
             .push(site);
     }
-    let mut changes = vec![];
+    let mut out = Out {
+        changes: vec![],
+        optional: vec![],
+    };
     for (rel, sites) in by_file {
         if !sources.stage().join(&rel).is_file() {
             continue;
+        }
+        if sites.iter().all(|s| alternative(s)) {
+            out.optional.push(rel.clone());
         }
         let text = sources.read(&rel)?;
         // Already rewritten: a pass runs once, but its output must stay a fixed point.
@@ -199,14 +216,14 @@ pub fn run(sources: &mut Sources) -> Result<Vec<Change>> {
         }
         let (rewritten, names) = defer(&text, &rel, &sites)?;
         if let Some(removed) = sources.replace(&rel, rewritten)? {
-            changes.push(Change {
-                file: rel,
+            out.changes.push(Change {
+                file: rel.clone(),
                 what: format!("deferred {} to launch", names.join(", ")),
                 bytes_removed: removed,
             });
         }
     }
-    Ok(changes)
+    Ok(out)
 }
 
 fn defer(text: &str, rel: &str, sites: &[&Site]) -> Result<(String, Vec<String>)> {

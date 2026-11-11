@@ -213,10 +213,11 @@ pub fn run(stage: &Path, options: &Options, setup: &Setup) -> Result<Output> {
                 keep_alive_http::run(&mut sources).context("pass keep_alive_http")?,
                 vec![],
             ),
-            Pass::SnapshotSafety => (
-                snapshot_safety::run(&mut sources).context("pass snapshot_safety")?,
-                vec![],
-            ),
+            Pass::SnapshotSafety => {
+                let out = snapshot_safety::run(&mut sources).context("pass snapshot_safety")?;
+                optional.extend(out.optional);
+                (out.changes, vec![])
+            }
             Pass::LazyModules if options.snapshot => (
                 vec![],
                 vec!["skipped: the snapshot holds these modules evaluated, and one evaluated after the resume would miss snapshot_safety's initialisers".to_owned()],

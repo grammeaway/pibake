@@ -158,3 +158,26 @@ fn the_sites_of_pi_1_5_1_are_deferred() {
     );
     assert!(out.overrides[&tool].starts_with("let wordSegmenter; globalThis.__pibake_reinit("));
 }
+
+/// An extension's dependency can install the package Pi used to need (grok-mermaid next to Pi
+/// 1.5.1's lovely-mermaid). Both are rewritten, and a bundle without that extension leaves it out.
+#[test]
+fn installed_alternatives_are_all_deferred_and_optional() {
+    let stage = tempfile::tempdir().unwrap();
+    common::write_snapshot_stage(stage.path());
+    let modules = stage.path().join("node_modules");
+    fs::create_dir_all(modules.join("lovely-mermaid")).unwrap();
+    for rel in ["dist/width.js", "package.json"] {
+        let text = fs::read_to_string(modules.join("grok-mermaid").join(rel)).unwrap();
+        common::write(&modules.join("lovely-mermaid").join(rel), &text);
+    }
+    let out = snapshot(stage.path()).unwrap();
+    for rel in [
+        "node_modules/grok-mermaid/dist/width.js",
+        "node_modules/lovely-mermaid/dist/width.js",
+    ] {
+        assert!(out.overrides.contains_key(rel), "{rel}");
+        assert!(out.optional.iter().any(|o| o == rel), "{rel}: {:?}", out.optional);
+    }
+    assert_eq!(out.optional.len(), 2, "{:?}", out.optional);
+}
